@@ -190,7 +190,6 @@ def mha_fwd_kvcache_torch(
     is_rotary_interleaved: bool = True,
     num_splits: int = 0,
 ) -> torch.Tensor:
-    breakpoint()
     assert alibi_slopes is None, "alibi_slopes not supported"
     if out is None:
         out = torch.empty_like(q)
@@ -205,6 +204,7 @@ def mha_fwd_kvcache_torch(
     seqlen_knew = k.shape[1] if k is not None else 0
 
     if block_table is not None:
+        assert False, "paged KV cache not supported"
         # TODO: paged KV cache
         pass
     else:
@@ -217,6 +217,7 @@ def mha_fwd_kvcache_torch(
             assert seqlens_k is not None
             
             if leftpad_k is not None:
+                assert False, "left pad k not supported"
                 # Create offset indices for the cache
                 offset = leftpad_k + seqlens_k  # [batch_size]
                 # Create indices for the new sequence length
@@ -238,6 +239,7 @@ def mha_fwd_kvcache_torch(
 
     # apply rotary embedding if rotary_cos and rotary_sin are passed in
     if rotary_cos is not None and rotary_sin is not None:
+        assert False, "rotary embedding not supported"
         if is_rotary_interleaved:
             pass
         else:
@@ -279,6 +281,7 @@ def mha_fwd_kvcache_torch(
 
         # apply sliding window if specified
         if window_size_left != -1 or window_size_right != -1:
+            assert False, "sliding window not supported"
             # This is Claude, NOT TESTED!
             q_idx = torch.arange(q.size(1), device=q.device)
             k_idx = torch.arange(seqlen_total, device=q.device)

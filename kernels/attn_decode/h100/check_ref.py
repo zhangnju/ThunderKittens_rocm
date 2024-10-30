@@ -310,11 +310,12 @@ if __name__ == "__main__":
     H = 32
     d = 128
     L_max = 1024
+    Q_seqlen = 10
     L_new = 3
     dtype = torch.bfloat16
     is_causal = True
 
-    q = torch.randn(B, L_new, H, d, device="cuda", dtype=dtype)
+    q = torch.randn(B, Q_seqlen, H, d, device="cuda", dtype=dtype)
     k_cache = torch.randn(B, L_max, H, d, device="cuda", dtype=dtype)
     v_cache = torch.randn(B, L_max, H, d, device="cuda", dtype=dtype)
 

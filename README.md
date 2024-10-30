@@ -19,7 +19,7 @@ ThunderKittens is built around three key principles:
     <img src="assets/attn.png" height=600 alt="Flash Attention 3, but with kittens!" style="margin-bottom:px"/> 
 </div>
 
-Join us on Discord to get involved: [ThunderKittens channel @ GPU Mode Discord](https://discord.com/channels/1189498204333543425/1300872762163728550)!!!! 
+Join us on Discord to get involved: [ThunderKittens channel @ GPU Mode Discord](https://discord.com/channels/1189498204333543425/1300872762163728550)!!!! Here is the invite link to GPU mode: https://discord.gg/W7CUhN5w
 
 ThunderKittens is built from the hardware up -- we do what the silicon tells us. And modern GPUs tell us that they want to work with fairly small tiles of data. A GPU is not really a 1000x1000 matrix multiply machine (even if it is often used as such); it’s a manycore processor where each core can efficiently run ~16x16 matrix multiplies. Consequently, ThunderKittens is built around manipulating tiles of data no smaller than 16x16 values.
 
@@ -142,12 +142,12 @@ But ThunderKittens does use a bunch of modern stuff, so it has fairly aggressive
 
 ```bash
 sudo apt update
-sudo apt install gcc-10 g++-10
+sudo apt install gcc-11 g++-11
 
-sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100 --slave /usr/bin/g++ g++ /usr/bin/g++-10
+sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100 --slave /usr/bin/g++ g++ /usr/bin/g++-11
 
 sudo apt update
-sudo apt install clang-10
+sudo apt install clang-11
 ```
 
 If you can't find nvcc, or you experience issues where your environment is pointing to the wrong CUDA version:
@@ -240,5 +240,5 @@ Learn more about ThunderKittens and how GPUs work by checking out:
 - [Easier, Better, Faster, Cuter Blogpost, Oct. 2024](https://hazyresearch.stanford.edu/blog/2024-10-29-tk2)
 - [GPUs Go Brrr Blogpost, May 2024](https://hazyresearch.stanford.edu/blog/2024-05-12-tk)
 
-Join us and get involved at the [ThunderKittens channel @ GPU Mode Discord](https://discord.com/channels/1189498204333543425/1300872762163728550)!!!! 
+Join us and get involved at the [ThunderKittens channel @ GPU Mode Discord](https://discord.com/channels/1189498204333543425/1300872762163728550)!!!!  Here is the invite link to GPU mode: https://discord.gg/W7CUhN5w
 

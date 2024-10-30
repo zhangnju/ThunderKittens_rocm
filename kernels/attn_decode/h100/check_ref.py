@@ -305,6 +305,32 @@ def mha_fwd_kvcache_torch(
     
     return out
 
+def mha_fwd_tk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    is_causal: bool = False,
+) -> torch.Tensor:
+    o, l_vec = tk.mha_forward(q, k, v, is_causal)
+    return o
+
+def mha_fwd_ref(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool = False,
+) -> torch.Tensor:
+    # manual pytorch implementation of scaled dot product attention
+    QK = torch.matmul(q, k.transpose(-2, -1))
+    QK /= (q.size(-1) ** 0.5)
+    if causal:
+        mask = torch.triu(torch.ones(QK.size(-2), QK.size(-1)), 1).to(torch.bool).to(QK.device)
+        QK.masked_fill_(mask, float('-inf'))
+    QK = torch.nn.functional.softmax(QK, dim=-1)
+    output = torch.matmul(QK, v)
+
+    return output
+
 if __name__ == "__main__":
     B = 4
     H = 32
@@ -332,5 +358,15 @@ if __name__ == "__main__":
     out_torch = mha_fwd_kvcache_torch(q, k_cache, v_cache, k = k_new, v = v_new, seqlens_k = k_seqlens, is_causal=is_causal)
 
     print((out_fa2 - out_torch).abs().max())
+
+    q_tk = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+    k_tk = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+    v_tk = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+
+    out_tk = mha_fwd_tk(q_tk, k_tk, v_tk, is_causal=is_causal)
+    out_ref = mha_fwd_ref(q_tk, k_tk, v_tk, causal=is_causal)
+
+    # this is incorrect??
+    print((out_tk - out_ref).abs().max())
 
     breakpoint()

@@ -47,7 +47,7 @@ __global__ void attend_ker(const __grid_constant__ globals<D> g) {
     zero(norm_vec);
     zero(o_reg);
     // launch the load of the first k, v tiles
-    int kv_blocks = g.Qg.rows / (LOAD_BLOCKS*ROWS<D>), tic = 0;
+    int kv_blocks = g.Kg.rows / (LOAD_BLOCKS*ROWS<D>), tic = 0;
     load_group::load_async(k_smem[loadid][0], g.Kg, {batch, head, loadid, 0});
     load_group::load_async(v_smem[loadid][0], g.Vg, {batch, head, loadid, 0});
     // iterate over k, v for these q's that have been loaded
@@ -172,7 +172,7 @@ attention_decode_forward(
             mem_size
         );
 
-        dim3 grid((k_seq_len + qkvo_tile<64>::rows*NUM_WORKERS - 1) / (qkvo_tile<64>::rows*NUM_WORKERS), qo_heads, batch);
+        dim3 grid((q_seq_len + qkvo_tile<64>::rows*NUM_WORKERS - 1) / (qkvo_tile<64>::rows*NUM_WORKERS), qo_heads, batch);
         attend_ker<64><<<grid, (32*NUM_WORKERS), mem_size>>>(g);
     }
     else if (head_dim == 128) {
@@ -188,7 +188,7 @@ attention_decode_forward(
             mem_size
         );
 
-        dim3 grid((k_seq_len + qkvo_tile<128>::rows*NUM_WORKERS - 1) / (qkvo_tile<128>::rows*NUM_WORKERS), qo_heads, batch);
+        dim3 grid((q_seq_len + qkvo_tile<128>::rows*NUM_WORKERS - 1) / (qkvo_tile<128>::rows*NUM_WORKERS), qo_heads, batch);
         attend_ker<128><<<grid, (32*NUM_WORKERS), mem_size>>>(g);
     }
     else {

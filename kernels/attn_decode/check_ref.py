@@ -393,4 +393,20 @@ if __name__ == "__main__":
 
     print(errors)
 
+    L_4090 = 1024
+    errors = []
+    
+    for L_4090_q in range(64, 1025, 32):
+
+        q_decode = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
+        k_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
+        v_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
+
+        out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, is_causal=False)
+        out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=False)
+
+        errors.append((L_4090_q, (out_tk_decode - out_ref_decode).abs().max().item()))
+
+    print(errors)
+
     breakpoint()

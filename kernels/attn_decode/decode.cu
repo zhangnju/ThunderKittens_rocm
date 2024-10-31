@@ -51,10 +51,8 @@ __global__ void attend_ker(
     zero(norm_vec);
     zero(o_reg);
     // launch the load of the first k, v tiles
-    // total number of k, v blocks in the cache
-    int total_kv_blocks = g.Kg.rows / (LOAD_BLOCKS*ROWS<D>);
     // total number of blocks we want to load
-    int kv_blocks = k_seqlen / (LOAD_BLOCKS*ROWS<D>), tic = 0;
+    int kv_blocks = (k_seqlen + (LOAD_BLOCKS*ROWS<D>) - 1) / (LOAD_BLOCKS*ROWS<D>), tic = 0;
     load_group::load_async(k_smem[loadid][0], g.Kg, {batch, head, loadid, 0});
     load_group::load_async(v_smem[loadid][0], g.Vg, {batch, head, loadid, 0});
     // iterate over k, v for these q's that have been loaded
@@ -71,7 +69,8 @@ __global__ void attend_ker(
         // now each warp goes through all of the subtiles, loads them, and then does the flash attention internal alg.
         #pragma unroll LOAD_BLOCKS
         for(int subtile = 0;
-            subtile < LOAD_BLOCKS;
+            subtile < LOAD_BLOCKS &&
+            kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> < k_seqlen;
             subtile++) {
 
             load(k_reg, k_smem[subtile][tic]); // load k from shared into registers

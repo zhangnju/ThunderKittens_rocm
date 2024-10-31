@@ -12,7 +12,11 @@ template<int D> using global_layout = gl<bf16, -1, -1, -1, D>; // B, H, g.Qg.row
 template<int D> struct globals { global_layout<D> Qg, Kg, Vg, Og; };
 
 template<int D> __launch_bounds__(NUM_WORKERS*WARP_THREADS, 1)
-__global__ void attend_ker(const __grid_constant__ globals<D> g) {
+__global__ void attend_ker(
+    const __grid_constant__ globals<D> g,
+    int k_seqlen,
+    bool causal
+) {
     using load_group = kittens::group<2>; // pairs of workers collaboratively load k, v tiles
     int loadid = load_group::groupid(), workerid = kittens::warpid(); // which worker am I?
     constexpr int LOAD_BLOCKS = NUM_WORKERS / load_group::GROUP_WARPS;
@@ -47,13 +51,16 @@ __global__ void attend_ker(const __grid_constant__ globals<D> g) {
     zero(norm_vec);
     zero(o_reg);
     // launch the load of the first k, v tiles
-    int kv_blocks = g.Kg.rows / (LOAD_BLOCKS*ROWS<D>), tic = 0;
+    // total number of k, v blocks in the cache
+    int total_kv_blocks = g.Kg.rows / (LOAD_BLOCKS*ROWS<D>);
+    // total number of blocks we want to load
+    int kv_blocks = k_seqlen / (LOAD_BLOCKS*ROWS<D>), tic = 0;
     load_group::load_async(k_smem[loadid][0], g.Kg, {batch, head, loadid, 0});
     load_group::load_async(v_smem[loadid][0], g.Vg, {batch, head, loadid, 0});
     // iterate over k, v for these q's that have been loaded
     for(auto kv_idx = 0; kv_idx < kv_blocks; kv_idx++, tic=(tic+1)%3) {
         int next_load_idx = (kv_idx+1)*LOAD_BLOCKS + loadid;
-        if(next_load_idx*ROWS<D> < g.Kg.rows) {
+        if(next_load_idx*ROWS<D> < k_seqlen) {
             int next_tic = (tic+1)%3;
             load_group::load_async(k_smem[loadid][next_tic], g.Kg, {batch, head, next_load_idx, 0});
             load_group::load_async(v_smem[loadid][next_tic], g.Vg, {batch, head, next_load_idx, 0});
@@ -63,7 +70,10 @@ __global__ void attend_ker(const __grid_constant__ globals<D> g) {
         __syncthreads(); // Everyone's memory must be ready for the next stage.
         // now each warp goes through all of the subtiles, loads them, and then does the flash attention internal alg.
         #pragma unroll LOAD_BLOCKS
-        for(int subtile = 0; subtile < LOAD_BLOCKS && (kv_idx*LOAD_BLOCKS + subtile) < g.Qg.rows; subtile++) {
+        for(int subtile = 0;
+            subtile < LOAD_BLOCKS;
+            subtile++) {
+
             load(k_reg, k_smem[subtile][tic]); // load k from shared into registers
             zero(att_block); // zero 16x16 attention tile
             mma_ABt(att_block, q_reg, k_reg, att_block); // Q@K.T
@@ -99,52 +109,55 @@ __global__ void attend_ker(const __grid_constant__ globals<D> g) {
 torch::Tensor
 attention_decode_forward(
     torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor v,
-    bool causal
+    torch::Tensor k_cache,
+    torch::Tensor v_cache,
+    bool causal,
+    int k_seqlen
 )
 {
     CHECK_INPUT(q);
-    CHECK_INPUT(k);
-    CHECK_INPUT(v);
+    CHECK_INPUT(k_cache);
+    CHECK_INPUT(v_cache);
 
     auto batch     = q.size(0);
     auto q_seq_len = q.size(2); 
-    auto k_seq_len = k.size(2); 
+    auto k_max_len = k_cache.size(2); 
     auto head_dim  = q.size(3); 
-    auto is_causal = causal; 
     auto qo_heads  = q.size(1);
-    auto kv_heads  = k.size(1);
+    auto kv_heads  = k_cache.size(1);
+
+    TORCH_CHECK(causal == false, "Causal attention is not supported yet");
+    TORCH_CHECK(k_seqlen % 32 == 0, "K sequence length must be divisible by 32");
 
     // check to see that these dimensions match for all inputs
     TORCH_CHECK(q.size(0) == batch, "Q batch dimension - idx 0 - must match for all inputs");
-    TORCH_CHECK(k.size(0) == batch, "K batch dimension - idx 0 - must match for all inputs");
-    TORCH_CHECK(v.size(0) == batch, "V batch dimension - idx 0 - must match for all inputs");
+    TORCH_CHECK(k_cache.size(0) == batch, "K cache batch dimension - idx 0 - must match for all inputs");
+    TORCH_CHECK(v_cache.size(0) == batch, "V cache batch dimension - idx 0 - must match for all inputs");
 
     TORCH_CHECK(q_seq_len % 32 == 0, "Q sequence length must be divisible by 32");
-    TORCH_CHECK(k_seq_len % 32 == 0, "K sequence length must be divisible by 32");
+    TORCH_CHECK(k_max_len % 32 == 0, "K cache sequence length must be divisible by 32");
 
-    TORCH_CHECK(v.size(2) == k_seq_len, "V sequence length dimension - idx 2 - must match for all inputs");
+    TORCH_CHECK(v_cache.size(2) == k_max_len, "V cache sequence length dimension - idx 2 - must match for all inputs");
 
     TORCH_CHECK(q.size(3) == head_dim, "Q head dimension - idx 3 - must match for all non-vector inputs");
-    TORCH_CHECK(k.size(3) == head_dim, "K head dimension - idx 3 - must match for all non-vector inputs");
-    TORCH_CHECK(v.size(3) == head_dim, "V head dimension - idx 3 - must match for all non-vector inputs");
+    TORCH_CHECK(k_cache.size(3) == head_dim, "K cache head dimension - idx 3 - must match for all non-vector inputs");
+    TORCH_CHECK(v_cache.size(3) == head_dim, "V cache head dimension - idx 3 - must match for all non-vector inputs");
 
     TORCH_CHECK(qo_heads >= kv_heads, "QO heads must be greater than or equal to KV heads");
     TORCH_CHECK(qo_heads % kv_heads == 0, "QO heads must be divisible by KV heads");
     TORCH_CHECK(q.size(1) == qo_heads, "QO head dimension - idx 1 - must match for all inputs");
-    TORCH_CHECK(k.size(1) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
-    TORCH_CHECK(v.size(1) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
+    TORCH_CHECK(k_cache.size(1) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
+    TORCH_CHECK(v_cache.size(1) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
     
     auto hr = qo_heads / kv_heads;
 
     c10::BFloat16* q_ptr = q.data_ptr<c10::BFloat16>();
-    c10::BFloat16* k_ptr = k.data_ptr<c10::BFloat16>();
-    c10::BFloat16* v_ptr = v.data_ptr<c10::BFloat16>();
+    c10::BFloat16* k_cache_ptr = k_cache.data_ptr<c10::BFloat16>();
+    c10::BFloat16* v_cache_ptr = v_cache.data_ptr<c10::BFloat16>();
 
     bf16*  d_q = reinterpret_cast<bf16*>(q_ptr);
-    bf16*  d_k = reinterpret_cast<bf16*>(k_ptr);
-    bf16*  d_v = reinterpret_cast<bf16*>(v_ptr);
+    bf16*  d_k_cache = reinterpret_cast<bf16*>(k_cache_ptr);
+    bf16*  d_v_cache = reinterpret_cast<bf16*>(v_cache_ptr);
     
     // for the returned outputs
     torch::Tensor o     = torch::empty({static_cast<const uint>(batch), 
@@ -161,8 +174,8 @@ attention_decode_forward(
 
     if (head_dim == 64) {
         global_layout<64> qg(d_q, batch, qo_heads, q_seq_len, nullptr);
-        global_layout<64> kg(d_k, batch, kv_heads, k_seq_len, nullptr);
-        global_layout<64> vg(d_v, batch, kv_heads, k_seq_len, nullptr);
+        global_layout<64> kg(d_k_cache, batch, kv_heads, k_max_len, nullptr);
+        global_layout<64> vg(d_v_cache, batch, kv_heads, k_max_len, nullptr);
         global_layout<64> og(d_o, batch, qo_heads, q_seq_len, nullptr);
         globals<64> g(qg, kg, vg, og);
 
@@ -173,12 +186,16 @@ attention_decode_forward(
         );
 
         dim3 grid((q_seq_len + qkvo_tile<64>::rows*NUM_WORKERS - 1) / (qkvo_tile<64>::rows*NUM_WORKERS), qo_heads, batch);
-        attend_ker<64><<<grid, (32*NUM_WORKERS), mem_size>>>(g);
+        attend_ker<64><<<grid, (32*NUM_WORKERS), mem_size>>>(
+            g,
+            k_seqlen,
+            causal
+        );
     }
     else if (head_dim == 128) {
         global_layout<128> qg(d_q, batch, qo_heads, q_seq_len, nullptr);
-        global_layout<128> kg(d_k, batch, kv_heads, k_seq_len, nullptr);
-        global_layout<128> vg(d_v, batch, kv_heads, k_seq_len, nullptr);
+        global_layout<128> kg(d_k_cache, batch, kv_heads, k_max_len, nullptr);
+        global_layout<128> vg(d_v_cache, batch, kv_heads, k_max_len, nullptr);
         global_layout<128> og(d_o, batch, qo_heads, q_seq_len, nullptr);
         globals<128> g(qg, kg, vg, og);
 
@@ -189,7 +206,11 @@ attention_decode_forward(
         );
 
         dim3 grid((q_seq_len + qkvo_tile<128>::rows*NUM_WORKERS - 1) / (qkvo_tile<128>::rows*NUM_WORKERS), qo_heads, batch);
-        attend_ker<128><<<grid, (32*NUM_WORKERS), mem_size>>>(g);
+        attend_ker<128><<<grid, (32*NUM_WORKERS), mem_size>>>(
+            g,
+            k_seqlen,
+            causal
+        );
     }
     else {
         TORCH_CHECK(false, "head_dim must be 64 or 128");

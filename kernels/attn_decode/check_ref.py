@@ -318,9 +318,12 @@ def mha_fwd_decode(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    is_causal: bool = False,
+    causal: bool = False,
+    k_seqlen: int = None,
 ) -> torch.Tensor:
-    o = tk.mha_decode_forward(q, k, v, is_causal)
+    if k_seqlen is None:
+        k_seqlen = k.size(1)
+    o = tk.mha_decode_forward(q, k, v, causal, k_seqlen)
     return o
 
 def mha_fwd_ref(
@@ -381,32 +384,64 @@ if __name__ == "__main__":
 
     errors = []
 
-    for L_4090 in range(64, 1025, 32):
+    print('Various sequence lengths')
+    for L_4090 in range(32, 1025, 32):
         q_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
         k_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
         v_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
 
-        out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, is_causal=False)
+        out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, causal=False, k_seqlen=L_4090)
         out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=False)
 
         errors.append((L_4090, (out_tk_decode - out_ref_decode).abs().max().item()))
 
     print(errors)
+    
+    # max error
+    print('max error', max(errors, key=lambda x: x[1]))
 
+    print('Various Q sequence lengths')
     L_4090 = 1024
     errors = []
     
-    for L_4090_q in range(64, 1025, 32):
+    for L_4090_q in range(32, 1025, 32):
 
         q_decode = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
         k_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
         v_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
 
-        out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, is_causal=False)
+        out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, causal=False, k_seqlen=L_4090)
         out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=False)
 
         errors.append((L_4090_q, (out_tk_decode - out_ref_decode).abs().max().item()))
 
     print(errors)
+
+    # max error
+    print('max error', max(errors, key=lambda x: x[1]))
+
+    print('KV cache')
+    errors = []
+
+    # test KV cache
+    L_max = 1024
+    k_cache = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+    v_cache = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+
+    L_4090_q = 64
+    q_decode = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
+
+    for k_seqlen in range(32, 1025, 32):
+        out_tk_decode = mha_fwd_decode(q_decode, k_cache, v_cache, causal=False, k_seqlen=k_seqlen)
+        k_ = k_cache[:, :k_seqlen, :, :]
+        v_ = v_cache[:, :k_seqlen, :, :]
+        out_ref_decode = mha_fwd_ref(q_decode, k_, v_, causal=False)
+
+        errors.append((k_seqlen, (out_tk_decode - out_ref_decode).abs().max().item()))
+
+    print(errors)
+
+    # max error
+    print('max error', max(errors, key=lambda x: x[1]))
 
     breakpoint()

@@ -35,7 +35,7 @@ extern std::vector<torch::Tensor> attention_backward(
 
 #ifdef TK_COMPILE_ATTN_DECODE
 extern torch::Tensor attention_decode_forward(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, bool causal
+    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, bool causal, int k_seqlen
 ); 
 #endif
 
@@ -142,7 +142,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #endif
 
 #ifdef TK_COMPILE_ATTN_DECODE
-    m.def("mha_decode_forward", attention_decode_forward, "Forward MHA for decoding. Takes Q,K,V in (B,H,N,D) where D must be 64 or 128. N must be a multiple of 32.");
+    m.def("mha_decode_forward", attention_decode_forward, "Forward MHA for decoding. Takes Q,K_cache,V_cache in (B,H,N,D) where D must be 64 or 128. N must be a multiple of 32.");
 #endif
 
 #ifdef TK_COMPILE_HEDGEHOG

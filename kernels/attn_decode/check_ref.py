@@ -433,8 +433,8 @@ if __name__ == "__main__":
 
     for k_seqlen in range(32, 1025, 32):
         out_tk_decode = mha_fwd_decode(q_decode, k_cache, v_cache, causal=False, k_seqlen=k_seqlen)
-        k_ = k_cache[:, :k_seqlen, :, :]
-        v_ = v_cache[:, :k_seqlen, :, :]
+        k_ = k_cache[:, :, :k_seqlen, :]
+        v_ = v_cache[:, :, :k_seqlen, :]
         out_ref_decode = mha_fwd_ref(q_decode, k_, v_, causal=False)
 
         errors.append((k_seqlen, (out_tk_decode - out_ref_decode).abs().max().item()))

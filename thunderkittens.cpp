@@ -33,6 +33,12 @@ extern std::vector<torch::Tensor> attention_backward(
 );
 #endif
 
+#ifdef TK_COMPILE_ATTN_DECODE
+extern torch::Tensor attention_decode_forward(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, bool causal
+); 
+#endif
+
 #ifdef TK_COMPILE_HEDGEHOG
 extern std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hedgehog(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, 
@@ -133,6 +139,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #ifdef TK_COMPILE_ATTN
     m.def("mha_forward",  torch::wrap_pybind_function(attention_forward), "Bidirectional forward MHA. Takes Q,K,V,O in (B,H,N,D) where D must be 64 or 128, and N must be a multiple of 64. Additionally writes out norm vector L of shape (B,H,N), used in backward pass.");
     m.def("mha_backward", torch::wrap_pybind_function(attention_backward), "Bidirectional backward MHA. Takes Q,K,V,O,Og,Qg,Kg,Vg in (B,H,N,D) where D must be 64 or 128, and N must be a multiple of 64. Additionally requres norm vec l_vec, and (TODO) d_vec memory.");
+#endif
+
+#ifdef TK_COMPILE_ATTN_DECODE
+    m.def("mha_decode_forward", attention_decode_forward, "Forward MHA for decoding. Takes Q,K,V in (B,H,N,D) where D must be 64 or 128. N must be a multiple of 32.");
 #endif
 
 #ifdef TK_COMPILE_HEDGEHOG

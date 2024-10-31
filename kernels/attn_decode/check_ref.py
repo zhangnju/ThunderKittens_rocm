@@ -314,6 +314,15 @@ def mha_fwd_tk(
     o, l_vec = tk.mha_forward(q, k, v, is_causal)
     return o
 
+def mha_fwd_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    is_causal: bool = False,
+) -> torch.Tensor:
+    o = tk.mha_decode_forward(q, k, v, is_causal)
+    return o
+
 def mha_fwd_ref(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -369,5 +378,19 @@ if __name__ == "__main__":
     out_ref = mha_fwd_ref(q_tk, k_tk, v_tk, causal=is_causal)
 
     print((out_tk - out_ref).abs().max())
+
+    errors = []
+
+    for L_4090 in range(64, 1025, 32):
+        q_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
+        k_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
+        v_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
+
+        out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, is_causal=False)
+        out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=False)
+
+        errors.append((L_4090, (out_tk_decode - out_ref_decode).abs().max().item()))
+
+    print(errors)
 
     breakpoint()

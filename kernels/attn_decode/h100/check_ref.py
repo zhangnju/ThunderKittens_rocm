@@ -359,14 +359,15 @@ if __name__ == "__main__":
 
     print((out_fa2 - out_torch).abs().max())
 
-    q_tk = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
-    k_tk = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
-    v_tk = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+    L_fragile = 1152 # multiple of 384
+
+    q_tk = torch.randn(B, H, L_fragile, d, device="cuda", dtype=dtype)
+    k_tk = torch.randn(B, H, L_fragile, d, device="cuda", dtype=dtype)
+    v_tk = torch.randn(B, H, L_fragile, d, device="cuda", dtype=dtype)
 
     out_tk = mha_fwd_tk(q_tk, k_tk, v_tk, is_causal=is_causal)
     out_ref = mha_fwd_ref(q_tk, k_tk, v_tk, causal=is_causal)
 
-    # this is incorrect??
     print((out_tk - out_ref).abs().max())
 
     breakpoint()

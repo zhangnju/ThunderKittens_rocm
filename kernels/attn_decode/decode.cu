@@ -52,13 +52,18 @@ __global__ void attend_ker(
     zero(o_reg);
     // launch the load of the first k, v tiles
     // total number of blocks we want to load
-    int kv_blocks = (k_seqlen + (LOAD_BLOCKS*ROWS<D>) - 1) / (LOAD_BLOCKS*ROWS<D>), tic = 0;
+    int kv_blocks = (k_seqlen + (LOAD_BLOCKS*ROWS<D>) - 1) / (LOAD_BLOCKS*ROWS<D>);
+    int tic = 0;
     load_group::load_async(k_smem[loadid][0], g.Kg, {batch, head, loadid, 0});
     load_group::load_async(v_smem[loadid][0], g.Vg, {batch, head, loadid, 0});
     // iterate over k, v for these q's that have been loaded
     for(auto kv_idx = 0; kv_idx < kv_blocks; kv_idx++, tic=(tic+1)%3) {
+        int cur_load_idx = kv_idx*LOAD_BLOCKS;
+        if (causal && cur_load_idx > q_seq) { break; } // skip if we're past the causal mask
+
         int next_load_idx = (kv_idx+1)*LOAD_BLOCKS + loadid;
-        if(next_load_idx*ROWS<D> < k_seqlen) {
+        if(next_load_idx*ROWS<D> < k_seqlen && (!causal || next_load_idx <= q_seq)) {
+            // load the next tiles, but skip if we're past the causal mask
             int next_tic = (tic+1)%3;
             load_group::load_async(k_smem[loadid][next_tic], g.Kg, {batch, head, next_load_idx, 0});
             load_group::load_async(v_smem[loadid][next_tic], g.Vg, {batch, head, next_load_idx, 0});
@@ -72,10 +77,16 @@ __global__ void attend_ker(
             subtile < LOAD_BLOCKS &&
             kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> < k_seqlen;
             subtile++) {
+            // we've passed the causal mask for this subtile
+            if (causal && kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> > q_seq * ROWS<D>) { break; }
 
             load(k_reg, k_smem[subtile][tic]); // load k from shared into registers
             zero(att_block); // zero 16x16 attention tile
             mma_ABt(att_block, q_reg, k_reg, att_block); // Q@K.T
+            if (causal && kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> == q_seq * ROWS<D>) {
+                // we are on the diagonal, so we need to mask out the upper triangle
+                make_causal_t(att_block, att_block, kittens::base_types::constants<float>::neg_infty());
+            }
             copy(max_vec_last,  max_vec);
             row_max(max_vec, att_block, max_vec); // accumulate onto the max_vec
             sub_row(att_block, att_block, max_vec); // subtract max from attention -- now all <=0
@@ -125,8 +136,8 @@ attention_decode_forward(
     auto qo_heads  = q.size(1);
     auto kv_heads  = k_cache.size(1);
 
-    TORCH_CHECK(causal == false, "Causal attention is not supported yet");
     TORCH_CHECK(k_seqlen % 32 == 0, "K sequence length must be divisible by 32");
+    TORCH_CHECK(!causal || k_seqlen == k_max_len, "K sequence length must match K cache length if causal attention is enabled");
 
     // check to see that these dimensions match for all inputs
     TORCH_CHECK(q.size(0) == batch, "Q batch dimension - idx 0 - must match for all inputs");

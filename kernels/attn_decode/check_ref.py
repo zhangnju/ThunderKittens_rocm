@@ -336,7 +336,12 @@ def mha_fwd_ref(
     QK = torch.matmul(q, k.transpose(-2, -1))
     QK /= (q.size(-1) ** 0.5)
     if causal:
-        mask = torch.triu(torch.ones(QK.size(-2), QK.size(-1)), 1).to(torch.bool).to(QK.device)
+        # Create position indices for queries and keys
+        q_idx = torch.arange(q.size(-2), device=q.device)
+        k_idx = torch.arange(k.size(-2), device=k.device)
+        # A query at position i can attend to keys up to position i + (k_len - q_len)
+        # This works for both prefill (k_len == q_len) and decode (k_len > q_len)
+        mask = k_idx[None, :] > (q_idx[:, None] + (k.size(-2) - q.size(-2)))
         QK.masked_fill_(mask, float('-inf'))
     QK = torch.nn.functional.softmax(QK, dim=-1)
     output = torch.matmul(QK, v)
@@ -371,16 +376,16 @@ if __name__ == "__main__":
 
     print((out_fa2 - out_torch).abs().max())
 
-    L_fragile = 1152 # multiple of 384
+    # L_fragile = 1152 # multiple of 384
 
-    q_tk = torch.randn(B, H, L_fragile, d, device="cuda", dtype=dtype)
-    k_tk = torch.randn(B, H, L_fragile, d, device="cuda", dtype=dtype)
-    v_tk = torch.randn(B, H, L_fragile, d, device="cuda", dtype=dtype)
+    # q_tk = torch.randn(B, H, L_fragile, d, device="cuda", dtype=dtype)
+    # k_tk = torch.randn(B, H, L_fragile, d, device="cuda", dtype=dtype)
+    # v_tk = torch.randn(B, H, L_fragile, d, device="cuda", dtype=dtype)
 
-    out_tk = mha_fwd_tk(q_tk, k_tk, v_tk, is_causal=is_causal)
-    out_ref = mha_fwd_ref(q_tk, k_tk, v_tk, causal=is_causal)
+    # out_tk = mha_fwd_tk(q_tk, k_tk, v_tk, is_causal=is_causal)
+    # out_ref = mha_fwd_ref(q_tk, k_tk, v_tk, causal=is_causal)
 
-    print((out_tk - out_ref).abs().max())
+    # print((out_tk - out_ref).abs().max())
 
     errors = []
 
@@ -443,5 +448,42 @@ if __name__ == "__main__":
 
     # max error
     print('max error', max(errors, key=lambda x: x[1]))
+
+    print('Causal, various sequence lengths')
+    errors = []
+
+    for L_4090 in range(32, 1025, 32):
+        q_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
+        k_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
+        v_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
+
+        out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, causal=True, k_seqlen=L_4090) # wrong for now
+        out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=True)
+        breakpoint()
+
+        errors.append((L_4090, (out_tk_decode - out_ref_decode).abs().max().item()))
+
+    print(errors)
+
+    # max error
+    print('max error', max(errors, key=lambda x: x[1]))
+
+    # print('Causal, KV cache')
+    # errors = []
+
+    # for L_4090 in range(32, 1025, 32):
+    #     q_decode = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
+    #     k_decode = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+    #     v_decode = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+
+    #     out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, causal=False, k_seqlen=L_4090) # wrong for now
+    #     out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=True)
+
+    #     errors.append((L_4090, (out_tk_decode - out_ref_decode).abs().max().item()))
+
+    # print(errors)
+
+    # # max error
+    # print('max error', max(errors, key=lambda x: x[1]))
 
     breakpoint()

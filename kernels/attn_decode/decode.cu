@@ -38,7 +38,7 @@ __global__ void attend_ker(
     typename attn_tile<D, float>::col_vec max_vec_last, max_vec, norm_vec; // these are column vectors for the in-place softmax.
     // each warp loads its own Q tile of 16x64
     if (q_seq*ROWS<D> < g.Qg.rows) {
-        load(qo_smem[workerid], g.Qg, {batch, head, q_seq, 0});  // going through shared memory improves coalescing of dram reads.
+        load<shared_tile<D>, global_layout<D>, 2>(qo_smem[workerid], g.Qg, {batch, head, q_seq, 0});  // going through shared memory improves coalescing of dram reads.
         __syncwarp();
         load(q_reg, qo_smem[workerid]);
     }
@@ -54,8 +54,8 @@ __global__ void attend_ker(
     // total number of blocks we want to load
     int kv_blocks = (k_seqlen + (LOAD_BLOCKS*ROWS<D>) - 1) / (LOAD_BLOCKS*ROWS<D>);
     int tic = 0;
-    load_group::load_async(k_smem[loadid][0], g.Kg, {batch, head, loadid, 0});
-    load_group::load_async(v_smem[loadid][0], g.Vg, {batch, head, loadid, 0});
+    load_group::load_async<shared_tile<D>, global_layout<D>, 2>(k_smem[loadid][0], g.Kg, {batch, head, loadid, 0});
+    load_group::load_async<shared_tile<D>, global_layout<D>, 2>(v_smem[loadid][0], g.Vg, {batch, head, loadid, 0});
     // iterate over k, v for these q's that have been loaded
     for(auto kv_idx = 0; kv_idx < kv_blocks; kv_idx++, tic=(tic+1)%3) {
         int cur_load_idx = kv_idx*LOAD_BLOCKS;
@@ -65,8 +65,8 @@ __global__ void attend_ker(
         if(next_load_idx*ROWS<D> < k_seqlen && (!causal || next_load_idx <= q_seq)) {
             // load the next tiles, but skip if we're past the causal mask
             int next_tic = (tic+1)%3;
-            load_group::load_async(k_smem[loadid][next_tic], g.Kg, {batch, head, next_load_idx, 0});
-            load_group::load_async(v_smem[loadid][next_tic], g.Vg, {batch, head, next_load_idx, 0});
+            load_group::load_async<shared_tile<D>, global_layout<D>, 2>(k_smem[loadid][next_tic], g.Kg, {batch, head, next_load_idx, 0});
+            load_group::load_async<shared_tile<D>, global_layout<D>, 2>(v_smem[loadid][next_tic], g.Vg, {batch, head, next_load_idx, 0});
             load_async_wait<2>(); // next k, v can stay in flight.
         }
         else load_async_wait(); // all must arrive
@@ -106,7 +106,7 @@ __global__ void attend_ker(
     if (q_seq*ROWS<D> < g.Qg.rows) { // write out o.
         store(qo_smem[workerid], o_reg); // going through shared memory improves coalescing of dram writes.
         __syncwarp();
-        store(g.Og, qo_smem[workerid], {batch, head, q_seq, 0});
+        store<shared_tile<D>, global_layout<D>, 2>(g.Og, qo_smem[workerid], {batch, head, q_seq, 0});
     }
 }
 

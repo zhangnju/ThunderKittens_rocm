@@ -457,9 +457,8 @@ if __name__ == "__main__":
         k_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
         v_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
 
-        out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, causal=True, k_seqlen=L_4090) # wrong for now
+        out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, causal=True, k_seqlen=L_4090)
         out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=True)
-        breakpoint()
 
         errors.append((L_4090, (out_tk_decode - out_ref_decode).abs().max().item()))
 

@@ -22,6 +22,7 @@ __global__ void attend_ker(
     int loadid = load_group::groupid(), workerid = kittens::warpid(); // which worker am I?
     constexpr int LOAD_BLOCKS = NUM_WORKERS / load_group::GROUP_WARPS;
     const int batch = blockIdx.z, head  = blockIdx.y, q_seq = blockIdx.x * NUM_WORKERS + workerid;
+    const int q_seq_next = (blockIdx.x + 1) * NUM_WORKERS;
 
     extern __shared__ alignment_dummy __shm[]; // this is the CUDA shared memory
     shared_allocator al((int*)&__shm[0]);
@@ -60,11 +61,12 @@ __global__ void attend_ker(
     // iterate over k, v for these q's that have been loaded
     for(auto kv_idx = 0; kv_idx < kv_blocks; kv_idx++, tic=(tic+1)%3) {
         int cur_load_idx = kv_idx*LOAD_BLOCKS;
-        if (causal && cur_load_idx > q_seq) { break; } // skip if we're past the causal mask
 
         int next_load_idx = (kv_idx+1)*LOAD_BLOCKS + loadid;
-        if(next_load_idx*ROWS<D> < k_seqlen && (!causal || next_load_idx <= q_seq)) {
+        if(next_load_idx*ROWS<D> < k_seqlen && (!causal || next_load_idx <= q_seq_next)) { 
             // load the next tiles, but skip if we're past the causal mask
+            // every two workers are working together to load the next tiles, then broadcast to all workers
+            // we need to load the next times for all workers, and then skip selectively in the individual worker
             int next_tic = (tic+1)%3;
             load_group::load_async<shared_tile<D>, global_layout<D>, 2>(k_smem[loadid][next_tic], g.Kg, {batch, head, next_load_idx, 0}, ROWS<D>, ZERO);
             load_group::load_async<shared_tile<D>, global_layout<D>, 2>(v_smem[loadid][next_tic], g.Vg, {batch, head, next_load_idx, 0}, ROWS<D>, ZERO);
@@ -86,7 +88,7 @@ __global__ void attend_ker(
             mma_ABt(att_block, q_reg, k_reg, att_block); // Q@K.T
             if (causal && kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> == q_seq * ROWS<D>) {
                 // we are on the diagonal, so we need to mask out the upper triangle
-                make_causal_t(att_block, att_block, kittens::base_types::constants<float>::neg_infty());
+                make_causal(att_block, att_block, kittens::base_types::constants<float>::neg_infty());
             }
             copy(max_vec_last,  max_vec);
             row_max(max_vec, att_block, max_vec); // accumulate onto the max_vec

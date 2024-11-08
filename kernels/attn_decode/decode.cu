@@ -70,8 +70,8 @@ __global__ void attend_ker(
             // skip if we're out of K's or we're past the causal mask
             load_next = next_load_idx*ROWS<D> < k_seqlen && (!causal || next_load_idx <= q_seq_next);
         } else {
-            // skip if we're out of KNew's - we load all the way to the end even if causal
-            load_next = next_load_idx*ROWS<D> < k_seqlen + k_new_seqlen;
+            // skip if we're out of KNew's or we're past the causal mask for KNew
+            load_next = next_load_idx*ROWS<D> < k_seqlen + k_new_seqlen && (!causal || (kv_idx + 1 - kv_blocks) * LOAD_BLOCKS + loadid <= q_seq_next);
         }
         if(load_next && next_load_idx*ROWS<D> < k_seqlen) {
             // every two workers are working together to load the next tiles, then broadcast to all workers
@@ -99,13 +99,15 @@ __global__ void attend_ker(
             subtile++) {
             if (
                 causal && (
-                    k_new_seqlen == 0 &&
-                    kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> > q_seq * ROWS<D> // we've passed the diagonal for this subtile and not using KNew
-                ) ||
-                (
-                    k_new_seqlen > 0 &&
-                    kv_idx >= kv_blocks &&
-                    (kv_idx - kv_blocks) * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> > q_seq * ROWS<D> // we've passed the diagonal for this subtile and using KNew
+                    (
+                        k_new_seqlen == 0 &&
+                        kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> > q_seq * ROWS<D> // we've passed the diagonal for this subtile and not using KNew
+                    ) ||
+                    (
+                        k_new_seqlen > 0 &&
+                        kv_idx >= kv_blocks &&
+                        (kv_idx - kv_blocks) * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> > q_seq * ROWS<D> // we've passed the diagonal for this subtile and using KNew
+                    )
                 )
             ){
                 break;

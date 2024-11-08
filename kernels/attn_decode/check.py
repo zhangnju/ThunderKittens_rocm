@@ -569,4 +569,37 @@ if __name__ == "__main__":
     # max error
     print('max error', max(errors, key=lambda x: x[1]))
 
+    print('KV cache update in-place, causal, Q_lengths')
+    errors = []
+
+    L_4090 = 512
+    for L_4090_q in range(32, 1025, 32):
+        q_decode = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
+        k_decode = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+        v_decode = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+        k_decode[:, :, L_4090:] = 0
+        v_decode[:, :, L_4090:] = 0
+        
+        # clone for in-place operations
+        k_decode_ref = k_decode.clone()
+        v_decode_ref = v_decode.clone()
+        k_new = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
+        v_new = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
+
+        out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=True, k_seqlen=L_4090)
+
+        out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=True, k_seqlen=L_4090)
+
+        errors.append((
+            L_4090,
+            (out_tk_decode - out_ref_decode).abs().max().item(),
+            (k_cache_tk - k_cache_ref).abs().max().item(),
+            (v_cache_tk - v_cache_ref).abs().max().item()
+        ))
+
+    print(errors)
+
+    # max error
+    print('max error', max(errors, key=lambda x: x[1]))
+
     breakpoint()

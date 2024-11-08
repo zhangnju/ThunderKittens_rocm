@@ -9,13 +9,14 @@ template<int D, typename T=bf16, typename L=row_l> using qkvo_tile = rt<T, ROWS<
 template<int D, typename T=float> using attn_tile = rt<T, ROWS<D>, ROWS<D>>;
 template<int D> using shared_tile = st_bf<ROWS<D>, D>;
 template<int D> using global_layout = gl<bf16, -1, -1, -1, D>; // B, H, g.Qg.rows specified at runtime, D=64 known at compile time for this kernel
-template<int D> struct globals { global_layout<D> Qg, Kg, Vg, Og; };
+template<int D> struct globals { global_layout<D> Qg, KCacheg, VCacheg, Og, KNewg, VNewg; };
 
 template<int D> __launch_bounds__(NUM_WORKERS*WARP_THREADS, 1)
 __global__ void attend_ker(
-    const __grid_constant__ globals<D> g,
-    int k_seqlen,
-    bool causal
+    const __grid_constant__ globals<D> g,   // Q, KCache, VCache, O, KNew, VNew
+    int k_seqlen,                           // KCache sequence length
+    int k_new_seqlen,                       // KNew sequence length
+    bool causal                             // causal attention flag
 ) {
     auto ZERO = kittens::base_types::constants<bf16>::zero();
     using load_group = kittens::group<2>; // pairs of workers collaboratively load k, v tiles
@@ -55,11 +56,12 @@ __global__ void attend_ker(
     // launch the load of the first k, v tiles
     // total number of blocks we want to load
     int kv_blocks = (k_seqlen + (LOAD_BLOCKS*ROWS<D>) - 1) / (LOAD_BLOCKS*ROWS<D>);
+    int kv_blocks_total = (k_seqlen + k_new_seqlen + (LOAD_BLOCKS*ROWS<D>) - 1) / (LOAD_BLOCKS*ROWS<D>);
     int tic = 0;
-    load_group::load_async<shared_tile<D>, global_layout<D>, 2>(k_smem[loadid][0], g.Kg, {batch, head, loadid, 0}, ROWS<D>, ZERO);
-    load_group::load_async<shared_tile<D>, global_layout<D>, 2>(v_smem[loadid][0], g.Vg, {batch, head, loadid, 0}, ROWS<D>, ZERO);
+    load_group::load_async<shared_tile<D>, global_layout<D>, 2>(k_smem[loadid][0], g.KCacheg, {batch, head, loadid, 0}, ROWS<D>, ZERO);
+    load_group::load_async<shared_tile<D>, global_layout<D>, 2>(v_smem[loadid][0], g.VCacheg, {batch, head, loadid, 0}, ROWS<D>, ZERO);
     // iterate over k, v for these q's that have been loaded
-    for(auto kv_idx = 0; kv_idx < kv_blocks; kv_idx++, tic=(tic+1)%3) {
+    for(auto kv_idx = 0; kv_idx < kv_blocks_total; kv_idx++, tic=(tic+1)%3) {
         int cur_load_idx = kv_idx*LOAD_BLOCKS;
 
         int next_load_idx = (kv_idx+1)*LOAD_BLOCKS + loadid;
@@ -68,8 +70,16 @@ __global__ void attend_ker(
             // every two workers are working together to load the next tiles, then broadcast to all workers
             // we need to load the next times for all workers, and then skip selectively in the individual worker
             int next_tic = (tic+1)%3;
-            load_group::load_async<shared_tile<D>, global_layout<D>, 2>(k_smem[loadid][next_tic], g.Kg, {batch, head, next_load_idx, 0}, ROWS<D>, ZERO);
-            load_group::load_async<shared_tile<D>, global_layout<D>, 2>(v_smem[loadid][next_tic], g.Vg, {batch, head, next_load_idx, 0}, ROWS<D>, ZERO);
+            load_group::load_async<shared_tile<D>, global_layout<D>, 2>(k_smem[loadid][next_tic], g.KCacheg, {batch, head, next_load_idx, 0}, ROWS<D>, ZERO);
+            load_group::load_async<shared_tile<D>, global_layout<D>, 2>(v_smem[loadid][next_tic], g.VCacheg, {batch, head, next_load_idx, 0}, ROWS<D>, ZERO);
+            load_async_wait<2>(); // next k, v can stay in flight.
+        }
+        else if (next_load_idx*ROWS<D> < k_seqlen + k_new_seqlen && (!causal || next_load_idx <= q_seq_next)) {
+            // load the next tiles from KNew and VNew
+            int next_tic = (tic+1)%3;
+            int kv_new_idx = (kv_idx - kv_blocks + 1) * LOAD_BLOCKS + loadid;
+            load_group::load_async<shared_tile<D>, global_layout<D>, 2>(k_smem[loadid][next_tic], g.KNewg, {batch, head, kv_new_idx, 0}, ROWS<D>, ZERO);
+            load_group::load_async<shared_tile<D>, global_layout<D>, 2>(v_smem[loadid][next_tic], g.VNewg, {batch, head, kv_new_idx, 0}, ROWS<D>, ZERO);
             load_async_wait<2>(); // next k, v can stay in flight.
         }
         else load_async_wait(); // all must arrive
@@ -78,7 +88,7 @@ __global__ void attend_ker(
         #pragma unroll LOAD_BLOCKS
         for(int subtile = 0;
             subtile < LOAD_BLOCKS &&
-            kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> < k_seqlen;
+            kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> < k_seqlen + k_new_seqlen;
             subtile++) {
             // we've passed the causal mask for this subtile
             if (causal && kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> > q_seq * ROWS<D>) { break; }
@@ -110,6 +120,21 @@ __global__ void attend_ker(
         store(qo_smem[workerid], o_reg); // going through shared memory improves coalescing of dram writes.
         __syncwarp();
         store<shared_tile<D>, global_layout<D>, 2>(g.Og, qo_smem[workerid], {batch, head, q_seq, 0});
+
+        if (k_new_seqlen > 0) {
+            __syncwarp();
+            int kv_blocks_orig = (k_seqlen + ROWS<D> - 1) / ROWS<D>;
+            // in-place update KCache with KNew
+            load<shared_tile<D>, global_layout<D>, 2>(qo_smem[workerid], g.KNewg, {batch, head, q_seq, 0}, ROWS<D>, ZERO);  // going through shared memory improves coalescing of dram reads.
+            __syncwarp();
+            store<shared_tile<D>, global_layout<D>, 2>(g.KCacheg, qo_smem[workerid], {batch, head, kv_blocks_orig + q_seq, 0});
+
+            __syncwarp();
+            // in-place update VCache with VNew
+            load<shared_tile<D>, global_layout<D>, 2>(qo_smem[workerid], g.VNewg, {batch, head, q_seq, 0}, ROWS<D>, ZERO);  // going through shared memory improves coalescing of dram reads.
+            __syncwarp();
+            store<shared_tile<D>, global_layout<D>, 2>(g.VCacheg, qo_smem[workerid], {batch, head, kv_blocks_orig + q_seq, 0});
+        }
     }
 }
 
@@ -124,6 +149,8 @@ attention_decode_forward(
     torch::Tensor q,
     torch::Tensor k_cache,
     torch::Tensor v_cache,
+    c10::optional<torch::Tensor> k_new_,
+    c10::optional<torch::Tensor> v_new_,
     bool causal,
     int k_seqlen
 )
@@ -161,16 +188,38 @@ attention_decode_forward(
     TORCH_CHECK(q.size(1) == qo_heads, "QO head dimension - idx 1 - must match for all inputs");
     TORCH_CHECK(k_cache.size(1) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
     TORCH_CHECK(v_cache.size(1) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
+
+    torch::Tensor k_new, v_new;
+    auto k_new_seqlen = k_new_.has_value() ? k_new_.value().size(2) : 0;
+    if (k_new_.has_value()) {
+        assert(v_new_.has_value());
+        k_new = k_new_.value();
+        v_new = v_new_.value();
+        CHECK_INPUT(k_new);
+        CHECK_INPUT(v_new);
+        TORCH_CHECK(k_new.size(0) == batch, "K new batch dimension - idx 0 - must match for all inputs");
+        TORCH_CHECK(v_new.size(0) == batch, "V new batch dimension - idx 0 - must match for all inputs");
+        TORCH_CHECK(k_new.size(1) == kv_heads, "K new heads - idx 1 - must match for all inputs");
+        TORCH_CHECK(v_new.size(1) == kv_heads, "V new heads - idx 1 - must match for all inputs");
+        TORCH_CHECK(k_new.size(2) == q_seq_len, "K new sequence length - idx 2 - must match for all inputs");
+        TORCH_CHECK(v_new.size(2) == q_seq_len, "V new sequence length - idx 2 - must match for all inputs");
+        TORCH_CHECK(k_new.size(3) == head_dim, "K new head dimension - idx 3 - must match for all inputs");
+        TORCH_CHECK(v_new.size(3) == head_dim, "V new head dimension - idx 3 - must match for all inputs");
+    }
     
     auto hr = qo_heads / kv_heads;
 
     c10::BFloat16* q_ptr = q.data_ptr<c10::BFloat16>();
     c10::BFloat16* k_cache_ptr = k_cache.data_ptr<c10::BFloat16>();
     c10::BFloat16* v_cache_ptr = v_cache.data_ptr<c10::BFloat16>();
+    c10::BFloat16* k_new_ptr = k_new_.has_value() ? k_new.data_ptr<c10::BFloat16>() : nullptr;
+    c10::BFloat16* v_new_ptr = v_new_.has_value() ? v_new.data_ptr<c10::BFloat16>() : nullptr;
 
     bf16*  d_q = reinterpret_cast<bf16*>(q_ptr);
     bf16*  d_k_cache = reinterpret_cast<bf16*>(k_cache_ptr);
     bf16*  d_v_cache = reinterpret_cast<bf16*>(v_cache_ptr);
+    bf16*  d_k_new = k_new_ptr ? reinterpret_cast<bf16*>(k_new_ptr) : nullptr;
+    bf16*  d_v_new = v_new_ptr ? reinterpret_cast<bf16*>(v_new_ptr) : nullptr;
     
     // for the returned outputs
     torch::Tensor o     = torch::empty({static_cast<const uint>(batch), 
@@ -190,7 +239,9 @@ attention_decode_forward(
         global_layout<64> kg(d_k_cache, batch, kv_heads, k_max_len, nullptr);
         global_layout<64> vg(d_v_cache, batch, kv_heads, k_max_len, nullptr);
         global_layout<64> og(d_o, batch, qo_heads, q_seq_len, nullptr);
-        globals<64> g(qg, kg, vg, og);
+        global_layout<64> kg_new(d_k_new, batch, kv_heads, q_seq_len, nullptr);
+        global_layout<64> vg_new(d_v_new, batch, kv_heads, q_seq_len, nullptr);
+        globals<64> g(qg, kg, vg, og, kg_new, vg_new);
 
         cudaFuncSetAttribute(
             attend_ker<64>,
@@ -202,6 +253,7 @@ attention_decode_forward(
         attend_ker<64><<<grid, (32*NUM_WORKERS), mem_size>>>(
             g,
             k_seqlen,
+            k_new_seqlen,
             causal
         );
     }
@@ -210,7 +262,9 @@ attention_decode_forward(
         global_layout<128> kg(d_k_cache, batch, kv_heads, k_max_len, nullptr);
         global_layout<128> vg(d_v_cache, batch, kv_heads, k_max_len, nullptr);
         global_layout<128> og(d_o, batch, qo_heads, q_seq_len, nullptr);
-        globals<128> g(qg, kg, vg, og);
+        global_layout<128> kg_new(d_k_new, batch, kv_heads, q_seq_len, nullptr);
+        global_layout<128> vg_new(d_v_new, batch, kv_heads, q_seq_len, nullptr);
+        globals<128> g(qg, kg, vg, og, kg_new, vg_new);
 
         cudaFuncSetAttribute(
             attend_ker<128>,
@@ -222,6 +276,7 @@ attention_decode_forward(
         attend_ker<128><<<grid, (32*NUM_WORKERS), mem_size>>>(
             g,
             k_seqlen,
+            k_new_seqlen,
             causal
         );
     }

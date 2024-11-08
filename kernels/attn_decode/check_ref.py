@@ -316,15 +316,17 @@ def mha_fwd_tk(
 
 def mha_fwd_decode(
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_new: Optional[torch.Tensor] = None,
+    v_new: Optional[torch.Tensor] = None,
     causal: bool = False,
     k_seqlen: int = None,
 ) -> torch.Tensor:
     if k_seqlen is None:
-        k_seqlen = k.size(1)
-    o = tk.mha_decode_forward(q, k, v, causal, k_seqlen)
-    return o
+        k_seqlen = k_new.size(1)
+    o = tk.mha_decode_forward(q, k_cache, v_cache, k_new, v_new, causal, k_seqlen)
+    return o, k_cache, v_cache
 
 def mha_fwd_ref(
     q: torch.Tensor,
@@ -347,6 +349,40 @@ def mha_fwd_ref(
     output = torch.matmul(QK, v)
 
     return output
+
+def mha_fwd_ref_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_new: Optional[torch.Tensor] = None,
+    v_new: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    k_seqlen: int = None,
+) -> torch.Tensor:
+    k_cache_fn = k_cache[:, :, :k_seqlen, :]
+    v_cache_fn = v_cache[:, :, :k_seqlen, :]
+    if k_new is not None:
+        assert v_new is not None
+        k_cache_fn = torch.cat([k_cache_fn, k_new], dim=2)
+        v_cache_fn = torch.cat([v_cache_fn, v_new], dim=2)
+        k_cache[:, :, :k_cache_fn.size(2), :] = k_cache_fn
+        v_cache[:, :, :v_cache_fn.size(2), :] = v_cache_fn
+
+    # manual pytorch implementation of scaled dot product attention
+    QK = torch.matmul(q, k_cache_fn.transpose(-2, -1))
+    QK /= (q.size(-1) ** 0.5)
+    if causal:
+        # Create position indices for queries and keys
+        q_idx = torch.arange(q.size(-2), device=q.device)
+        k_idx = torch.arange(k_cache_fn.size(-2), device=k_cache_fn.device)
+        # A query at position i can attend to keys up to position i + (k_len - q_len)
+        # This works for both prefill (k_len == q_len) and decode (k_len > q_len)
+        mask = k_idx[None, :] > (q_idx[:, None] + (k_cache_fn.size(-2) - q.size(-2)))
+        QK.masked_fill_(mask, float('-inf'))
+    QK = torch.nn.functional.softmax(QK, dim=-1)
+    output = torch.matmul(QK, v_cache_fn)
+
+    return output, k_cache, v_cache
 
 if __name__ == "__main__":
     B = 4
@@ -395,7 +431,7 @@ if __name__ == "__main__":
         k_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
         v_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
 
-        out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, causal=False, k_seqlen=L_4090)
+        out_tk_decode, _, _ = mha_fwd_decode(q_decode, k_decode, v_decode, causal=False, k_seqlen=L_4090)
         out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=False)
 
         errors.append((L_4090, (out_tk_decode - out_ref_decode).abs().max().item()))
@@ -415,7 +451,7 @@ if __name__ == "__main__":
         k_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
         v_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
 
-        out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, causal=False, k_seqlen=L_4090)
+        out_tk_decode, _, _ = mha_fwd_decode(q_decode, k_decode, v_decode, causal=False, k_seqlen=L_4090)
         out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=False)
 
         errors.append((L_4090_q, (out_tk_decode - out_ref_decode).abs().max().item()))
@@ -429,7 +465,7 @@ if __name__ == "__main__":
     errors = []
 
     # test KV cache
-    L_max = 1024
+    L_max = 4096
     k_cache = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
     v_cache = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
 
@@ -437,7 +473,7 @@ if __name__ == "__main__":
     q_decode = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
 
     for k_seqlen in range(32, 1025, 32):
-        out_tk_decode = mha_fwd_decode(q_decode, k_cache, v_cache, causal=False, k_seqlen=k_seqlen)
+        out_tk_decode, _, _ = mha_fwd_decode(q_decode, k_cache, v_cache, causal=False, k_seqlen=k_seqlen)
         k_ = k_cache[:, :, :k_seqlen, :]
         v_ = v_cache[:, :, :k_seqlen, :]
         out_ref_decode = mha_fwd_ref(q_decode, k_, v_, causal=False)
@@ -457,7 +493,7 @@ if __name__ == "__main__":
         k_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
         v_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
 
-        out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, causal=True, k_seqlen=L_4090)
+        out_tk_decode, _, _ = mha_fwd_decode(q_decode, k_decode, v_decode, causal=True, k_seqlen=L_4090)
         out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=True)
 
         errors.append((L_4090, (out_tk_decode - out_ref_decode).abs().max().item()))
@@ -467,22 +503,36 @@ if __name__ == "__main__":
     # max error
     print('max error', max(errors, key=lambda x: x[1]))
 
-    # print('Causal, KV cache')
-    # errors = []
+    print('KV cache update in-place, non-causal')
+    errors = []
 
-    # for L_4090 in range(32, 1025, 32):
-    #     q_decode = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
-    #     k_decode = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
-    #     v_decode = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+    for L_4090 in range(32, 1025, 32):
+        q_decode = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
+        k_decode = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+        v_decode = torch.randn(B, H, L_max, d, device="cuda", dtype=dtype)
+        k_decode[:, :, L_4090:] = 0
+        v_decode[:, :, L_4090:] = 0
+        
+        # clone for in-place operations
+        k_decode_ref = k_decode.clone()
+        v_decode_ref = v_decode.clone()
+        k_new = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
+        v_new = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
 
-    #     out_tk_decode = mha_fwd_decode(q_decode, k_decode, v_decode, causal=False, k_seqlen=L_4090) # wrong for now
-    #     out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=True)
+        out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=False, k_seqlen=L_4090)
 
-    #     errors.append((L_4090, (out_tk_decode - out_ref_decode).abs().max().item()))
+        out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=False, k_seqlen=L_4090)
 
-    # print(errors)
+        errors.append((
+            L_4090,
+            (out_tk_decode - out_ref_decode).abs().max().item(),
+            (k_cache_tk - k_cache_ref).abs().max().item(),
+            (v_cache_tk - v_cache_ref).abs().max().item()
+        ))
 
-    # # max error
-    # print('max error', max(errors, key=lambda x: x[1]))
+    print(errors)
+
+    # max error
+    print('max error', max(errors, key=lambda x: x[1]))
 
     breakpoint()

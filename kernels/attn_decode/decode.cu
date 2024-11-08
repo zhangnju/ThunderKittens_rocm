@@ -65,8 +65,15 @@ __global__ void attend_ker(
         int cur_load_idx = kv_idx*LOAD_BLOCKS;
 
         int next_load_idx = (kv_idx+1)*LOAD_BLOCKS + loadid;
-        if(next_load_idx*ROWS<D> < k_seqlen && (!causal || next_load_idx <= q_seq_next)) { 
-            // load the next tiles, but skip if we're past the causal mask
+        bool load_next = true;
+        if (k_new_seqlen == 0) {
+            // skip if we're out of K's or we're past the causal mask
+            load_next = next_load_idx*ROWS<D> < k_seqlen && (!causal || next_load_idx <= q_seq_next);
+        } else {
+            // skip if we're out of KNew's - we load all the way to the end even if causal
+            load_next = next_load_idx*ROWS<D> < k_seqlen + k_new_seqlen;
+        }
+        if(load_next && next_load_idx*ROWS<D> < k_seqlen) {
             // every two workers are working together to load the next tiles, then broadcast to all workers
             // we need to load the next times for all workers, and then skip selectively in the individual worker
             int next_tic = (tic+1)%3;
@@ -74,7 +81,7 @@ __global__ void attend_ker(
             load_group::load_async<shared_tile<D>, global_layout<D>, 2>(v_smem[loadid][next_tic], g.VCacheg, {batch, head, next_load_idx, 0}, ROWS<D>, ZERO);
             load_async_wait<2>(); // next k, v can stay in flight.
         }
-        else if (next_load_idx*ROWS<D> < k_seqlen + k_new_seqlen && (!causal || next_load_idx <= q_seq_next)) {
+        else if (load_next && next_load_idx*ROWS<D> < k_seqlen + k_new_seqlen) {
             // load the next tiles from KNew and VNew
             int next_tic = (tic+1)%3;
             int kv_new_idx = (kv_idx - kv_blocks + 1) * LOAD_BLOCKS + loadid;
@@ -90,14 +97,37 @@ __global__ void attend_ker(
             subtile < LOAD_BLOCKS &&
             kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> < k_seqlen + k_new_seqlen;
             subtile++) {
-            // we've passed the causal mask for this subtile
-            if (causal && kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> > q_seq * ROWS<D>) { break; }
+            if (
+                causal && (
+                    k_new_seqlen == 0 &&
+                    kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> > q_seq * ROWS<D> // we've passed the diagonal for this subtile and not using KNew
+                ) ||
+                (
+                    k_new_seqlen > 0 &&
+                    kv_idx >= kv_blocks &&
+                    (kv_idx - kv_blocks) * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> > q_seq * ROWS<D> // we've passed the diagonal for this subtile and using KNew
+                )
+            ){
+                break;
+            }
 
             load(k_reg, k_smem[subtile][tic]); // load k from shared into registers
             zero(att_block); // zero 16x16 attention tile
             mma_ABt(att_block, q_reg, k_reg, att_block); // Q@K.T
-            if (causal && kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> == q_seq * ROWS<D>) {
-                // we are on the diagonal, so we need to mask out the upper triangle
+            if (
+                causal && (
+                    (
+                        k_new_seqlen == 0 && 
+                        kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> == q_seq * ROWS<D>
+                    ) // we are not using KNew, and Q_tile == K_tile on the diagonal
+                    || (
+                        k_new_seqlen > 0 &&
+                        kv_idx >= kv_blocks &&
+                        ((kv_idx - kv_blocks) * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> == q_seq * ROWS<D>)
+                    ) // we are using KNew, and Q_tile == K_new_tile, on the diagonal
+                )
+            ) {
+                // mask out the upper triangle
                 make_causal(att_block, att_block, kittens::base_types::constants<float>::neg_infty());
             }
             copy(max_vec_last,  max_vec);
@@ -144,6 +174,18 @@ __global__ void attend_ker(
 #include <ATen/cuda/CUDAContext.h>
 #include <iostream>
 
+/**
+ * @brief Decode attention forward pass with a KV cache and optional in-place update to the KV cache.
+ * 
+ * @param q The new query. (batch, num_heads, seqlen_q, head_dim)
+ * @param k_cache The existing key cache. (batch, num_heads, seqlen_k_max, head_dim)
+ * @param v_cache The existing value cache. (batch, num_heads, seqlen_v, head_dim)
+ * @param k_new_ The new keys to update k_cache in-place. (batch, num_heads, seqlen_q, head_dim)
+ * @param v_new_ The new values to update v_cache in-place. (batch, num_heads, seqlen_q, head_dim)
+ * @param causal Whether to use causal attention. If k_new_ and v_new_ are provided, causal mask is only applied against the new queries and keys. If they are not provided, k_seqlen must match seqlen_q, and the causal mask is applied against all the queries and keys.
+ * @param k_seqlen The sequence length of the key cache.
+ * @return The output of the attention operation. (batch, num_heads, seqlen_q, head_dim)
+ */
 torch::Tensor
 attention_decode_forward(
     torch::Tensor q,
@@ -167,7 +209,6 @@ attention_decode_forward(
     auto kv_heads  = k_cache.size(1);
 
     TORCH_CHECK(k_seqlen % 32 == 0, "K sequence length must be divisible by 32");
-    TORCH_CHECK(!causal || k_seqlen == k_max_len, "K sequence length must match K cache length if causal attention is enabled");
 
     // check to see that these dimensions match for all inputs
     TORCH_CHECK(q.size(0) == batch, "Q batch dimension - idx 0 - must match for all inputs");

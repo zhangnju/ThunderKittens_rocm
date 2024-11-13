@@ -254,7 +254,7 @@ attention_decode_forward(
     TORCH_CHECK(v_cache.size(HEAD_AXIS) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
 
     torch::Tensor k_new, v_new;
-    auto k_new_seqlen = k_new_.has_value() ? k_new_.value().size(2) : 0;
+    auto k_new_seqlen = k_new_.has_value() ? k_new_.value().size(SEQ_AXIS) : 0;
     if (k_new_.has_value()) {
         assert(v_new_.has_value());
         k_new = k_new_.value();

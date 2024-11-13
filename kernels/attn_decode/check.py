@@ -647,7 +647,7 @@ if __name__ == "__main__":
             (v_cache_tk - v_cache_ref).abs().max().item()
         ))
 
-    print(errors)
+    # print(errors)
 
     # max error
     print('max error', max(errors, key=lambda x: x[1]))

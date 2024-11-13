@@ -323,12 +323,13 @@ def mha_fwd_decode(
     causal: bool = False,
     k_seqlens: Union[torch.Tensor, int] = None,
     blhd_format: bool = False,
+    cache_batch_idx: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if k_seqlens is None:
         k_seqlens = k_new.size(1)
     if isinstance(k_seqlens, int):
         k_seqlens = torch.full((q.size(0),), k_seqlens, dtype=torch.int32, device=q.device)
-    o = tk.mha_decode_forward(q, k_cache, v_cache, k_new, v_new, causal, k_seqlens, blhd_format)
+    o = tk.mha_decode_forward(q, k_cache, v_cache, k_new, v_new, causal, k_seqlens, cache_batch_idx, blhd_format)
     return o, k_cache, v_cache
 
 def mha_fwd_ref(
@@ -410,20 +411,24 @@ def mha_fwd_ref_kvcache(
     causal: bool = False,
     k_seqlens: Optional[Union[torch.Tensor, int]] = None,
     blhd_format: bool = False,
+    cache_batch_idx: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if k_seqlens is None:
         k_seqlens = k_cache.size(1 if blhd_format else 2)
     if isinstance(k_seqlens, int):
         k_seqlens = torch.full((q.size(0),), k_seqlens, dtype=torch.int32, device=q.device)
 
+    if cache_batch_idx is None:
+        cache_batch_idx = torch.arange(q.size(0), device=q.device).to(torch.int32)
+
     batch_size = q.size(0)
     outputs = []
-    k_caches = []
-    v_caches = []
     for i in range(batch_size):
+        cache_batch_idx_i = cache_batch_idx[i]
+
         q_i = q[i:i+1]
-        k_cache_i = k_cache[i:i+1]
-        v_cache_i = v_cache[i:i+1]
+        k_cache_i = k_cache[cache_batch_idx_i:cache_batch_idx_i+1]
+        v_cache_i = v_cache[cache_batch_idx_i:cache_batch_idx_i+1]
         if k_new is not None:
             k_new_i = k_new[i:i+1]
             v_new_i = v_new[i:i+1]
@@ -435,12 +440,10 @@ def mha_fwd_ref_kvcache(
         
         output_i, k_cache_i, v_cache_i = mha_fwd_ref_kvcache_bs1(q_i, k_cache_i, v_cache_i, k_new_i, v_new_i, causal, k_seqlen, blhd_format)
         outputs.append(output_i)
-        k_caches.append(k_cache_i)
-        v_caches.append(v_cache_i)
+        k_cache[cache_batch_idx_i] = k_cache_i
+        v_cache[cache_batch_idx_i] = v_cache_i
 
     outputs = torch.cat(outputs, dim=0)
-    k_cache[:] = torch.cat(k_caches, dim=0)
-    v_cache[:] = torch.cat(v_caches, dim=0)
 
     return outputs, k_cache, v_cache
 
@@ -720,6 +723,48 @@ if __name__ == "__main__":
         out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=True, k_seqlens=k_seqlens, blhd_format=True)
 
         out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=True, k_seqlens=k_seqlens, blhd_format=True)
+
+        # breakpoint()
+
+        errors.append((
+            L_4090,
+            (out_tk_decode - out_ref_decode).abs().max().item(),
+            (k_cache_tk - k_cache_ref).abs().max().item(),
+            (v_cache_tk - v_cache_ref).abs().max().item()
+        ))
+
+    # print(errors)
+
+    # max error
+    print('max error', max(errors, key=lambda x: x[1]))
+
+    print('KV cache update in-place, causal, Q_lengths, BLHD format, different seqlens, cache batch idx')
+    errors = []
+
+    B_c = 2 * B
+
+    torch.manual_seed(0)
+    for L_4090_q in range(32, 1025, 32):
+        q_decode = torch.randn(B, L_4090_q, H, d, device="cuda", dtype=dtype)
+        k_decode = torch.randn(B_c, L_max, H, d, device="cuda", dtype=dtype)
+        v_decode = torch.randn(B_c, L_max, H, d, device="cuda", dtype=dtype)
+
+        cache_batch_idx = torch.randperm(B_c, device="cuda")[:B].to(torch.int32)
+
+        k_seqlens = (torch.randint(1, (L_max-L_4090_q-32) // 32, (B,), device="cuda") * 32).to(torch.int32)
+        for i in range(B):
+            k_decode[i, k_seqlens[i]:] = 0
+            v_decode[i, k_seqlens[i]:] = 0
+        
+        # clone for in-place operations
+        k_decode_ref = k_decode.clone()
+        v_decode_ref = v_decode.clone()
+        k_new = torch.randn(B, L_4090_q, H, d, device="cuda", dtype=dtype)
+        v_new = torch.randn(B, L_4090_q, H, d, device="cuda", dtype=dtype)
+
+        out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=True, k_seqlens=k_seqlens, blhd_format=True, cache_batch_idx=cache_batch_idx)
+
+        out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=True, k_seqlens=k_seqlens, blhd_format=True, cache_batch_idx=cache_batch_idx)
 
         # breakpoint()
 

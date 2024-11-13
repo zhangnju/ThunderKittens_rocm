@@ -50,6 +50,19 @@ __device__ static const float* device_cast(const float* x) { return x;}
             TORCH_CHECK(false, "Unsupported type!");\
     }
 
+#ifndef BOOL_SWITCH
+#define BOOL_SWITCH(COND, CONST_NAME, ...)      \
+  [&] {                                         \
+    if (COND) {                                 \
+      constexpr static bool CONST_NAME = true;  \
+      return __VA_ARGS__();                     \
+    } else {                                    \
+      constexpr static bool CONST_NAME = false; \
+      return __VA_ARGS__();                     \
+    }                                           \
+  }()
+#endif
+
 // copied from online tutorial.
 #define CHECK_CUDA_ERROR(val) check((val), #val, __FILE__, __LINE__)
 template <typename T>

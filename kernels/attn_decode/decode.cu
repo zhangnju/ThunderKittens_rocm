@@ -11,7 +11,7 @@ template<int D> using shared_tile = st_bf<ROWS<D>, D>;
 template<int D> using global_layout = gl<bf16, -1, -1, -1, D>; // B, H, g.Qg.rows specified at runtime, D=64 known at compile time for this kernel
 template<int D> struct globals { global_layout<D> Qg, KCacheg, VCacheg, Og, KNewg, VNewg; };
 
-template<int D> __launch_bounds__(NUM_WORKERS*WARP_THREADS, 1)
+template<int D, int SEQ_AXIS> __launch_bounds__(NUM_WORKERS*WARP_THREADS, 1)
 __global__ void attend_ker(
     const __grid_constant__ globals<D> g,   // Q, KCache, VCache, O, KNew, VNew
     int k_seqlen,                           // KCache sequence length
@@ -41,7 +41,8 @@ __global__ void attend_ker(
     typename attn_tile<D, float>::col_vec max_vec_last, max_vec, norm_vec; // these are column vectors for the in-place softmax.
     // each warp loads its own Q tile of 16x64
     if (q_seq*ROWS<D> < g.Qg.rows) {
-        load<shared_tile<D>, global_layout<D>, 2>(qo_smem[workerid], g.Qg, {batch, head, q_seq, 0}, ROWS<D>, ZERO);  // going through shared memory improves coalescing of dram reads.
+        auto q_coords = (SEQ_AXIS == 2 ? coord{batch, head, q_seq, 0} : coord{batch, q_seq, head, 0});
+        load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.Qg, q_coords, ROWS<D>, ZERO);  // going through shared memory improves coalescing of dram reads.
         __syncwarp();
         load(q_reg, qo_smem[workerid]);
     }
@@ -58,8 +59,12 @@ __global__ void attend_ker(
     int kv_blocks = (k_seqlen + (LOAD_BLOCKS*ROWS<D>) - 1) / (LOAD_BLOCKS*ROWS<D>);
     int kv_blocks_total = (k_seqlen + k_new_seqlen + (LOAD_BLOCKS*ROWS<D>) - 1) / (LOAD_BLOCKS*ROWS<D>);
     int tic = 0;
-    load_group::load_async<shared_tile<D>, global_layout<D>, 2>(k_smem[loadid][0], g.KCacheg, {batch, head, loadid, 0}, ROWS<D>, ZERO);
-    load_group::load_async<shared_tile<D>, global_layout<D>, 2>(v_smem[loadid][0], g.VCacheg, {batch, head, loadid, 0}, ROWS<D>, ZERO);
+
+    auto k_coords = (SEQ_AXIS == 2 ? coord{batch, head, loadid, 0} : coord{batch, loadid, head, 0});
+    auto v_coords = (SEQ_AXIS == 2 ? coord{batch, head, loadid, 0} : coord{batch, loadid, head, 0});
+
+    load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][0], g.KCacheg, k_coords, ROWS<D>, ZERO);
+    load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][0], g.VCacheg, v_coords, ROWS<D>, ZERO);
     // iterate over k, v for these q's that have been loaded
     for(auto kv_idx = 0; kv_idx < kv_blocks_total; kv_idx++, tic=(tic+1)%3) {
         int cur_load_idx = kv_idx*LOAD_BLOCKS;
@@ -77,16 +82,21 @@ __global__ void attend_ker(
             // every two workers are working together to load the next tiles, then broadcast to all workers
             // we need to load the next times for all workers, and then skip selectively in the individual worker
             int next_tic = (tic+1)%3;
-            load_group::load_async<shared_tile<D>, global_layout<D>, 2>(k_smem[loadid][next_tic], g.KCacheg, {batch, head, next_load_idx, 0}, ROWS<D>, ZERO);
-            load_group::load_async<shared_tile<D>, global_layout<D>, 2>(v_smem[loadid][next_tic], g.VCacheg, {batch, head, next_load_idx, 0}, ROWS<D>, ZERO);
+            auto next_coords = (SEQ_AXIS == 2 ? coord{batch, head, next_load_idx, 0} : coord{batch, next_load_idx, head, 0});
+
+            load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][next_tic], g.KCacheg, next_coords, ROWS<D>, ZERO);
+            load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][next_tic], g.VCacheg, next_coords, ROWS<D>, ZERO);
             load_async_wait<2>(); // next k, v can stay in flight.
         }
         else if (load_next && next_load_idx*ROWS<D> < k_seqlen + k_new_seqlen) {
             // load the next tiles from KNew and VNew
             int next_tic = (tic+1)%3;
             int kv_new_idx = (kv_idx - kv_blocks + 1) * LOAD_BLOCKS + loadid;
-            load_group::load_async<shared_tile<D>, global_layout<D>, 2>(k_smem[loadid][next_tic], g.KNewg, {batch, head, kv_new_idx, 0}, ROWS<D>, ZERO);
-            load_group::load_async<shared_tile<D>, global_layout<D>, 2>(v_smem[loadid][next_tic], g.VNewg, {batch, head, kv_new_idx, 0}, ROWS<D>, ZERO);
+
+            auto next_coords = (SEQ_AXIS == 2 ? coord{batch, head, kv_new_idx, 0} : coord{batch, kv_new_idx, head, 0});
+
+            load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][next_tic], g.KNewg, next_coords, ROWS<D>, ZERO);
+            load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][next_tic], g.VNewg, next_coords, ROWS<D>, ZERO);
             load_async_wait<2>(); // next k, v can stay in flight.
         }
         else load_async_wait(); // all must arrive
@@ -151,21 +161,24 @@ __global__ void attend_ker(
     if (q_seq*ROWS<D> < g.Qg.rows) { // write out o.
         store(qo_smem[workerid], o_reg); // going through shared memory improves coalescing of dram writes.
         __syncwarp();
-        store<shared_tile<D>, global_layout<D>, 2>(g.Og, qo_smem[workerid], {batch, head, q_seq, 0});
+        auto kv_new_coords = (SEQ_AXIS == 2 ? coord{batch, head, q_seq, 0} : coord{batch, q_seq, head, 0});
+        store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.Og, qo_smem[workerid], kv_new_coords);
 
         if (k_new_seqlen > 0) {
-            __syncwarp();
             int kv_blocks_orig = (k_seqlen + ROWS<D> - 1) / ROWS<D>;
-            // in-place update KCache with KNew
-            load<shared_tile<D>, global_layout<D>, 2>(qo_smem[workerid], g.KNewg, {batch, head, q_seq, 0}, ROWS<D>, ZERO);  // going through shared memory improves coalescing of dram reads.
+            auto kv_cache_coords = (SEQ_AXIS == 2 ? coord{batch, head, kv_blocks_orig + q_seq, 0} : coord{batch, kv_blocks_orig + q_seq, head, 0});
+
             __syncwarp();
-            store<shared_tile<D>, global_layout<D>, 2>(g.KCacheg, qo_smem[workerid], {batch, head, kv_blocks_orig + q_seq, 0});
+            // in-place update KCache with KNew
+            load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.KNewg, kv_new_coords, ROWS<D>, ZERO);  // going through shared memory improves coalescing of dram reads.
+            __syncwarp();
+            store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.KCacheg, qo_smem[workerid], kv_cache_coords);
 
             __syncwarp();
             // in-place update VCache with VNew
-            load<shared_tile<D>, global_layout<D>, 2>(qo_smem[workerid], g.VNewg, {batch, head, q_seq, 0}, ROWS<D>, ZERO);  // going through shared memory improves coalescing of dram reads.
+            load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.VNewg, kv_new_coords, ROWS<D>, ZERO);  // going through shared memory improves coalescing of dram reads.
             __syncwarp();
-            store<shared_tile<D>, global_layout<D>, 2>(g.VCacheg, qo_smem[workerid], {batch, head, kv_blocks_orig + q_seq, 0});
+            store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.VCacheg, qo_smem[workerid], kv_cache_coords);
         }
     }
 }
@@ -186,6 +199,7 @@ __global__ void attend_ker(
  * @param v_new_ The new values to update v_cache in-place. (batch, num_heads, seqlen_q, head_dim)
  * @param causal Whether to use causal attention. If k_new_ and v_new_ are provided, causal mask is only applied against the new queries and keys. If they are not provided, k_seqlen must match seqlen_q, and the causal mask is applied against all the queries and keys.
  * @param k_seqlen The sequence length of the key cache.
+ * @param blhd_format If true, use the (batch, seq, head, dim) format. Otherwise, use (batch, head, seq, dim).
  * @return The output of the attention operation. (batch, num_heads, seqlen_q, head_dim)
  */
 torch::Tensor
@@ -196,41 +210,47 @@ attention_decode_forward(
     c10::optional<torch::Tensor> k_new_,
     c10::optional<torch::Tensor> v_new_,
     bool causal,
-    int k_seqlen
+    int k_seqlen,
+    bool blhd_format
 )
 {
     CHECK_INPUT(q);
     CHECK_INPUT(k_cache);
     CHECK_INPUT(v_cache);
 
-    auto batch     = q.size(0);
-    auto q_seq_len = q.size(2); 
-    auto k_max_len = k_cache.size(2); 
-    auto head_dim  = q.size(3); 
-    auto qo_heads  = q.size(1);
-    auto kv_heads  = k_cache.size(1);
+    int BATCH_AXIS = 0;
+    int SEQ_AXIS = blhd_format ? 1 : 2;
+    int HEAD_AXIS = blhd_format ? 2 : 1;
+    int DIM_AXIS = 3;
+
+    auto batch     = q.size(BATCH_AXIS);
+    auto head_dim  = q.size(DIM_AXIS); 
+    auto q_seq_len = q.size(SEQ_AXIS); 
+    auto k_max_len = k_cache.size(SEQ_AXIS); 
+    auto qo_heads  = q.size(HEAD_AXIS);
+    auto kv_heads  = k_cache.size(HEAD_AXIS);
 
     TORCH_CHECK(k_seqlen % 32 == 0, "K sequence length must be divisible by 32");
 
     // check to see that these dimensions match for all inputs
-    TORCH_CHECK(q.size(0) == batch, "Q batch dimension - idx 0 - must match for all inputs");
-    TORCH_CHECK(k_cache.size(0) == batch, "K cache batch dimension - idx 0 - must match for all inputs");
-    TORCH_CHECK(v_cache.size(0) == batch, "V cache batch dimension - idx 0 - must match for all inputs");
+    TORCH_CHECK(q.size(BATCH_AXIS) == batch, "Q batch dimension - idx 0 - must match for all inputs");
+    TORCH_CHECK(k_cache.size(BATCH_AXIS) == batch, "K cache batch dimension - idx 0 - must match for all inputs");
+    TORCH_CHECK(v_cache.size(BATCH_AXIS) == batch, "V cache batch dimension - idx 0 - must match for all inputs");
 
     TORCH_CHECK(q_seq_len % 32 == 0, "Q sequence length must be divisible by 32");
     TORCH_CHECK(k_max_len % 32 == 0, "K cache sequence length must be divisible by 32");
 
-    TORCH_CHECK(v_cache.size(2) == k_max_len, "V cache sequence length dimension - idx 2 - must match for all inputs");
+    TORCH_CHECK(v_cache.size(SEQ_AXIS) == k_max_len, "V cache sequence length dimension - idx 2 - must match for all inputs");
 
-    TORCH_CHECK(q.size(3) == head_dim, "Q head dimension - idx 3 - must match for all non-vector inputs");
-    TORCH_CHECK(k_cache.size(3) == head_dim, "K cache head dimension - idx 3 - must match for all non-vector inputs");
-    TORCH_CHECK(v_cache.size(3) == head_dim, "V cache head dimension - idx 3 - must match for all non-vector inputs");
+    TORCH_CHECK(q.size(DIM_AXIS) == head_dim, "Q head dimension - idx 3 - must match for all non-vector inputs");
+    TORCH_CHECK(k_cache.size(DIM_AXIS) == head_dim, "K cache head dimension - idx 3 - must match for all non-vector inputs");
+    TORCH_CHECK(v_cache.size(DIM_AXIS) == head_dim, "V cache head dimension - idx 3 - must match for all non-vector inputs");
 
     TORCH_CHECK(qo_heads >= kv_heads, "QO heads must be greater than or equal to KV heads");
     TORCH_CHECK(qo_heads % kv_heads == 0, "QO heads must be divisible by KV heads");
-    TORCH_CHECK(q.size(1) == qo_heads, "QO head dimension - idx 1 - must match for all inputs");
-    TORCH_CHECK(k_cache.size(1) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
-    TORCH_CHECK(v_cache.size(1) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
+    TORCH_CHECK(q.size(HEAD_AXIS) == qo_heads, "QO head dimension - idx 1 - must match for all inputs");
+    TORCH_CHECK(k_cache.size(HEAD_AXIS) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
+    TORCH_CHECK(v_cache.size(HEAD_AXIS) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
 
     torch::Tensor k_new, v_new;
     auto k_new_seqlen = k_new_.has_value() ? k_new_.value().size(2) : 0;
@@ -240,14 +260,14 @@ attention_decode_forward(
         v_new = v_new_.value();
         CHECK_INPUT(k_new);
         CHECK_INPUT(v_new);
-        TORCH_CHECK(k_new.size(0) == batch, "K new batch dimension - idx 0 - must match for all inputs");
-        TORCH_CHECK(v_new.size(0) == batch, "V new batch dimension - idx 0 - must match for all inputs");
-        TORCH_CHECK(k_new.size(1) == kv_heads, "K new heads - idx 1 - must match for all inputs");
-        TORCH_CHECK(v_new.size(1) == kv_heads, "V new heads - idx 1 - must match for all inputs");
-        TORCH_CHECK(k_new.size(2) == q_seq_len, "K new sequence length - idx 2 - must match for all inputs");
-        TORCH_CHECK(v_new.size(2) == q_seq_len, "V new sequence length - idx 2 - must match for all inputs");
-        TORCH_CHECK(k_new.size(3) == head_dim, "K new head dimension - idx 3 - must match for all inputs");
-        TORCH_CHECK(v_new.size(3) == head_dim, "V new head dimension - idx 3 - must match for all inputs");
+        TORCH_CHECK(k_new.size(BATCH_AXIS) == batch, "K new batch dimension - idx 0 - must match for all inputs");
+        TORCH_CHECK(v_new.size(BATCH_AXIS) == batch, "V new batch dimension - idx 0 - must match for all inputs");
+        TORCH_CHECK(k_new.size(HEAD_AXIS) == kv_heads, "K new heads - idx 1 - must match for all inputs");
+        TORCH_CHECK(v_new.size(HEAD_AXIS) == kv_heads, "V new heads - idx 1 - must match for all inputs");
+        TORCH_CHECK(k_new.size(SEQ_AXIS) == q_seq_len, "K new sequence length - idx 2 - must match for all inputs");
+        TORCH_CHECK(v_new.size(SEQ_AXIS) == q_seq_len, "V new sequence length - idx 2 - must match for all inputs");
+        TORCH_CHECK(k_new.size(DIM_AXIS) == head_dim, "K new head dimension - idx 3 - must match for all inputs");
+        TORCH_CHECK(v_new.size(DIM_AXIS) == head_dim, "V new head dimension - idx 3 - must match for all inputs");
     }
     
     auto hr = qo_heads / kv_heads;
@@ -265,7 +285,11 @@ attention_decode_forward(
     bf16*  d_v_new = v_new_ptr ? reinterpret_cast<bf16*>(v_new_ptr) : nullptr;
     
     // for the returned outputs
-    torch::Tensor o     = torch::empty({static_cast<const uint>(batch), 
+    torch::Tensor o     = blhd_format ? torch::empty({static_cast<const uint>(batch), 
+                                        static_cast<const uint>(q_seq_len), 
+                                        static_cast<const uint>(qo_heads), 
+                                        static_cast<const uint>(head_dim)}, q.options())
+                                      : torch::empty({static_cast<const uint>(batch), 
                                         static_cast<const uint>(qo_heads), 
                                         static_cast<const uint>(q_seq_len), 
                                         static_cast<const uint>(head_dim)}, q.options());
@@ -277,55 +301,85 @@ attention_decode_forward(
 
     unsigned long mem_size = (kittens::MAX_SHARED_MEMORY-1000) / 2; // have the flag tell us
 
-    if (head_dim == 64) {
-        global_layout<64> qg(d_q, batch, qo_heads, q_seq_len, nullptr);
-        global_layout<64> kg(d_k_cache, batch, kv_heads, k_max_len, nullptr);
-        global_layout<64> vg(d_v_cache, batch, kv_heads, k_max_len, nullptr);
-        global_layout<64> og(d_o, batch, qo_heads, q_seq_len, nullptr);
-        global_layout<64> kg_new(d_k_new, batch, kv_heads, q_seq_len, nullptr);
-        global_layout<64> vg_new(d_v_new, batch, kv_heads, q_seq_len, nullptr);
-        globals<64> g(qg, kg, vg, og, kg_new, vg_new);
+    BOOL_SWITCH(blhd_format, IS_BLHD, [&] {
+        const int SEQ_AXIS_CONST = IS_BLHD ? 1 : 2;
+        if (head_dim == 64) {
+            // global_layout<64> qg = IS_BLHD ? global_layout<64>(d_q, batch, q_seq_len, qo_heads, nullptr) : global_layout<64>(d_q, batch, qo_heads, q_seq_len, nullptr);
+            // global_layout<64> kg = IS_BLHD ? global_layout<64>(d_k_cache, batch, k_max_len, kv_heads, nullptr) : global_layout<64>(d_k_cache, batch, kv_heads, k_max_len, nullptr);
+            // global_layout<64> vg = IS_BLHD ? global_layout<64>(d_v_cache, batch, k_max_len, kv_heads, nullptr) : global_layout<64>(d_v_cache, batch, kv_heads, k_max_len, nullptr);
+            // global_layout<64> og = IS_BLHD ? global_layout<64>(d_o, batch, q_seq_len, qo_heads, nullptr) : global_layout<64>(d_o, batch, qo_heads, q_seq_len, nullptr);
+            // global_layout<64> kg_new = IS_BLHD ? global_layout<64>(d_k_new, batch, q_seq_len, kv_heads, nullptr) : global_layout<64>(d_k_new, batch, kv_heads, q_seq_len, nullptr);
+            // global_layout<64> vg_new = IS_BLHD ? global_layout<64>(d_v_new, batch, q_seq_len, kv_heads, nullptr) : global_layout<64>(d_v_new, batch, kv_heads, q_seq_len, nullptr);
 
-        cudaFuncSetAttribute(
-            attend_ker<64>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            mem_size
-        );
+            auto q_dim_1 = IS_BLHD ? q_seq_len : qo_heads;
+            auto q_dim_2 = IS_BLHD ? qo_heads : q_seq_len;
+            auto kv_dim_1 = IS_BLHD ? k_max_len : kv_heads;
+            auto kv_dim_2 = IS_BLHD ? kv_heads : k_max_len;
 
-        dim3 grid((q_seq_len + qkvo_tile<64>::rows*NUM_WORKERS - 1) / (qkvo_tile<64>::rows*NUM_WORKERS), qo_heads, batch);
-        attend_ker<64><<<grid, (32*NUM_WORKERS), mem_size>>>(
-            g,
-            k_seqlen,
-            k_new_seqlen,
-            causal
-        );
-    }
-    else if (head_dim == 128) {
-        global_layout<128> qg(d_q, batch, qo_heads, q_seq_len, nullptr);
-        global_layout<128> kg(d_k_cache, batch, kv_heads, k_max_len, nullptr);
-        global_layout<128> vg(d_v_cache, batch, kv_heads, k_max_len, nullptr);
-        global_layout<128> og(d_o, batch, qo_heads, q_seq_len, nullptr);
-        global_layout<128> kg_new(d_k_new, batch, kv_heads, q_seq_len, nullptr);
-        global_layout<128> vg_new(d_v_new, batch, kv_heads, q_seq_len, nullptr);
-        globals<128> g(qg, kg, vg, og, kg_new, vg_new);
+            global_layout<64> qg = global_layout<64>(d_q, batch, q_dim_1, q_dim_2, nullptr);
+            global_layout<64> kg = global_layout<64>(d_k_cache, batch, kv_dim_1, kv_dim_2, nullptr);
+            global_layout<64> vg = global_layout<64>(d_v_cache, batch, kv_dim_1, kv_dim_2, nullptr);
+            global_layout<64> og = global_layout<64>(d_o, batch, q_dim_1, q_dim_2, nullptr);
+            global_layout<64> kg_new = global_layout<64>(d_k_new, batch, q_dim_1, q_dim_2, nullptr);
+            global_layout<64> vg_new = global_layout<64>(d_v_new, batch, q_dim_1, q_dim_2, nullptr);
 
-        cudaFuncSetAttribute(
-            attend_ker<128>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            mem_size
-        );
+            globals<64> g(qg, kg, vg, og, kg_new, vg_new);
 
-        dim3 grid((q_seq_len + qkvo_tile<128>::rows*NUM_WORKERS - 1) / (qkvo_tile<128>::rows*NUM_WORKERS), qo_heads, batch);
-        attend_ker<128><<<grid, (32*NUM_WORKERS), mem_size>>>(
-            g,
-            k_seqlen,
-            k_new_seqlen,
-            causal
-        );
-    }
-    else {
-        TORCH_CHECK(false, "head_dim must be 64 or 128");
-    }
+            cudaFuncSetAttribute(
+                attend_ker<64, SEQ_AXIS_CONST>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                mem_size
+            );
+
+            dim3 grid((q_seq_len + qkvo_tile<64>::rows*NUM_WORKERS - 1) / (qkvo_tile<64>::rows*NUM_WORKERS), qo_heads, batch);
+            attend_ker<64, SEQ_AXIS_CONST><<<grid, (32*NUM_WORKERS), mem_size>>>(
+                g,
+                k_seqlen,
+                k_new_seqlen,
+                causal
+            );
+        }
+        else if (head_dim == 128) {
+
+            // global_layout<128> qg = IS_BLHD ? global_layout<128>(d_q, batch, q_seq_len, qo_heads, nullptr) : global_layout<128>(d_q, batch, qo_heads, q_seq_len, nullptr);
+            // global_layout<128> kg = IS_BLHD ? global_layout<128>(d_k_cache, batch, k_max_len, kv_heads, nullptr) : global_layout<128>(d_k_cache, batch, kv_heads, k_max_len, nullptr);
+            // global_layout<128> vg = IS_BLHD ? global_layout<128>(d_v_cache, batch, k_max_len, kv_heads, nullptr) : global_layout<128>(d_v_cache, batch, kv_heads, k_max_len, nullptr);
+            // global_layout<128> og = IS_BLHD ? global_layout<128>(d_o, batch, q_seq_len, qo_heads, nullptr) : global_layout<128>(d_o, batch, qo_heads, q_seq_len, nullptr);
+            // global_layout<128> kg_new = IS_BLHD ? global_layout<128>(d_k_new, batch, q_seq_len, kv_heads, nullptr) : global_layout<128>(d_k_new, batch, kv_heads, q_seq_len, nullptr);
+            // global_layout<128> vg_new = IS_BLHD ? global_layout<128>(d_v_new, batch, q_seq_len, kv_heads, nullptr) : global_layout<128>(d_v_new, batch, kv_heads, q_seq_len, nullptr);
+
+            auto q_dim_1 = IS_BLHD ? q_seq_len : qo_heads;
+            auto q_dim_2 = IS_BLHD ? qo_heads : q_seq_len;
+            auto kv_dim_1 = IS_BLHD ? k_max_len : kv_heads;
+            auto kv_dim_2 = IS_BLHD ? kv_heads : k_max_len;
+
+            global_layout<128> qg = global_layout<128>(d_q, batch, q_dim_1, q_dim_2, nullptr);
+            global_layout<128> kg = global_layout<128>(d_k_cache, batch, kv_dim_1, kv_dim_2, nullptr);
+            global_layout<128> vg = global_layout<128>(d_v_cache, batch, kv_dim_1, kv_dim_2, nullptr);
+            global_layout<128> og = global_layout<128>(d_o, batch, q_dim_1, q_dim_2, nullptr);
+            global_layout<128> kg_new = global_layout<128>(d_k_new, batch, q_dim_1, q_dim_2, nullptr);
+            global_layout<128> vg_new = global_layout<128>(d_v_new, batch, q_dim_1, q_dim_2, nullptr);
+
+            globals<128> g(qg, kg, vg, og, kg_new, vg_new);
+
+            cudaFuncSetAttribute(
+                attend_ker<128, SEQ_AXIS_CONST>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                mem_size
+            );
+
+            dim3 grid((q_seq_len + qkvo_tile<128>::rows*NUM_WORKERS - 1) / (qkvo_tile<128>::rows*NUM_WORKERS), qo_heads, batch);
+            attend_ker<128, SEQ_AXIS_CONST><<<grid, (32*NUM_WORKERS), mem_size>>>(
+                g,
+                k_seqlen,
+                k_new_seqlen,
+                causal
+            );
+        }
+        else {
+            TORCH_CHECK(false, "head_dim must be 64 or 128");
+        }
+    });
 
     CHECK_CUDA_ERROR(cudaGetLastError());
 

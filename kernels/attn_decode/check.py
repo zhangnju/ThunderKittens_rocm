@@ -638,7 +638,7 @@ if __name__ == "__main__":
 
         out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=True, k_seqlen=L_4090, blhd_format=True)
 
-        breakpoint()
+        # breakpoint()
 
         errors.append((
             L_4090,

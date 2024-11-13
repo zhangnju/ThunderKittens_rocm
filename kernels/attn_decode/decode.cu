@@ -24,6 +24,7 @@ __global__ void attend_ker(
     constexpr int LOAD_BLOCKS = NUM_WORKERS / load_group::GROUP_WARPS;
     const int batch = blockIdx.z, head  = blockIdx.y, q_seq = blockIdx.x * NUM_WORKERS + workerid;
     const int q_seq_next = (blockIdx.x + 1) * NUM_WORKERS;
+    auto num_q_rows = SEQ_AXIS == 2 ? g.Qg.rows : g.Qg.depth;
 
     extern __shared__ alignment_dummy __shm[]; // this is the CUDA shared memory
     shared_allocator al((int*)&__shm[0]);
@@ -40,7 +41,7 @@ __global__ void attend_ker(
     attn_tile<D, bf16> att_block_mma; // bf16 attention tile for the second mma_AB. We cast right before that op.
     typename attn_tile<D, float>::col_vec max_vec_last, max_vec, norm_vec; // these are column vectors for the in-place softmax.
     // each warp loads its own Q tile of 16x64
-    if (q_seq*ROWS<D> < g.Qg.rows) {
+    if (q_seq*ROWS<D> < num_q_rows) {
         auto q_coords = (SEQ_AXIS == 2 ? coord{batch, head, q_seq, 0} : coord{batch, q_seq, head, 0});
         load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.Qg, q_coords, ROWS<D>, ZERO);  // going through shared memory improves coalescing of dram reads.
         __syncwarp();
@@ -158,7 +159,7 @@ __global__ void attend_ker(
     }
     div_row(o_reg, o_reg, norm_vec);
     __syncthreads();
-    if (q_seq*ROWS<D> < g.Qg.rows) { // write out o.
+    if (q_seq*ROWS<D> < num_q_rows) { // write out o.
         store(qo_smem[workerid], o_reg); // going through shared memory improves coalescing of dram writes.
         __syncwarp();
         auto kv_new_coords = (SEQ_AXIS == 2 ? coord{batch, head, q_seq, 0} : coord{batch, q_seq, head, 0});

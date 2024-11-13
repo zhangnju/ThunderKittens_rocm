@@ -5,7 +5,7 @@ from tqdm import tqdm
 from flash_attn_2_cuda import fwd_kvcache
 from flash_attn import flash_attn_with_kvcache
 from einops import rearrange
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -321,12 +321,14 @@ def mha_fwd_decode(
     k_new: Optional[torch.Tensor] = None,
     v_new: Optional[torch.Tensor] = None,
     causal: bool = False,
-    k_seqlen: int = None,
+    k_seqlens: Union[torch.Tensor, int] = None,
     blhd_format: bool = False,
 ) -> torch.Tensor:
-    if k_seqlen is None:
-        k_seqlen = k_new.size(1)
-    o = tk.mha_decode_forward(q, k_cache, v_cache, k_new, v_new, causal, k_seqlen, blhd_format)
+    if k_seqlens is None:
+        k_seqlens = k_new.size(1)
+    if isinstance(k_seqlens, int):
+        k_seqlens = torch.full((q.size(0),), k_seqlens, dtype=torch.int32, device=q.device)
+    o = tk.mha_decode_forward(q, k_cache, v_cache, k_new, v_new, causal, k_seqlens, blhd_format)
     return o, k_cache, v_cache
 
 def mha_fwd_ref(
@@ -358,7 +360,7 @@ def mha_fwd_ref_kvcache(
     k_new: Optional[torch.Tensor] = None,
     v_new: Optional[torch.Tensor] = None,
     causal: bool = False,
-    k_seqlen: int = None,
+    k_seqlens: Union[torch.Tensor, int] = None,
     blhd_format: bool = False,
 ) -> torch.Tensor:
     if blhd_format:
@@ -369,8 +371,11 @@ def mha_fwd_ref_kvcache(
             k_new = k_new.transpose(1, 2)
             v_new = v_new.transpose(1, 2)
 
-    k_cache_fn = k_cache[:, :, :k_seqlen, :]
-    v_cache_fn = v_cache[:, :, :k_seqlen, :]
+    assert isinstance(k_seqlens, int), "k_seqlens tensor not yet supported"
+    if isinstance(k_seqlens, int):
+        k_seqlens = torch.full((q.size(0),), k_seqlens, dtype=torch.int32, device=q.device)
+    k_cache_fn = k_cache[:, :, :k_seqlens[0], :]
+    v_cache_fn = v_cache[:, :, :k_seqlens[0], :]
     if k_new is not None:
         assert v_new is not None
         k_cache_fn = torch.cat([k_cache_fn, k_new], dim=2)
@@ -446,7 +451,7 @@ if __name__ == "__main__":
         k_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
         v_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
 
-        out_tk_decode, _, _ = mha_fwd_decode(q_decode, k_decode, v_decode, causal=False, k_seqlen=L_4090)
+        out_tk_decode, _, _ = mha_fwd_decode(q_decode, k_decode, v_decode, causal=False, k_seqlens=L_4090)
         out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=False)
 
         errors.append((L_4090, (out_tk_decode - out_ref_decode).abs().max().item()))
@@ -466,7 +471,7 @@ if __name__ == "__main__":
         k_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
         v_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
 
-        out_tk_decode, _, _ = mha_fwd_decode(q_decode, k_decode, v_decode, causal=False, k_seqlen=L_4090)
+        out_tk_decode, _, _ = mha_fwd_decode(q_decode, k_decode, v_decode, causal=False, k_seqlens=L_4090)
         out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=False)
 
         errors.append((L_4090_q, (out_tk_decode - out_ref_decode).abs().max().item()))
@@ -488,7 +493,7 @@ if __name__ == "__main__":
     q_decode = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
 
     for k_seqlen in range(32, 1025, 32):
-        out_tk_decode, _, _ = mha_fwd_decode(q_decode, k_cache, v_cache, causal=False, k_seqlen=k_seqlen)
+        out_tk_decode, _, _ = mha_fwd_decode(q_decode, k_cache, v_cache, causal=False, k_seqlens=k_seqlen)
         k_ = k_cache[:, :, :k_seqlen, :]
         v_ = v_cache[:, :, :k_seqlen, :]
         out_ref_decode = mha_fwd_ref(q_decode, k_, v_, causal=False)
@@ -508,7 +513,7 @@ if __name__ == "__main__":
         k_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
         v_decode = torch.randn(B, H, L_4090, d, device="cuda", dtype=dtype)
 
-        out_tk_decode, _, _ = mha_fwd_decode(q_decode, k_decode, v_decode, causal=True, k_seqlen=L_4090)
+        out_tk_decode, _, _ = mha_fwd_decode(q_decode, k_decode, v_decode, causal=True, k_seqlens=L_4090)
         out_ref_decode = mha_fwd_ref(q_decode, k_decode, v_decode, causal=True)
 
         errors.append((L_4090, (out_tk_decode - out_ref_decode).abs().max().item()))
@@ -536,9 +541,9 @@ if __name__ == "__main__":
         k_new = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
         v_new = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
 
-        out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=False, k_seqlen=L_4090)
+        out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=False, k_seqlens=L_4090)
 
-        out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=False, k_seqlen=L_4090)
+        out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=False, k_seqlens=L_4090)
 
         errors.append((
             L_4090,
@@ -568,9 +573,9 @@ if __name__ == "__main__":
         k_new = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
         v_new = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
 
-        out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=True, k_seqlen=L_4090)
+        out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=True, k_seqlens=L_4090)
 
-        out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=True, k_seqlen=L_4090)
+        out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=True, k_seqlens=L_4090)
 
         errors.append((
             L_4090,
@@ -601,9 +606,9 @@ if __name__ == "__main__":
         k_new = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
         v_new = torch.randn(B, H, L_4090_q, d, device="cuda", dtype=dtype)
 
-        out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=True, k_seqlen=L_4090)
+        out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=True, k_seqlens=L_4090)
 
-        out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=True, k_seqlen=L_4090)
+        out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=True, k_seqlens=L_4090)
 
         errors.append((
             L_4090,
@@ -634,9 +639,9 @@ if __name__ == "__main__":
         k_new = torch.randn(B, L_4090_q, H, d, device="cuda", dtype=dtype)
         v_new = torch.randn(B, L_4090_q, H, d, device="cuda", dtype=dtype)
 
-        out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=True, k_seqlen=L_4090, blhd_format=True)
+        out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=True, k_seqlens=L_4090, blhd_format=True)
 
-        out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=True, k_seqlen=L_4090, blhd_format=True)
+        out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=True, k_seqlens=L_4090, blhd_format=True)
 
         # breakpoint()
 

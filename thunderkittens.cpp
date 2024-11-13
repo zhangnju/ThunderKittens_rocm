@@ -35,7 +35,7 @@ extern std::vector<torch::Tensor> attention_backward(
 
 #ifdef TK_COMPILE_ATTN_DECODE
 extern torch::Tensor attention_decode_forward(
-    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, c10::optional<torch::Tensor> k_new_, c10::optional<torch::Tensor> v_new_, bool causal, int k_seqlen, bool blhd_format
+    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, c10::optional<torch::Tensor> k_new_, c10::optional<torch::Tensor> v_new_, bool causal, torch::Tensor k_seqlens, bool blhd_format
 ); 
 #endif
 

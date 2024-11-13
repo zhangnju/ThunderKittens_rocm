@@ -14,7 +14,7 @@ template<int D> struct globals { global_layout<D> Qg, KCacheg, VCacheg, Og, KNew
 template<int D, int SEQ_AXIS> __launch_bounds__(NUM_WORKERS*WARP_THREADS, 1)
 __global__ void attend_ker(
     const __grid_constant__ globals<D> g,   // Q, KCache, VCache, O, KNew, VNew
-    int k_seqlen,                           // KCache sequence length
+    int* k_seqlens,                         // KCache sequence length
     int k_new_seqlen,                       // KNew sequence length
     bool causal                             // causal attention flag
 ) {
@@ -25,6 +25,7 @@ __global__ void attend_ker(
     const int batch = blockIdx.z, head  = blockIdx.y, q_seq = blockIdx.x * NUM_WORKERS + workerid;
     const int q_seq_next = (blockIdx.x + 1) * NUM_WORKERS;
     auto num_q_rows = SEQ_AXIS == 2 ? g.Qg.rows : g.Qg.depth;
+    int k_seqlen = k_seqlens[batch];
 
     extern __shared__ alignment_dummy __shm[]; // this is the CUDA shared memory
     shared_allocator al((int*)&__shm[0]);
@@ -199,7 +200,7 @@ __global__ void attend_ker(
  * @param k_new_ The new keys to update k_cache in-place. (batch, num_heads, seqlen_q, head_dim)
  * @param v_new_ The new values to update v_cache in-place. (batch, num_heads, seqlen_q, head_dim)
  * @param causal Whether to use causal attention. If k_new_ and v_new_ are provided, causal mask is only applied against the new queries and keys. If they are not provided, k_seqlen must match seqlen_q, and the causal mask is applied against all the queries and keys.
- * @param k_seqlen The sequence length of the key cache.
+ * @param k_seqlens (batch). The sequence lengths of the key cache.
  * @param blhd_format If true, use the (batch, seq, head, dim) format. Otherwise, use (batch, head, seq, dim).
  * @return The output of the attention operation. (batch, num_heads, seqlen_q, head_dim)
  */
@@ -211,13 +212,14 @@ attention_decode_forward(
     c10::optional<torch::Tensor> k_new_,
     c10::optional<torch::Tensor> v_new_,
     bool causal,
-    int k_seqlen,
+    torch::Tensor k_seqlens,
     bool blhd_format
 )
 {
     CHECK_INPUT(q);
     CHECK_INPUT(k_cache);
     CHECK_INPUT(v_cache);
+    CHECK_INPUT(k_seqlens);
 
     int BATCH_AXIS = 0;
     int SEQ_AXIS = blhd_format ? 1 : 2;
@@ -231,7 +233,7 @@ attention_decode_forward(
     auto qo_heads  = q.size(HEAD_AXIS);
     auto kv_heads  = k_cache.size(HEAD_AXIS);
 
-    TORCH_CHECK(k_seqlen % 32 == 0, "K sequence length must be divisible by 32");
+    TORCH_CHECK(k_seqlens.size(BATCH_AXIS) == batch, "K sequence lengths batch dimension - idx 0 - must match for all inputs");
 
     // check to see that these dimensions match for all inputs
     TORCH_CHECK(q.size(BATCH_AXIS) == batch, "Q batch dimension - idx 0 - must match for all inputs");
@@ -278,6 +280,7 @@ attention_decode_forward(
     c10::BFloat16* v_cache_ptr = v_cache.data_ptr<c10::BFloat16>();
     c10::BFloat16* k_new_ptr = k_new_.has_value() ? k_new.data_ptr<c10::BFloat16>() : nullptr;
     c10::BFloat16* v_new_ptr = v_new_.has_value() ? v_new.data_ptr<c10::BFloat16>() : nullptr;
+    int* k_seqlens_ptr = k_seqlens.data_ptr<int>();
 
     bf16*  d_q = reinterpret_cast<bf16*>(q_ptr);
     bf16*  d_k_cache = reinterpret_cast<bf16*>(k_cache_ptr);
@@ -335,7 +338,7 @@ attention_decode_forward(
             dim3 grid((q_seq_len + qkvo_tile<64>::rows*NUM_WORKERS - 1) / (qkvo_tile<64>::rows*NUM_WORKERS), qo_heads, batch);
             attend_ker<64, SEQ_AXIS_CONST><<<grid, (32*NUM_WORKERS), mem_size>>>(
                 g,
-                k_seqlen,
+                k_seqlens_ptr,
                 k_new_seqlen,
                 causal
             );
@@ -372,7 +375,7 @@ attention_decode_forward(
             dim3 grid((q_seq_len + qkvo_tile<128>::rows*NUM_WORKERS - 1) / (qkvo_tile<128>::rows*NUM_WORKERS), qo_heads, batch);
             attend_ker<128, SEQ_AXIS_CONST><<<grid, (32*NUM_WORKERS), mem_size>>>(
                 g,
-                k_seqlen,
+                k_seqlens_ptr,
                 k_new_seqlen,
                 causal
             );

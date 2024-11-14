@@ -780,4 +780,51 @@ if __name__ == "__main__":
     # max error
     print('max error', max(errors, key=lambda x: x[1]))
 
+    print('KV cache update in-place, causal, Q_lengths, BLHD format, different seqlens, cache batch idx, Q K_new V_new %32 != 0')
+    errors = []
+
+    B_c = 2 * B
+
+    torch.manual_seed(0)
+    for L_4090_q in range(32, 1025, 32):
+        q_offset = torch.randint(0, 32, (1,))[0]
+        l_max_offset = torch.randint(0, 32, (1,))[0]
+        q_len = L_4090_q + q_offset
+        l_max = L_max + l_max_offset
+
+        q_decode = torch.randn(B, q_len, H, d, device="cuda", dtype=dtype)
+        k_decode = torch.randn(B_c, l_max, H, d, device="cuda", dtype=dtype)
+        v_decode = torch.randn(B_c, l_max, H, d, device="cuda", dtype=dtype)
+
+        cache_batch_idx = torch.randperm(B_c, device="cuda")[:B].to(torch.int32)
+
+        k_seqlens = (torch.randint(1, (l_max-L_4090_q-32) // 32, (B,), device="cuda") * 32).to(torch.int32)
+        for i in range(B):
+            k_decode[i, k_seqlens[i]:] = 0
+            v_decode[i, k_seqlens[i]:] = 0
+        
+        # clone for in-place operations
+        k_decode_ref = k_decode.clone()
+        v_decode_ref = v_decode.clone()
+        k_new = torch.randn(B, q_len, H, d, device="cuda", dtype=dtype)
+        v_new = torch.randn(B, q_len, H, d, device="cuda", dtype=dtype)
+
+        out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=True, k_seqlens=k_seqlens, blhd_format=True, cache_batch_idx=cache_batch_idx)
+
+        out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=True, k_seqlens=k_seqlens, blhd_format=True, cache_batch_idx=cache_batch_idx)
+
+        # breakpoint()
+
+        errors.append((
+            L_4090,
+            (out_tk_decode - out_ref_decode).abs().max().item(),
+            (k_cache_tk - k_cache_ref).abs().max().item(),
+            (v_cache_tk - v_cache_ref).abs().max().item()
+        ))
+
+    # print(errors)
+
+    # max error
+    print('max error', max(errors, key=lambda x: x[1]))
+
     breakpoint()

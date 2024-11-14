@@ -20,6 +20,7 @@ __global__ void attend_ker(
     int* cache_batch_idx                    // cache batch indices
 ) {
     auto ZERO = kittens::base_types::constants<bf16>::zero();
+    auto NEG_INF = kittens::base_types::constants<bf16>::neg_infty();
     using load_group = kittens::group<2>; // pairs of workers collaboratively load k, v tiles
     int loadid = load_group::groupid(), workerid = kittens::warpid(); // which worker am I?
     constexpr int LOAD_BLOCKS = NUM_WORKERS / load_group::GROUP_WARPS;
@@ -49,7 +50,10 @@ __global__ void attend_ker(
     // each warp loads its own Q tile of 16x64
     if (q_seq*ROWS<D> < num_q_rows) {
         auto q_coords = (SEQ_AXIS == 2 ? coord{q_batch, head, q_seq, 0} : coord{q_batch, q_seq, head, 0});
-        load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.Qg, q_coords, ROWS<D>, ZERO);  // going through shared memory improves coalescing of dram reads.
+        auto n_rows = (q_seq + 1) * ROWS<D> > num_q_rows ? num_q_rows - q_seq * ROWS<D> : ROWS<D>;
+
+        // replace the rest of the tile with NEG_INF for attention
+        load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.Qg, q_coords, n_rows, NEG_INF);  // going through shared memory improves coalescing of dram reads.
         __syncwarp();
         load(q_reg, qo_smem[workerid]);
     }
@@ -101,9 +105,11 @@ __global__ void attend_ker(
             int kv_new_idx = (kv_idx - kv_blocks + 1) * LOAD_BLOCKS + loadid;
 
             auto next_coords = (SEQ_AXIS == 2 ? coord{q_batch, head, kv_new_idx, 0} : coord{q_batch, kv_new_idx, head, 0});
-
-            load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][next_tic], g.KNewg, next_coords, ROWS<D>, ZERO);
-            load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][next_tic], g.VNewg, next_coords, ROWS<D>, ZERO);
+            auto n_rows = (kv_new_idx + 1) * ROWS<D> > k_new_seqlen ? k_new_seqlen - kv_new_idx * ROWS<D> : ROWS<D>;
+            
+            // replace the rest of the tile with NEG_INF for attention
+            load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][next_tic], g.KNewg, next_coords, n_rows, NEG_INF);
+            load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][next_tic], g.VNewg, next_coords, n_rows, NEG_INF);
             load_async_wait<2>(); // next k, v can stay in flight.
         }
         else load_async_wait(); // all must arrive
@@ -169,23 +175,24 @@ __global__ void attend_ker(
         store(qo_smem[workerid], o_reg); // going through shared memory improves coalescing of dram writes.
         __syncwarp();
         auto q_out_coords = (SEQ_AXIS == 2 ? coord{q_batch, head, q_seq, 0} : coord{q_batch, q_seq, head, 0});
-        store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.Og, qo_smem[workerid], q_out_coords);
+        auto n_rows = (q_seq + 1) * ROWS<D> > num_q_rows ? num_q_rows - q_seq * ROWS<D> : ROWS<D>;
+        store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.Og, qo_smem[workerid], q_out_coords, n_rows);
 
         if (k_new_seqlen > 0) {
             int kv_blocks_orig = (k_seqlen + ROWS<D> - 1) / ROWS<D>;
             auto kv_cache_coords = (SEQ_AXIS == 2 ? coord{kv_batch, head, kv_blocks_orig + q_seq, 0} : coord{kv_batch, kv_blocks_orig + q_seq, head, 0});
 
             __syncwarp();
-            // in-place update KCache with KNew
-            load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.KNewg, q_out_coords, ROWS<D>, ZERO);  // going through shared memory improves coalescing of dram reads.
+            // in-place update KCache with KNew, replace the rest of the tile with ZERO for reading
+            load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.KNewg, q_out_coords, n_rows, ZERO);  // going through shared memory improves coalescing of dram reads.
             __syncwarp();
-            store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.KCacheg, qo_smem[workerid], kv_cache_coords);
+            store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.KCacheg, qo_smem[workerid], kv_cache_coords, n_rows);
 
             __syncwarp();
-            // in-place update VCache with VNew
-            load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.VNewg, q_out_coords, ROWS<D>, ZERO);  // going through shared memory improves coalescing of dram reads.
+            // in-place update VCache with VNew, replace the rest of the tile with ZERO for reading
+            load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.VNewg, q_out_coords, n_rows, ZERO);  // going through shared memory improves coalescing of dram reads.
             __syncwarp();
-            store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.VCacheg, qo_smem[workerid], kv_cache_coords);
+            store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.VCacheg, qo_smem[workerid], kv_cache_coords, n_rows);
         }
     }
 }
@@ -248,8 +255,8 @@ attention_decode_forward(
     TORCH_CHECK(k_cache.size(BATCH_AXIS) == batch_c, "K cache batch dimension - idx 0 - must match for all inputs");
     TORCH_CHECK(v_cache.size(BATCH_AXIS) == batch_c, "V cache batch dimension - idx 0 - must match for all inputs");
 
-    TORCH_CHECK(q_seq_len % 32 == 0, "Q sequence length must be divisible by 32");
-    TORCH_CHECK(k_max_len % 32 == 0, "K cache sequence length must be divisible by 32");
+    // TORCH_CHECK(q_seq_len % 32 == 0, "Q sequence length must be divisible by 32");
+    // TORCH_CHECK(k_max_len % 32 == 0, "K cache sequence length must be divisible by 32");
 
     TORCH_CHECK(v_cache.size(SEQ_AXIS) == k_max_len, "V cache sequence length dimension - idx 2 - must match for all inputs");
 

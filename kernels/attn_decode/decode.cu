@@ -68,14 +68,33 @@ __global__ void attend_ker(
     // launch the load of the first k, v tiles
     // total number of blocks we want to load
     int kv_blocks = (k_seqlen + (LOAD_BLOCKS*ROWS<D>) - 1) / (LOAD_BLOCKS*ROWS<D>);
-    int kv_blocks_total = (k_seqlen + k_new_seqlen + (LOAD_BLOCKS*ROWS<D>) - 1) / (LOAD_BLOCKS*ROWS<D>);
+    
+    // we want to load all the blocks from the cache, plus the new blocks
+    int kv_blocks_total = kv_blocks + (k_new_seqlen + (LOAD_BLOCKS*ROWS<D>) - 1) / (LOAD_BLOCKS*ROWS<D>);
+
+    // total number of tiles in KV cache
+    int kv_tiles = (k_seqlen + ROWS<D> - 1) / ROWS<D>;
+    // total number of tiles in KV cache and KNew/VNew
+    int kv_tiles_total = kv_tiles + (k_new_seqlen + ROWS<D> - 1) / ROWS<D>;
+
     int tic = 0;
 
     auto k_coords = (SEQ_AXIS == 2 ? coord{kv_batch, head, loadid, 0} : coord{kv_batch, loadid, head, 0});
     auto v_coords = (SEQ_AXIS == 2 ? coord{kv_batch, head, loadid, 0} : coord{kv_batch, loadid, head, 0});
 
-    load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][0], g.KCacheg, k_coords, ROWS<D>, ZERO);
-    load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][0], g.VCacheg, v_coords, ROWS<D>, ZERO);
+    if (kv_blocks > 0 && loadid * ROWS<D> < k_seqlen) {
+        auto n_rows = loadid * ROWS<D> < k_seqlen ? ROWS<D> : k_seqlen - loadid * ROWS<D>;
+
+        load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][0], g.KCacheg, k_coords, n_rows, NEG_INF);
+        load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][0], g.VCacheg, v_coords, n_rows, ZERO);
+    } else if (k_new_seqlen > 0 && loadid * ROWS<D> < k_new_seqlen) {
+        auto next_coords = (SEQ_AXIS == 2 ? coord{q_batch, head, loadid, 0} : coord{q_batch, loadid, head, 0});
+        auto n_rows = loadid * ROWS<D> < k_new_seqlen ? ROWS<D> : k_new_seqlen - loadid * ROWS<D>;
+
+        load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][0], g.KNewg, k_coords, n_rows, NEG_INF);
+        load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][0], g.VNewg, v_coords, n_rows, ZERO);
+    }
+    
     // iterate over k, v for these q's that have been loaded
     for(auto kv_idx = 0; kv_idx < kv_blocks_total; kv_idx++, tic=(tic+1)%3) {
         int cur_load_idx = kv_idx*LOAD_BLOCKS;
@@ -84,33 +103,40 @@ __global__ void attend_ker(
         bool load_next = true;
         if (k_new_seqlen == 0) {
             // skip if we're out of K's or we're past the causal mask
-            load_next = next_load_idx*ROWS<D> < k_seqlen && (!causal || next_load_idx <= q_seq_next);
+            load_next = next_load_idx < kv_tiles && (!causal || next_load_idx <= q_seq_next);
         } else {
             // skip if we're out of KNew's or we're past the causal mask for KNew
-            load_next = next_load_idx*ROWS<D> < k_seqlen + k_new_seqlen && (!causal || (kv_idx + 1 - kv_blocks) * LOAD_BLOCKS + loadid <= q_seq_next);
+            load_next = next_load_idx < kv_tiles_total && (!causal || (kv_idx + 1 - kv_blocks) * LOAD_BLOCKS + loadid <= q_seq_next);
         }
-        if(load_next && next_load_idx*ROWS<D> < k_seqlen) {
+        if(load_next && next_load_idx < kv_tiles) {
             // every two workers are working together to load the next tiles, then broadcast to all workers
             // we need to load the next times for all workers, and then skip selectively in the individual worker
             int next_tic = (tic+1)%3;
             auto next_coords = (SEQ_AXIS == 2 ? coord{kv_batch, head, next_load_idx, 0} : coord{kv_batch, next_load_idx, head, 0});
 
-            load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][next_tic], g.KCacheg, next_coords, ROWS<D>, ZERO);
-            load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][next_tic], g.VCacheg, next_coords, ROWS<D>, ZERO);
-            load_async_wait<2>(); // next k, v can stay in flight.
+            if (next_load_idx * ROWS<D> < k_seqlen) {
+                auto n_rows = (next_load_idx + 1) * ROWS<D> > k_seqlen ? k_seqlen - (next_load_idx + 1) * ROWS<D> : ROWS<D>;
+
+                load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][next_tic], g.KCacheg, next_coords, n_rows, NEG_INF);
+                load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][next_tic], g.VCacheg, next_coords, n_rows, ZERO);
+                load_async_wait<2>(); // next k, v can stay in flight.
+            }
         }
-        else if (load_next && next_load_idx*ROWS<D> < k_seqlen + k_new_seqlen) {
+        else if (load_next && next_load_idx < kv_tiles_total) {
             // load the next tiles from KNew and VNew
             int next_tic = (tic+1)%3;
             int kv_new_idx = (kv_idx - kv_blocks + 1) * LOAD_BLOCKS + loadid;
 
             auto next_coords = (SEQ_AXIS == 2 ? coord{q_batch, head, kv_new_idx, 0} : coord{q_batch, kv_new_idx, head, 0});
-            auto n_rows = (kv_new_idx + 1) * ROWS<D> > k_new_seqlen ? k_new_seqlen - kv_new_idx * ROWS<D> : ROWS<D>;
-            
-            // replace the rest of the tile with NEG_INF for attention
-            load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][next_tic], g.KNewg, next_coords, n_rows, NEG_INF);
-            load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][next_tic], g.VNewg, next_coords, n_rows, NEG_INF);
-            load_async_wait<2>(); // next k, v can stay in flight.
+
+            if (kv_new_idx * ROWS<D> < k_new_seqlen) {
+                auto n_rows = (kv_new_idx + 1) * ROWS<D> > k_new_seqlen ? k_new_seqlen - kv_new_idx * ROWS<D> : ROWS<D>;
+                
+                // replace the rest of the tile with NEG_INF for attention
+                load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][next_tic], g.KNewg, next_coords, n_rows, NEG_INF);
+                load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][next_tic], g.VNewg, next_coords, n_rows, ZERO);
+                load_async_wait<2>(); // next k, v can stay in flight.
+            }
         }
         else load_async_wait(); // all must arrive
         __syncthreads(); // Everyone's memory must be ready for the next stage.
@@ -118,7 +144,7 @@ __global__ void attend_ker(
         #pragma unroll LOAD_BLOCKS
         for(int subtile = 0;
             subtile < LOAD_BLOCKS &&
-            kv_idx * LOAD_BLOCKS * ROWS<D> + subtile * ROWS<D> < k_seqlen + k_new_seqlen;
+            kv_idx * LOAD_BLOCKS + subtile < kv_tiles_total;
             subtile++) {
             if (
                 causal && (
@@ -179,6 +205,7 @@ __global__ void attend_ker(
         store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.Og, qo_smem[workerid], q_out_coords, n_rows);
 
         if (k_new_seqlen > 0) {
+            // TODO(danfu): this needs to be fixed for when k_seqlen % 32 != 0
             int kv_blocks_orig = (k_seqlen + ROWS<D> - 1) / ROWS<D>;
             auto kv_cache_coords = (SEQ_AXIS == 2 ? coord{kv_batch, head, kv_blocks_orig + q_seq, 0} : coord{kv_batch, kv_blocks_orig + q_seq, head, 0});
 
@@ -186,12 +213,14 @@ __global__ void attend_ker(
             // in-place update KCache with KNew, replace the rest of the tile with ZERO for reading
             load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.KNewg, q_out_coords, n_rows, ZERO);  // going through shared memory improves coalescing of dram reads.
             __syncwarp();
+            // TODO(danfu): this needs to be fixed for when k_seqlen % 32 != 0
             store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.KCacheg, qo_smem[workerid], kv_cache_coords, n_rows);
 
             __syncwarp();
             // in-place update VCache with VNew, replace the rest of the tile with ZERO for reading
             load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.VNewg, q_out_coords, n_rows, ZERO);  // going through shared memory improves coalescing of dram reads.
             __syncwarp();
+            // TODO(danfu): this needs to be fixed for when k_seqlen % 32 != 0
             store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.VCacheg, qo_smem[workerid], kv_cache_coords, n_rows);
         }
     }

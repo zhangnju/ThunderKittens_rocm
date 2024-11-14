@@ -824,8 +824,6 @@ if __name__ == "__main__":
 
     # print(errors)
 
-    breakpoint()
-
     # max error
     print('max error', max(errors, key=lambda x: x[1]))
 
@@ -863,8 +861,6 @@ if __name__ == "__main__":
         v_new = None
 
         out_tk_decode, k_cache_tk, v_cache_tk = mha_fwd_decode(q_decode, k_decode, v_decode, k_new=k_new, v_new=v_new, causal=False, k_seqlens=k_seqlens, blhd_format=True, cache_batch_idx=cache_batch_idx)
-
-        breakpoint()
 
         out_ref_decode, k_cache_ref, v_cache_ref = mha_fwd_ref_kvcache(q_decode, k_decode_ref, v_decode_ref, k_new=k_new, v_new=v_new, causal=False, k_seqlens=k_seqlens, blhd_format=True, cache_batch_idx=cache_batch_idx)
 

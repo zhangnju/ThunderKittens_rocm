@@ -237,7 +237,11 @@ __device__ static inline void copy(rt<T2, _height, _width, layout> &dst, const r
 
     if constexpr (
         (std::is_same_v<U2, float> && std::is_same_v<T2, fp8e4m3>) ||
-        (std::is_same_v<U2, float> && std::is_same_v<T2, fp8e5m2>)
+        (std::is_same_v<U2, float> && std::is_same_v<T2, fp8e5m2>) ||
+        (std::is_same_v<U2, kittens::bf16> && std::is_same_v<T2, fp8e4m3>) ||
+        (std::is_same_v<U2, kittens::bf16> && std::is_same_v<T2, fp8e5m2>) ||
+        (std::is_same_v<U2, half> && std::is_same_v<T2, fp8e4m3>) ||
+        (std::is_same_v<U2, half> && std::is_same_v<T2, fp8e5m2>)
     ) {
         // FLOAT (SRC -- 1H x 2W) to FP8 (DST -- 1H x 1W)
         int laneid = threadIdx.x % 32;
@@ -248,26 +252,30 @@ __device__ static inline void copy(rt<T2, _height, _width, layout> &dst, const r
             for(int j = 0; j < dst.width; j++) {
                 #pragma unroll
                 for(int k = 0; k < dst.tiles[0][0].packed_per_thread; k++) {
+                    
+                    // check for half, float, bf16
+                    using src_t = std::conditional_t<std::is_same_v<U2, float>, float2, std::conditional_t<std::is_same_v<U2, kittens::bf16>, bf16_2, half2>>;
+                    src_t val1, val2;
+
                     // Put something up for adoption
-                    float2 val1, val2;
                     if (laneid % 2 == 0) { 
                         // put up src left core matrix first as 0, 2
-                        val1 = src.tiles[i][2*j].data[k];
-                        val2 = src.tiles[i][2*j + 1].data[k];
+                        val1 = src.tiles[i][2*j + k/2].data[(k%2)+0];
+                        val2 = src.tiles[i][2*j + k/2].data[(k%2)+2];
                     } else { 
                         // put up src right core matrix first as 1, 3
-                        val1 = src.tiles[i][2*j + 1].data[k];
-                        val2 = src.tiles[i][2*j].data[k];
+                        val1 = src.tiles[i][2*j + k/2].data[(k%2)+2];
+                        val2 = src.tiles[i][2*j + k/2].data[(k%2)+0];
                     }
 
                     // Shuffle first 4 floats
                     int row_mask = 4 * ( laneid / 4 );
                     int row_offset = row_mask + ( (laneid-row_mask) / 2 ) + ( laneid % 2 );
                     int src_offset = (laneid % 2 == 0 ) ? row_offset + 0 : ( row_offset + 1 );
-                    float2 val01 = packed_shfl_sync(MASK_ALL, val1, src_offset);  // Get from even thread
+                    src_t val01 = packed_shfl_sync(MASK_ALL, val1, src_offset);  // Get from even thread
 
                     int src_offset2 = (laneid % 4 < 2 ) ? src_offset + 1 : (src_offset - 1);
-                    float2 val23 = packed_shfl_sync(MASK_ALL, val2, src_offset2);  // Get from odd thread
+                    src_t val23 = packed_shfl_sync(MASK_ALL, val2, src_offset2);  // Get from odd thread
                     
                     // Convert to fp8e4m3_4
                     float4 f4;
@@ -292,10 +300,13 @@ __device__ static inline void copy(rt<T2, _height, _width, layout> &dst, const r
             }
         }
     }
-    
     else if constexpr (
         (std::is_same_v<U2, fp8e4m3> && std::is_same_v<T2, float>) ||
-        (std::is_same_v<U2, fp8e5m2> && std::is_same_v<T2, float>)
+        (std::is_same_v<U2, fp8e5m2> && std::is_same_v<T2, float>) ||
+        (std::is_same_v<U2, fp8e4m3> && std::is_same_v<T2, kittens::bf16>) ||
+        (std::is_same_v<U2, fp8e5m2> && std::is_same_v<T2, kittens::bf16>) ||
+        (std::is_same_v<U2, fp8e4m3> && std::is_same_v<T2, half>) ||
+        (std::is_same_v<U2, fp8e5m2> && std::is_same_v<T2, half>)
     ) {
         // FP8 (SRC -- 1H x 1W) to FLOAT (DST -- 1H x 2W)
         int laneid = threadIdx.x % 32;
@@ -306,7 +317,7 @@ __device__ static inline void copy(rt<T2, _height, _width, layout> &dst, const r
             for(int j = 0; j < src.width; j++) {
                 #pragma unroll
                 for(int k = 0; k < src.tiles[0][0].packed_per_thread; k++) {
-                    int dst_j = (laneid % 2 == 0) ? 2*j : 2*j + 1;
+                    int dst_j = 2*j + k/2;
 
                     // Put something up for adoption
                     using fp8_4_t = std::conditional_t<std::is_same_v<U2, fp8e4m3>, fp8e4m3_4, fp8e5m2_4>;
@@ -322,25 +333,37 @@ __device__ static inline void copy(rt<T2, _height, _width, layout> &dst, const r
                         f2_1 = make_float2(f4.x, f4.y);
                     }
 
-                    // Shuffle f2_0
-                    int row_mask = 4 * ( laneid / 4 );
-                    int row_offset = row_mask + ( (laneid-row_mask) / 2 ) + ( laneid % 2 );
-                    int src_offset = (laneid % 2 == 0 ) ? row_offset + 0 : ( row_offset + 1 );
-                    float2 f2_0_shfl = packed_shfl_sync(MASK_ALL, f2_0, src_offset);
-                    dst.tiles[i][dst_j].data[k] = f2_0_shfl;
+                    int row_offset = 4 * (laneid/4) + (laneid%2) * 2 + (laneid%4) / 2;
+                    float2 f2_0_shfl = packed_shfl_sync(MASK_ALL, f2_0, row_offset);
+                    float2 f2_1_shfl = packed_shfl_sync(MASK_ALL, f2_1, row_offset^2);
 
-                    // Shuffle f2_1
-                    int src_offset2 = (laneid % 2 == 0 ) ? row_offset + 2 : (row_offset - 1); 
-                    float2 f2_1_shfl = packed_shfl_sync(MASK_ALL, f2_1, src_offset2);
-                    dst.tiles[i][dst_j^1].data[k] = f2_1_shfl;
+                    // convert to dst type if needed
+                    using dst_t = std::conditional_t<std::is_same_v<T2, float>, float2, std::conditional_t<std::is_same_v<T2, kittens::bf16>, bf16_2, half2>>;
+                    if constexpr (!(std::is_same_v<T2, float>)) {
+                        dst_t f2_0_shfl_t = base_types::convertor<dst_t, float2>::convert(f2_0_shfl);
+                        dst_t f2_1_shfl_t = base_types::convertor<dst_t, float2>::convert(f2_1_shfl);
+                        if (laneid % 2 == 0) {  
+                            dst.tiles[i][dst_j].data[(k%2)+0] = f2_0_shfl_t;
+                            dst.tiles[i][dst_j].data[(k%2)+2] = f2_1_shfl_t;
+                        } else {
+                            dst.tiles[i][dst_j].data[(k%2)+0] = f2_1_shfl_t;
+                            dst.tiles[i][dst_j].data[(k%2)+2] = f2_0_shfl_t;
+                        }
+                    } else {
+                        if (laneid % 2 == 0) {  
+                            dst.tiles[i][dst_j].data[(k%2)+0] = f2_0_shfl;
+                            dst.tiles[i][dst_j].data[(k%2)+2] = f2_1_shfl;
+                        } else {
+                            dst.tiles[i][dst_j].data[(k%2)+0] = f2_1_shfl;
+                            dst.tiles[i][dst_j].data[(k%2)+2] = f2_0_shfl;
+                        }
+                    }
                 }
             }
         }
     }
-
     // default case where the layouts map 1:1 in thread ownership logic
     else {
-        if constexpr (std::is_same_v<U2, fp8e4m3> || std::is_same_v<T2, fp8e4m3>) { printf("else case\n"); }
         #pragma unroll
         for(int i = 0; i < dst.height; i++) {
             #pragma unroll
@@ -391,6 +414,9 @@ __device__ static inline void copy(rt<T2, _height, _width, layout> &dst, const r
 template<ducks::rt::row_layout RT>
 __device__ static inline void make_causal(RT &dst, const RT &src, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
+    #ifdef KITTENS_HOPPER
+    static_assert(!std::is_same_v<typename RT::dtype, fp8e4m3_4> && !std::is_same_v<typename RT::dtype, fp8e5m2_4>, "Unsupported type for make_causal");
+    #endif
     #pragma unroll
     for(int i = 0; i < dst.height; i++) {
         #pragma unroll
@@ -433,9 +459,24 @@ __device__ static inline void make_causal(RT &dst, const RT &src, const typename
     }
 }
 
+/**
+ * @brief Makes a square register tile anti-causal by zeroing elements below the main diagonal.
+ *
+ * This function modifies a square register tile in-place to make it anti-causal. All elements
+ * below the main diagonal are set to zero, while elements on or above the main diagonal
+ * are left unchanged.
+ *
+ * @tparam T The data type of the register tile elements.
+ * @tparam _size The size (height and width) of the square register tile.
+ * @tparam layout The current layout of the register tile.
+ * @param tile[in,out] Reference to the register tile to be made causal.
+ */
 template<ducks::rt::row_layout RT>
 __device__ static inline void make_causal_t(RT &dst, const RT &src, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
+    #ifdef KITTENS_HOPPER
+    static_assert(!std::is_same_v<typename RT::dtype, fp8e4m3_4> && !std::is_same_v<typename RT::dtype, fp8e5m2_4>, "Unsupported type for make_causal");
+    #endif
     #pragma unroll
     for(int i = 0; i < dst.height; i++) {
         #pragma unroll
@@ -483,6 +524,325 @@ __device__ static inline void make_causal_t(RT &dst, const RT &src, const typena
                 
             }
             __syncwarp();
+        }
+    }
+}
+
+/* ----------  TRIANGULAR FILLS  ---------- */
+
+/**
+ * @brief Makes a register tile triangular by zeroing elements above the row index
+ *
+ * @tparam RT The type of the register tile.
+ * @param dst[in,out] The register tile to be filled.
+ * @param src[in] The register tile to copy from.
+ * @param row_idx[in] The row index to triangularize from.
+ * @param val[in] The value to fill with.
+ */
+template<ducks::rt::row_layout RT>
+__device__ static inline void tril(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
+
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_tile; k++) {
+                const int global_row_idx   = (i * dst.tile_size_row) + ((k % 2) * 8) + (laneid() / 4);
+                const int global_col_idx_x = (j * dst.tile_size_col) + ((k / 2) * 8) + ((laneid() % 4) * 2);
+                const int global_col_idx_y = (j * dst.tile_size_col) + ((k / 2) * 8) + ((laneid() % 4) * 2) + 1;
+
+                if (global_row_idx < row_idx) { dst.tiles[i][j].data[k] = packed_val; }
+                else {
+                    if (global_col_idx_x <= global_row_idx - row_idx) { dst.tiles[i][j].data[k].x = src.tiles[i][j].data[k].x; }
+                    else                                              { dst.tiles[i][j].data[k].x = val; }
+
+                    if (global_col_idx_y <= global_row_idx - row_idx) { dst.tiles[i][j].data[k].y = src.tiles[i][j].data[k].y; }
+                    else                                              { dst.tiles[i][j].data[k].y = val; }
+                }
+            }
+        }
+        __syncwarp();
+    }
+}
+template<ducks::rt::col_layout RT>
+__device__ static inline void tril(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_tile; k++) {
+                const int global_row_idx_x = (i * dst.tile_size_row) + ((k / 2) * 8) + ((laneid() % 4) * 2);
+                const int global_row_idx_y = (i * dst.tile_size_row) + ((k / 2) * 8) + ((laneid() % 4) * 2) + 1;
+                const int global_col_idx   = (j * dst.tile_size_col) + ((k % 2) * 8) + (laneid() / 4);
+
+                if (global_row_idx_x < row_idx) { dst.tiles[i][j].data[k].x = val; }
+                else { 
+                    if (global_col_idx <= global_row_idx_x - row_idx) { dst.tiles[i][j].data[k].x = src.tiles[i][j].data[k].x; }
+                    else                                              { dst.tiles[i][j].data[k].x = val; }
+                }
+
+                if (global_row_idx_y < row_idx) { dst.tiles[i][j].data[k].y = val; }
+                else { 
+                    if (global_col_idx <= global_row_idx_y - row_idx) { dst.tiles[i][j].data[k].y = src.tiles[i][j].data[k].y; }
+                    else                                              { dst.tiles[i][j].data[k].y = val; }
+                }
+            }
+        }
+        __syncwarp();
+    }
+}
+
+/**
+ * @brief Makes a register tile triangular by zeroing elements below the row index
+ *
+ * @tparam RT The type of the register tile.
+ * @param dst[in,out] The register tile to be filled.
+ * @param src[in] The register tile to copy from.
+ * @param row_idx[in] The row index to triangularize from.
+ * @param val[in] The value to fill with.
+ */
+template<ducks::rt::row_layout RT>
+__device__ static inline void triu(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
+
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_tile; k++) {
+                const int global_row_idx   = (i * dst.tile_size_row) + ((k % 2) * 8) + (laneid() / 4);
+                const int global_col_idx_x = (j * dst.tile_size_col) + ((k / 2) * 8) + ((laneid() % 4) * 2);
+                const int global_col_idx_y = (j * dst.tile_size_col) + ((k / 2) * 8) + ((laneid() % 4) * 2) + 1;
+
+                if (global_row_idx < row_idx) { dst.tiles[i][j].data[k] = src.tiles[i][j].data[k]; }
+                else {
+                    if (global_col_idx_x < global_row_idx - row_idx) { dst.tiles[i][j].data[k].x = val; }
+                    else                                             { dst.tiles[i][j].data[k].x = src.tiles[i][j].data[k].x; }
+
+                    if (global_col_idx_y < global_row_idx - row_idx) { dst.tiles[i][j].data[k].y = val; }
+                    else                                             { dst.tiles[i][j].data[k].y = src.tiles[i][j].data[k].y; }
+                }
+            }
+        }
+        __syncwarp();
+    }
+}
+template<ducks::rt::col_layout RT>
+__device__ static inline void triu(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_tile; k++) {
+                const int global_row_idx_x = (i * dst.tile_size_row) + ((k / 2) * 8) + ((laneid() % 4) * 2);
+                const int global_row_idx_y = (i * dst.tile_size_row) + ((k / 2) * 8) + ((laneid() % 4) * 2) + 1;
+                const int global_col_idx   = (j * dst.tile_size_col) + ((k % 2) * 8) + (laneid() / 4);
+
+                if (global_row_idx_x < row_idx) { dst.tiles[i][j].data[k].x = src.tiles[i][j].data[k].x; }
+                else                            { 
+                    if (global_col_idx < global_row_idx_x - row_idx) { dst.tiles[i][j].data[k].x = val; }
+                    else                                             { dst.tiles[i][j].data[k].x = src.tiles[i][j].data[k].x; }
+                }
+
+                if (global_row_idx_y < row_idx) { dst.tiles[i][j].data[k].y = src.tiles[i][j].data[k].y; }
+                else                            { 
+                    if (global_col_idx < global_row_idx_y - row_idx) { dst.tiles[i][j].data[k].y = val; }
+                    else                                             { dst.tiles[i][j].data[k].y = src.tiles[i][j].data[k].y; }
+                }
+            }
+        }
+        __syncwarp();
+    }
+}
+
+/* ----------  RECTANGULAR FILLS  ---------- */
+
+/**
+ * @brief Makes a register tile right filled with a given value.
+ *
+ * @tparam RT The type of the register tile.
+ * @param dst[in,out] The register tile to be filled.
+ * @param src[in] The register tile to copy from.
+ * @param col_idx[in] The column index to fill from and onwards to the right.
+ * @param val[in] The value to fill with.
+ */
+template<ducks::rt::row_layout RT>
+__device__ static inline void right_fill(RT &dst, const RT &src, const int col_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    if(col_idx >= dst.cols) return;
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_tile; k++) {
+                const int col_idx_x = (j * dst.tile_size_col) + ((k / 2) * 8) + ((laneid() % 4) * 2);
+                const int col_idx_y = (j * dst.tile_size_col) + ((k / 2) * 8) + ((laneid() % 4) * 2) + 1;
+                if (col_idx_x >= col_idx)  { dst.tiles[i][j].data[k].x = val; }
+                else                       { dst.tiles[i][j].data[k].x = src.tiles[i][j].data[k].x; }
+                if (col_idx_y >= col_idx)  { dst.tiles[i][j].data[k].y = val; }
+                else                       { dst.tiles[i][j].data[k].y = src.tiles[i][j].data[k].y; }
+            }
+        }
+    }
+}
+template<ducks::rt::col_layout RT>
+__device__ static inline void right_fill(RT &dst, const RT &src, const int col_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
+    
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_tile; k++) {
+                const int t_col_idx = (j * dst.tile_size_col) + ((k % 2) * 8) + (laneid() / 4); 
+                if (t_col_idx >= col_idx)  { dst.tiles[i][j].data[k] = packed_val; }
+                else                       { dst.tiles[i][j].data[k] = src.tiles[i][j].data[k]; }
+            }
+        }
+        __syncwarp();
+    }
+}
+
+/**
+ * @brief Makes a register tile left filled with a given value.
+ *
+ * @tparam RT The type of the register tile.
+ * @param dst[in,out] The register tile to be filled.
+ * @param src[in] The register tile to copy from.
+ * @param col_idx[in] The column index to fill to the left (exclusive).
+ * @param val[in] The value to fill with.
+ */
+template<ducks::rt::row_layout RT>
+__device__ static inline void left_fill(RT &dst, const RT &src, const int col_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    if(col_idx <= 0) return;
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_tile; k++) {
+                const int col_idx_x = (j * dst.tile_size_col) + ((k / 2) * 8) + ((laneid() % 4) * 2);
+                const int col_idx_y = (j * dst.tile_size_col) + ((k / 2) * 8) + ((laneid() % 4) * 2) + 1;
+                if (col_idx_x < col_idx)  { dst.tiles[i][j].data[k].x = val; }
+                else                      { dst.tiles[i][j].data[k].x = src.tiles[i][j].data[k].x; }
+                if (col_idx_y < col_idx)  { dst.tiles[i][j].data[k].y = val; }
+                else                      { dst.tiles[i][j].data[k].y = src.tiles[i][j].data[k].y; }
+            }
+        }
+    }
+}
+template<ducks::rt::col_layout RT>
+__device__ static inline void left_fill(RT &dst, const RT &src, const int col_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
+
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_tile; k++) {
+                const int thread_col = (j * dst.tile_size_col) + ((k % 2) * 8) + ((laneid() / 4));
+                if (thread_col < col_idx)  { dst.tiles[i][j].data[k] = packed_val; }
+                else                       { dst.tiles[i][j].data[k] = src.tiles[i][j].data[k]; }
+            }
+        }
+        __syncwarp();
+    }
+}
+
+/**
+ * @brief Makes a register tile upper filled with a given value.
+ *
+ * @tparam RT The type of the register tile.
+ * @param dst[in,out] The register tile to be filled.
+ * @param src[in] The register tile to copy from.
+ * @param row_idx[in] The row index to fill to, from the top (exclusive).
+ * @param val[in] The value to fill with.
+ */
+template<ducks::rt::row_layout RT>
+__device__ static inline void upper_fill(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    if(row_idx <= 0) return;
+    const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_tile; k++) {
+                const int thread_row = (i * dst.tile_size_row) + ((k % 2) * 8) + ((laneid() / 4));
+                if (thread_row < row_idx)  { dst.tiles[i][j].data[k] = packed_val; }
+                else                       { dst.tiles[i][j].data[k] = src.tiles[i][j].data[k]; }
+            }
+        }
+    }
+}
+template<ducks::rt::col_layout RT>
+__device__ static inline void upper_fill(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_tile; k++) {
+                const int row_idx_x = (i * dst.tile_size_row) + ((k / 2) * 8) + ((laneid() % 4) * 2);
+                const int row_idx_y = (i * dst.tile_size_row) + ((k / 2) * 8) + ((laneid() % 4) * 2) + 1;
+                if (row_idx_x < row_idx)  { dst.tiles[i][j].data[k].x = val; }
+                else                      { dst.tiles[i][j].data[k].x = src.tiles[i][j].data[k].x; }
+                if (row_idx_y < row_idx)  { dst.tiles[i][j].data[k].y = val; }
+                else                      { dst.tiles[i][j].data[k].y = src.tiles[i][j].data[k].y; }
+            }
+        }
+    }
+}
+
+/**
+ * @brief Makes a register tile lower filled with a given value.
+ *
+ * @tparam RT The type of the register tile.
+ * @param dst[in,out] The register tile to be filled.
+ * @param src[in] The register tile to copy from.
+ * @param row_idx[in] The row index to fill from and onwards to the bottom of the tile (inclusive).
+ * @param val[in] The value to fill with.
+ */
+template<ducks::rt::row_layout RT>
+__device__ static inline void lower_fill(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    if(row_idx >= dst.rows) return;
+    const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
+
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_tile; k++) {
+                const int thread_row = (i * dst.tile_size_row) + ((k % 2) * 8) + ((laneid() / 4));
+                if (thread_row >= row_idx)  { dst.tiles[i][j].data[k] = packed_val; }
+                else                        { dst.tiles[i][j].data[k] = src.tiles[i][j].data[k]; }
+            }
+        }
+    }
+}
+template<ducks::rt::col_layout RT>
+__device__ static inline void lower_fill(RT &dst, const RT &src, const int row_idx, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < dst.packed_per_tile; k++) {
+                const int row_idx_x = (i * dst.tile_size_row) + ((k / 2) * 8) + ((laneid() % 4) * 2);
+                const int row_idx_y = (i * dst.tile_size_row) + ((k / 2) * 8) + ((laneid() % 4) * 2) + 1;
+                if (row_idx_x >= row_idx)  { dst.tiles[i][j].data[k].x = val; }
+                else                       { dst.tiles[i][j].data[k].x = src.tiles[i][j].data[k].x; }
+                if (row_idx_y >= row_idx)  { dst.tiles[i][j].data[k].y = val; }
+                else                       { dst.tiles[i][j].data[k].y = src.tiles[i][j].data[k].y; }
+            }
         }
     }
 }

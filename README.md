@@ -1,4 +1,10 @@
 # ThunderKittens
+
+### Recent Updates (Nov 23, 2024)
+- kernels/example_bind has a newer, simpler way to get started binding TK kernels up to PyTorch.
+- FP8 support.
+- New-axis loads, automatic padding, and other QoL improvements.
+
 ### Tile primitives for speedy kernels
 
 <div align="center" >
@@ -19,7 +25,7 @@ ThunderKittens is built around three key principles:
     <img src="assets/attn.png" height=600 alt="Flash Attention 3, but with kittens!" style="margin-bottom:px"/> 
 </div>
 
-Join us on Discord to get involved: [ThunderKittens channel @ GPU Mode Discord](https://discord.com/channels/1189498204333543425/1300872762163728550)!!!! Here is the invite link to GPU mode: https://discord.gg/W7CUhN5w
+Join us on Discord to get involved: [ThunderKittens channel @ GPU Mode Discord](https://discord.com/channels/1189498204333543425/1300872762163728550)!!!! Here is the invite link to GPU mode: https://discord.gg/gpumode
 
 ThunderKittens is built from the hardware up -- we do what the silicon tells us. And modern GPUs tell us that they want to work with fairly small tiles of data. A GPU is not really a 1000x1000 matrix multiply machine (even if it is often used as such); it’s a manycore processor where each core can efficiently run ~16x16 matrix multiplies. Consequently, ThunderKittens is built around manipulating tiles of data no smaller than 16x16 values.
 
@@ -142,12 +148,12 @@ But ThunderKittens does use a bunch of modern stuff, so it has fairly aggressive
 
 ```bash
 sudo apt update
-sudo apt install gcc-10 g++-10
+sudo apt install gcc-11 g++-11
 
-sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100 --slave /usr/bin/g++ g++ /usr/bin/g++-10
+sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100 --slave /usr/bin/g++ g++ /usr/bin/g++-11
 
 sudo apt update
-sudo apt install clang-10
+sudo apt install clang-11
 ```
 
 If you can't find nvcc, or you experience issues where your environment is pointing to the wrong CUDA version:
@@ -235,10 +241,14 @@ Most operations in ThunderKittens are pure functional. However, some operations 
 
 ## Learn more and get involved!
 
-Learn more about ThunderKittens and how GPUs work by checking out:
-- [New Paper, Oct. 2024](https://arxiv.org/abs/2410.20399)
+Learn more about ThunderKittens and how GPUs work by checking out our blogs:
 - [Easier, Better, Faster, Cuter Blogpost, Oct. 2024](https://hazyresearch.stanford.edu/blog/2024-10-29-tk2)
 - [GPUs Go Brrr Blogpost, May 2024](https://hazyresearch.stanford.edu/blog/2024-05-12-tk)
+- [ThunderKittens: Bringing fp8 to theaters near you, Nov 2024](https://hazyresearch.stanford.edu/blog/2024-11-27-tk-fp8)
+- [ThunderMittens For Your ThunderKittens, Nov 2024](https://hazyresearch.stanford.edu/blog/2024-11-28-tk-mlx)
 
-Join us and get involved at the [ThunderKittens channel @ GPU Mode Discord](https://discord.com/channels/1189498204333543425/1300872762163728550)!!!!  Here is the invite link to GPU mode: https://discord.gg/W7CUhN5w
+Please check out our paper for even more details: [paper](https://arxiv.org/abs/2410.20399)
+
+Join us and get involved at the [ThunderKittens channel @ GPU Mode Discord](https://discord.com/channels/1189498204333543425/1300872762163728550)!!!!  Here is the invite link to GPU mode: https://discord.gg/gpumode
+
 

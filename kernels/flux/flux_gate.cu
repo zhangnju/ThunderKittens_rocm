@@ -97,7 +97,7 @@ struct flux_matmul_gate_template {
             warpgroup::consumer_registers<NUM_CONSUMER_WARPGROUPS>();
             group<NUM_CONSUMER_WARPS>::load(args.scratch.bias, args.globals.bias, {blockIdx.y});
             group<NUM_CONSUMER_WARPS>::load(args.scratch.gate, args.globals.gate, {blockIdx.y});
-            group<NUM_CONSUMER_WARPS>::sync();
+            group<NUM_CONSUMER_WARPS>::sync(6);
             rt_sv_op<base_ops::copy2>(args.state.acc, args.scratch.bias); // copy bias in to start
             zero(args.state.acc);
         }
@@ -117,10 +117,10 @@ struct flux_matmul_gate_template {
             kittens::coord idx = {blockIdx.x * NUM_CONSUMER_WARPGROUPS + warpgroup::groupid(), blockIdx.y};
             warpgroup::load(args.finish.acc[warpgroup::groupid()], args.globals.y, idx);
             rt_sv_op<base_ops::mul>(args.state.acc, args.scratch.gate); // multiply gate onto acc
-            warpgroup::sync(); // y now arrived
+            warpgroup::sync(6); // y now arrived
             wg_rt_sv_op<base_ops::sum>(args.state.acc, args.finish.acc[warpgroup::groupid()]); // add y onto acc
             warpgroup::store(args.finish.acc[warpgroup::groupid()], args.state.acc); // now that we're done with that, store the result into same slot.
-            warpgroup::sync();
+            warpgroup::sync(6);
             if(warpgroup::warpid() == 0) {
                 tma::store_async(args.globals.acc, args.finish.acc[warpgroup::groupid()], idx);
                 tma::store_async_read_wait();
@@ -341,7 +341,7 @@ int main() {
 #endif
 
 #ifdef TORCH_COMPILE_GATE
-#include "common/pyutils/torch_helpers.cuh"
+#include "pyutils/torch_helpers.cuh"
 #include <iostream>
 
 template<int M_tile, int K_tile, int N_tile, int transpose_lhs, int transpose_rhs>

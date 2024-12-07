@@ -70,7 +70,7 @@ template<int H, int W, int NW> std::string generate_test_name(std::string test_i
 template <typename T> concept integral_wrapper = std::is_integral_v<decltype(T::value)>;
 template<int H, int W, int NW, integral_wrapper _K> std::string generate_test_name(std::string test_id) {
     constexpr int K = _K::value;
-    std::string label = test_id+"_["+std::to_string(H)+"x"+std::to_string(K)+"x"+std::to_string(W)+"]";
+    std::string label = test_id+"_["+std::to_string(H)+"x"+std::to_string(W)+"]x"+std::to_string(K);
     if constexpr (NW > 1) {
         label += "_["+std::to_string(NW)+"warps]";
     }
@@ -94,13 +94,17 @@ template<int H, int W, int NW, kittens::ducks::base_types::T1 T2, kittens::ducks
     std::string label = generate_test_name<H,W,NW>(test_id);
     if constexpr (std::is_same_v<U2, float>) label += "_[float->";
     else if constexpr (std::is_same_v<U2, kittens::bf16>) label += "_[bf16->";
+    #ifdef KITTENS_HOPPER
     else if constexpr (std::is_same_v<U2, kittens::fp8e4m3>) label += "_[e4m3->";
     else if constexpr (std::is_same_v<U2, kittens::fp8e5m2>) label += "_[e5m2->";
+    #endif
     else label += "_[half->";
     if constexpr (std::is_same_v<T2, float>) label += "float]";
     else if constexpr (std::is_same_v<T2, kittens::bf16>) label += "bf16]";
+    #ifdef KITTENS_HOPPER
     else if constexpr (std::is_same_v<T2, kittens::fp8e4m3>) label += "e4m3]";
     else if constexpr (std::is_same_v<T2, kittens::fp8e5m2>) label += "e5m2]";
+    #endif
     else label += "half]";
     return label;
 }

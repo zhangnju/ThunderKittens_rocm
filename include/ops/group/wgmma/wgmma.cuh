@@ -156,7 +156,11 @@ __device__ static inline void mma_AB(D &d,
     // Usings
     using T_AB = A::T;
     using T_D  = D::T;
-    using base = kittens::wgmma::base<T_D, T_AB, TILE_DIM*N, 0, 1>;
+    #ifdef KITTENS_HOPPER
+    static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
+    #endif
+    using base = kittens::wgmma::base<T_D, T_AB, TILE_ROW_DIM<T_AB>*N, 0, 1>;
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 1> b_desc(b); // apologies for this hack -- it either calls ST constructor or copy constructor.
 
     if constexpr (fence) { mma_fence(d); }
@@ -164,7 +168,7 @@ __device__ static inline void mma_AB(D &d,
     // Do it
     #pragma unroll
     for(int m = 0; m < M_DIV_4; m++) {
-        rt<T_D, TILE_DIM, TILE_DIM*N, ducks::rt_layout::row> &d_ref = subtile_inplace<TILE_DIM>(d, m);
+        rt<T_D, TILE_ROW_DIM<T_D>, TILE_COL_DIM<T_D>*N, ducks::rt_layout::row> &d_ref = subtile_inplace<TILE_ROW_DIM<T_AB>>(d, m);
         base::rt_st(
             d_ref,
             a.tiles[m][0],
@@ -207,7 +211,11 @@ __device__ static inline void mma_AB(D &d,
     // Usings
     using T_AB = A::T;
     using T_D  = D::T;
-    using base = kittens::wgmma::base<T_D, T_AB, TILE_DIM*N, 0, 1>;
+    #ifdef KITTENS_HOPPER
+    static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
+    #endif
+    using base = kittens::wgmma::base<T_D, T_AB, TILE_COL_DIM<T_AB>*N, 0, 1>;
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<A>, 0> a_desc(a);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 1> b_desc(b);
 
@@ -269,7 +277,7 @@ __device__ static inline void mma_ABt(D &d,
     // Usings
     using T_AB = A::T;
     using T_D  = D::T;
-    using base = kittens::wgmma::base<T_D, T_AB, TILE_DIM*N, 0, 0>;
+    using base = kittens::wgmma::base<T_D, T_AB, TILE_ROW_DIM<T_AB>*N, 0, 0>;
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 0> b_desc(b);
 
     if constexpr (fence) { mma_fence(d); }
@@ -277,7 +285,7 @@ __device__ static inline void mma_ABt(D &d,
     // Do it
     #pragma unroll
     for(int m = 0; m < M_DIV_4; m++) {
-        rt<T_D, TILE_DIM, TILE_DIM*N, ducks::rt_layout::row> &d_ref = subtile_inplace<TILE_DIM>(d, m);
+        rt<T_D, TILE_ROW_DIM<T_D>, TILE_COL_DIM<T_D>*N, ducks::rt_layout::row> &d_ref = subtile_inplace<TILE_ROW_DIM<T_AB>>(d, m);
         base::rt_st(
             d_ref,
             a.tiles[m][0],
@@ -335,7 +343,7 @@ __device__ static inline void mma_ABt(D &d,
     // Usings
     using T_AB = A::T;
     using T_D  = D::T;
-    using base = kittens::wgmma::base<T_D, T_AB, TILE_DIM*N, 0, 0>;
+    using base = kittens::wgmma::base<T_D, T_AB, TILE_ROW_DIM<T_AB>*N, 0, 0>;
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<A>, 0> a_desc(a);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 0> b_desc(b);
 
@@ -398,7 +406,11 @@ __device__ static inline void mma_AtB(D &d,
     // Usings
     using T_AB = A::T;
     using T_D  = D::T;
-    using base = kittens::wgmma::base<T_D, T_AB, TILE_DIM*N, 1, 1>;
+    #ifdef KITTENS_HOPPER
+    static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
+    #endif
+    using base = kittens::wgmma::base<T_D, T_AB, TILE_COL_DIM<T_AB>*N, 1, 1>;
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<A>, 1> a_desc(a);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 1> b_desc(b);
 
@@ -457,7 +469,11 @@ __device__ static inline void mma_AtBt(D &d,
     // Usings
     using T_AB = A::T;
     using T_D  = D::T;
-    using base = kittens::wgmma::base<T_D, T_AB, TILE_DIM*N, 1, 0>;
+    #ifdef KITTENS_HOPPER
+    static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
+    #endif
+    using base = kittens::wgmma::base<T_D, T_AB, TILE_ROW_DIM<T_AB>*N, 1, 0>;
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<A>, 1> a_desc(a);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 0> b_desc(b);
 
@@ -550,7 +566,11 @@ __device__ static inline void mma_AB(D &d,
     // Usings
     using T_AB = A::T;
     using T_D  = D::T;
-    using base = kittens::wgmma::base<T_D, T_AB, TILE_DIM*N, 0, 1>;
+    #ifdef KITTENS_HOPPER
+    static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
+    #endif
+    using base = kittens::wgmma::base<T_D, T_AB, TILE_ROW_DIM<T_AB>*N, 0, 1>;
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 1> b_desc_real(b.real);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 1> b_desc_imag(b.imag);
 
@@ -559,7 +579,7 @@ __device__ static inline void mma_AB(D &d,
     // Do it
     #pragma unroll // Do real part
     for(int m = 0; m < M_DIV_4; m++) {
-        rt<T_D, TILE_DIM, TILE_DIM*N, ducks::rt_layout::row> &d_ref = subtile_inplace<TILE_DIM>(d.real, m);
+        rt<T_D, TILE_ROW_DIM<T_D>, TILE_COL_DIM<T_D>*N, ducks::rt_layout::row> &d_ref = subtile_inplace<TILE_ROW_DIM<T_AB>>(d.real, m);
         base::rt_st(
             d_ref,
             a.real.tiles[m][0],
@@ -587,7 +607,7 @@ __device__ static inline void mma_AB(D &d,
     }
     #pragma unroll // Do imaginary part
     for(int m = 0; m < M_DIV_4; m++) {
-        rt<T_D, TILE_DIM, TILE_DIM*N, ducks::rt_layout::row> &d_ref = subtile_inplace<TILE_DIM>(d.imag, m);
+        rt<T_D, TILE_ROW_DIM<T_AB>, TILE_COL_DIM<T_AB>*N, ducks::rt_layout::row> &d_ref = subtile_inplace<TILE_ROW_DIM<T_AB>>(d.imag, m);
         base::rt_st(
             d_ref,
             a.real.tiles[m][0],
@@ -639,7 +659,11 @@ __device__ static inline void mma_AB(D &d,
     // Usings
     using T_AB = A::T;
     using T_D  = D::T;
-    using base = kittens::wgmma::base<T_D, T_AB, TILE_DIM*N, 0, 1>;
+    #ifdef KITTENS_HOPPER
+    static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
+    #endif
+    using base = kittens::wgmma::base<T_D, T_AB, TILE_COL_DIM<T_AB>*N, 0, 1>;
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<A>, 0> a_desc_real(a.real);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<A>, 0> a_desc_imag(a.imag);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 1> b_desc_real(b.real);
@@ -736,7 +760,7 @@ __device__ static inline void mma_ABt(D &d,
     // Usings
     using T_AB = A::T;
     using T_D  = D::T;
-    using base = kittens::wgmma::base<T_D, T_AB, TILE_DIM*N, 0, 0>;
+    using base = kittens::wgmma::base<T_D, T_AB, TILE_ROW_DIM<T_AB>*N, 0, 0>;
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 0> b_desc_real(b.real);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 0> b_desc_imag(b.imag);
 
@@ -745,7 +769,7 @@ __device__ static inline void mma_ABt(D &d,
     // Do it
     #pragma unroll
     for(int m = 0; m < M_DIV_4; m++) {
-        rt<T_D, TILE_DIM, TILE_DIM*N, ducks::rt_layout::row> &d_ref = subtile_inplace<TILE_DIM>(d.real, m);
+        rt<T_D, TILE_ROW_DIM<T_D>, TILE_ROW_DIM<T_D>*N, ducks::rt_layout::row> &d_ref = subtile_inplace<TILE_ROW_DIM<T_AB>>(d.real, m);
         base::rt_st(
             d_ref,
             a.real.tiles[m][0],
@@ -773,7 +797,7 @@ __device__ static inline void mma_ABt(D &d,
     }
     #pragma unroll
     for(int m = 0; m < M_DIV_4; m++) {
-        rt<T_D, TILE_DIM, TILE_DIM*N, ducks::rt_layout::row> &d_ref = subtile_inplace<TILE_DIM>(d.imag, m);
+        rt<T_D, TILE_ROW_DIM<T_AB>, TILE_ROW_DIM<T_AB>*N, ducks::rt_layout::row> &d_ref = subtile_inplace<TILE_ROW_DIM<T_AB>>(d.imag, m);
         base::rt_st(
             d_ref,
             a.real.tiles[m][0],
@@ -840,7 +864,7 @@ __device__ static inline void mma_ABt(D &d,
     // Usings
     using T_AB = A::T;
     using T_D  = D::T;
-    using base = kittens::wgmma::base<T_D, T_AB, TILE_DIM*N, 0, 0>;
+    using base = kittens::wgmma::base<T_D, T_AB, TILE_COL_DIM<T_AB>*N, 0, 0>;
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<A>, 0> a_desc_real(a.real);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<A>, 0> a_desc_imag(a.imag);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 0> b_desc_real(b.real);
@@ -938,7 +962,11 @@ __device__ static inline void mma_AtB(D &d,
     // Usings
     using T_AB = A::T;
     using T_D  = D::T;
-    using base = kittens::wgmma::base<T_D, T_AB, TILE_DIM*N, 1, 1>;
+    #ifdef KITTENS_HOPPER
+    static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
+    #endif
+    using base = kittens::wgmma::base<T_D, T_AB, TILE_COL_DIM<T_AB>*N, 1, 1>;
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<A>, 1> a_desc_real(a.real);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<A>, 1> a_desc_imag(a.imag);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 1> b_desc_real(b.real);
@@ -1032,7 +1060,11 @@ __device__ static inline void mma_AtBt(D &d,
     // Usings
     using T_AB = A::T;
     using T_D  = D::T;
-    using base = kittens::wgmma::base<T_D, T_AB, TILE_DIM*N, 1, 0>;
+    #ifdef KITTENS_HOPPER
+    static_assert(!std::is_same_v<T_AB, fp8e4m3> && !std::is_same_v<T_AB, fp8e5m2>, "Currently unsupported type");
+    static_assert(!std::is_same_v<T_D, fp8e4m3> && !std::is_same_v<T_D, fp8e5m2>, "Currently unsupported type");
+    #endif
+    using base = kittens::wgmma::base<T_D, T_AB, TILE_ROW_DIM<T_AB>*N, 1, 0>;
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<A>, 1> a_desc_real(a.real);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<A>, 1> a_desc_imag(a.imag);
     kittens::wgmma::descriptor<ducks::wgmma::detail::get_st<B>, 0> b_desc_real(b.real);

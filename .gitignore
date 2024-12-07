@@ -6,3 +6,9 @@
 *.fatbin
 __pycache__/
 */printouts/*
+
+*.o
+*.so
+build/
+*.egg
+*.egg-info

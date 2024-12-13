@@ -15,12 +15,12 @@ With TK Problems, we should also specify dtypes
 B = 1 
 N = 16
 D = 32
-dtype = torch.float32
+DTYPE = torch.float32
 
 
 def get_inputs():
     # randomly generate input tensors based on the model architecture
-    x = torch.randn(B, N, D, dtype=dtype).cuda()
+    x = torch.randn(B, N, D, dtype=DTYPE).cuda()
     return [x]
 
 def get_init_inputs():
@@ -49,7 +49,7 @@ class ModelNew(nn.Module):
         super().__init__()
 
     def forward(self, x):
-        output = torch.zeros_like(x, dtype=dtype)
+        output = torch.zeros_like(x, dtype=DTYPE)
         simple_tk.dispatch_micro(x, output)
         return output
 

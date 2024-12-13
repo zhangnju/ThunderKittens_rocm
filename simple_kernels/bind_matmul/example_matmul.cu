@@ -51,6 +51,7 @@ void micro_tk(const __grid_constant__ micro_globals g) {
     store(o_s, accum_tile);
     __syncthreads();
 
+    one(o_s);
     // store from shared to HBM
     store(g.o, o_s, {0, 0, 0, 0});
     __syncthreads();

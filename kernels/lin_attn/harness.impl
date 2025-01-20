@@ -6,7 +6,7 @@
 
 #define ATTN_B (1)
 #define ATTN_H (1)
-#define ATTN_N (1024)
+#define ATTN_N (4096)
 
 #define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
 inline void __cudaCheckError( const char *file, const int line ) {
@@ -112,7 +112,7 @@ int main(int argc, char **argv) {
     );
 
     // Run kernel
-    const int ITER = 1;
+    const int ITER = 10;
     cudaDeviceSynchronize();
     CudaCheckError();
     

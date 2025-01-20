@@ -68,7 +68,7 @@ def save_test_case(q, k, v, s, o):
 def main():
     torch.manual_seed(0)
     
-    B, H, N = 1, 1, 1024 
+    B, H, N = 1, 1, 4096 
     
     q, k, v, s = generate_inputs(B, H, N)
 

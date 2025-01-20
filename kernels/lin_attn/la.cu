@@ -33,6 +33,85 @@ struct la_globals {
     float *slopes;
 };
 
+// will run at warpgroup level
+template<ducks::rt::row_layout RT>
+__device__ static inline void custom_mask_wg(RT &dst, const RT &src, float slope) {
+    const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(0.0f);
+    int i = warpid();
+    #pragma unroll
+    for(int j = 0; j < dst.width; j++) {
+        if(j < i) { // below diagonal: apply decay
+            #pragma unroll
+            for(int k = 0; k < dst.packed_per_tile; k++) {
+                auto row   = (i * dst.tile_size_row) + ((k % 2) * 8) + (laneid() / 4);
+                auto col_x = (j * dst.tile_size_col) + ((k / 2) * 8) + (laneid() % 4);
+                auto col_y = col_x + 1;
+
+                float decay_x = __expf(-slope * static_cast<float>(row-col_x));
+                float decay_y = __expf(-slope * static_cast<float>(row-col_y));
+                
+                dst.tiles[i][k].data[k].x = src.tiles[i][k].data[k].x * decay_x;
+                dst.tiles[i][k].data[k].y = src.tiles[i][k].data[k].y * decay_y;
+            }
+        }
+        else if(j > i) { // above the diagonal, zero
+            #pragma unroll
+            for(int k = 0; k < dst.packed_per_tile; k++) {
+                dst.tiles[i][j].data[k] = packed_val;
+            }
+        }
+        else { // on the diagonal, interesting!
+            constexpr uint32_t MASK_X = 0xFF773311, MASK_Y = 0xF7733110; 
+
+            // below diagonal, apply decay
+            auto row   = (i * dst.tile_size_row) + ((1 % 2) * 8) + (laneid() / 4);
+            auto col_x = (j * dst.tile_size_col) + ((1 / 2) * 8) + (laneid() % 4);
+            auto col_y = col_x + 1;
+
+            float decay_x = __expf(-slope * static_cast<float>(row-col_x));
+            float decay_y = __expf(-slope * static_cast<float>(row-col_y));
+            
+            dst.tiles[i][j].data[1].x = src.tiles[i][j].data[1].x * decay_x;
+            dst.tiles[i][j].data[1].y = src.tiles[i][j].data[1].y * decay_y;
+            
+            // above diagonal, zero
+            dst.tiles[i][j].data[2] = packed_val;
+
+            if((MASK_X >> laneid()) & 1) {
+                auto  row     = (i * dst.tile_size_row) + ((0 % 2) * 8) + (laneid() / 4);
+                auto  col_x   = (j * dst.tile_size_col) + ((0 / 2) * 8) + (laneid() % 4);
+                float decay_x = __expf(-slope * static_cast<float>(row-col_x));
+                dst.tiles[i][j].data[0].x = src.tiles[i][j].data[0].x * decay_x;
+
+                row     = (i * dst.tile_size_row) + ((3 % 2) * 8) + (laneid() / 4);
+                col_x   = (j        * dst.tile_size_col) + ((3 / 2) * 8) + (laneid() % 4);
+                decay_x = __expf(-slope * static_cast<float>(row-col_x));
+                dst.tiles[i][j].data[3].x = src.tiles[i][j].data[3].x * decay_x;
+            }
+            else {
+                dst.tiles[i][j].data[0].x = 0.0f;
+                dst.tiles[i][j].data[3].x = 0.0f;
+            }
+            if((MASK_Y >> laneid()) & 1) {
+                auto  row     = (i * dst.tile_size_row) + ((0 % 2) * 8) + (laneid() / 4);    
+                auto  col_y   = (j * dst.tile_size_col) + ((0 / 2) * 8) + (laneid() % 4);
+                float decay_y = __expf(-slope * static_cast<float>(row-col_y));
+                dst.tiles[i][j].data[0].y = src.tiles[i][j].data[0].y * decay_y;
+
+                row     = (i * dst.tile_size_row) + ((3 % 2) * 8) + (laneid() / 4);
+                col_y   = (j * dst.tile_size_col) + ((3 / 2) * 8) + (laneid() % 4);
+                decay_y = __expf(-slope * static_cast<float>(row-col_y));
+                dst.tiles[i][j].data[3].y = src.tiles[i][j].data[3].y * decay_y;
+            }
+            else {
+                dst.tiles[i][j].data[0].y = 0.0f;
+                dst.tiles[i][j].data[3].y = 0.0f;
+            }
+        }
+    }
+    group<4>::sync(10); 
+}
+
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
 void la_kernel (const __grid_constant__ la_globals g, int N)  
@@ -106,6 +185,7 @@ void la_kernel (const __grid_constant__ la_globals g, int N)
             warpgroup::mm_ABt(qk, q_smem[tic], k_smem[tic]);
             warpgroup::mma_async_wait();
 
+            custom_mask_wg(qk, qk, slope);
             copy(qk_bf, qk);
 
             warpgroup::mm_AB(linear_o, qk_bf, v_smem[tic]);

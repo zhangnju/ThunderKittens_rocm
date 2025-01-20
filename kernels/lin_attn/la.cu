@@ -198,7 +198,8 @@ void la_kernel (const __grid_constant__ la_globals g, int N)
         }
 
         if (warpgroupid == 1) {
-            rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D> linear_o;  
+                    rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D>  linear_o;  
+            col_vec<rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D>> q_decay;
 
             static_assert(NUM_WARPGROUPS == 2, "NUM_WARPGROUPS must be 2");
             rt_fl<ATTN_F/(kittens::WARPGROUP_WARPS * NUM_WARPGROUPS), ATTN_D> local_kv_0; 
@@ -217,9 +218,14 @@ void la_kernel (const __grid_constant__ la_globals g, int N)
             if  (block != 0) { tma::store_async_wait(); }
             if (warpid == 0) { tma::store_add_async(g.o, o_smem[warpgroupid], {batch, head, block, 0}); }
 
+            float block_decay = __expf(-slope * static_cast<float>(CHUNK_SIZE));
+
             warpgroup::load(local_kv_0, kv_subtile_0); 
+            mul(local_kv_0, local_kv_0, block_decay);
             warpgroup::mma_AtB(local_kv_0, k_subtile_0, v_smem[tic]);
+            
             warpgroup::load(local_kv_1, kv_subtile_1); 
+            mul(local_kv_1, local_kv_1, block_decay);
             warpgroup::mma_AtB(local_kv_1, k_subtile_1, v_smem[tic]);
             
             warpgroup::mma_async_wait();

@@ -61,7 +61,7 @@ void la_kernel (const __grid_constant__ la_globals g, int N)
 
     int warpid      = kittens::warpid();
     int warpgroupid = warpid/4;
-    int blocks      = N / (q_tile::rows);
+    int blocks      = N / (CHUNK_SIZE);
 
     int tic = 0, toc = 1;
 

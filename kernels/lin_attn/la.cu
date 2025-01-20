@@ -112,6 +112,26 @@ __device__ static inline void custom_mask_wg(RT &dst, const RT &src, float slope
     group<4>::sync(10); 
 }
 
+template<ducks::rv::tile_layout T>
+__device__ static inline void arange_wg(T &vec) {
+    #pragma unroll
+    for(int i = 0; i < vec.length; i++) {
+        float val = static_cast<float>(i) + (warpid() * vec.length); 
+        vec.data[i][0] = base_types::packing<typename T::dtype>::pack(val);
+    }
+    group<4>::sync(10);
+}
+
+template<ducks::rv::tile_layout T>
+__device__ static inline void arange(T &vec) {
+    #pragma unroll
+    for(int i = 0; i < vec.length; i++) {
+        float val = static_cast<float>(i); 
+        vec.data[i][0] = base_types::packing<typename T::dtype>::pack(val);
+    }
+    __syncwarp();
+}
+
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
 void la_kernel (const __grid_constant__ la_globals g, int N)  
@@ -200,6 +220,13 @@ void la_kernel (const __grid_constant__ la_globals g, int N)
         if (warpgroupid == 1) {
                     rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D>  linear_o;  
             col_vec<rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D>> q_decay;
+            row_vec<rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D>> k_decay; 
+
+            arange(k_decay);
+            mul(k_decay, k_decay, -1.0f); 
+            add(k_decay, k_decay, CHUNK_SIZE);
+            mul(k_decay, k_decay, -1.0f * slope);
+            exp(k_decay, k_decay);
 
             static_assert(NUM_WARPGROUPS == 2, "NUM_WARPGROUPS must be 2");
             rt_fl<ATTN_F/(kittens::WARPGROUP_WARPS * NUM_WARPGROUPS), ATTN_D> local_kv_0; 
@@ -210,8 +237,14 @@ void la_kernel (const __grid_constant__ la_globals g, int N)
             auto kv_subtile_0 = subtile_inplace<ATTN_F/2, ATTN_D>(kv_smem, {0, 0});
             auto kv_subtile_1 = subtile_inplace<ATTN_F/2, ATTN_D>(kv_smem, {1, 0});
 
+            arange_wg(q_decay);
+            mul(q_decay, q_decay, -1.0f * slope);
+            exp(q_decay, q_decay);
+
             warpgroup::mm_AB(linear_o, q_smem[tic], kv_smem);
             warpgroup::mma_async_wait();
+
+            mul_row(linear_o, linear_o, q_decay);
 
             warpgroup::store(o_smem[warpgroupid], linear_o);
 
@@ -229,6 +262,8 @@ void la_kernel (const __grid_constant__ la_globals g, int N)
             warpgroup::mma_AtB(local_kv_1, k_subtile_1, v_smem[tic]);
             
             warpgroup::mma_async_wait();
+            mul_col(local_kv_0, local_kv_0, k_decay);
+            mul_col(local_kv_1, local_kv_1, k_decay);
             warpgroup::store(kv_subtile_0, local_kv_0);
             warpgroup::store(kv_subtile_1, local_kv_1);
         }

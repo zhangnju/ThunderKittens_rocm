@@ -4,11 +4,9 @@
 #include <fstream>
 #include <chrono>
 
-#define ATTN_B (2)
-#define ATTN_H (2)
+#define ATTN_B (1)
+#define ATTN_H (1)
 #define ATTN_N (1024)
-#define ATTN_D (128)  // D_QK 
-#define ATTN_F (128)  // D_VO
 
 #define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
 inline void __cudaCheckError( const char *file, const int line ) {
@@ -29,17 +27,15 @@ inline void __cudaCheckError( const char *file, const int line ) {
 int main(int argc, char **argv) {
     std::cout << "Entered main!" << std::endl;
 
-    // Calculate total elements needed
-    constexpr int TOTAL_ELEMENTS_QK = ATTN_B*ATTN_H*ATTN_N*ATTN_D;  // For Q and K
-    constexpr int TOTAL_ELEMENTS_VO = ATTN_B*ATTN_H*ATTN_N*ATTN_F;  // For V and O
+    constexpr int TOTAL_ELEMENTS_QK = ATTN_B*ATTN_H*ATTN_N*ATTN_D;
+    constexpr int TOTAL_ELEMENTS_VO = ATTN_B*ATTN_H*ATTN_N*ATTN_F;
     
-    // Allocate host memory
-    float *slopes       = new float[ATTN_H];
+    float *slopes      = new float[ATTN_H];
     float *q           = new float[TOTAL_ELEMENTS_QK];
     float *k           = new float[TOTAL_ELEMENTS_QK];
     float *v           = new float[TOTAL_ELEMENTS_VO];
     float *o_ref       = new float[TOTAL_ELEMENTS_VO];
-    float *o           = new float[TOTAL_ELEMENTS_VO];  // For kernel output
+    float *o           = new float[TOTAL_ELEMENTS_VO];
     
     bf16 *q_bf        = new bf16[TOTAL_ELEMENTS_QK];
     bf16 *k_bf        = new bf16[TOTAL_ELEMENTS_QK];
@@ -83,21 +79,19 @@ int main(int argc, char **argv) {
         v_bf[i] = __float2bfloat16(v[i]);
     }
 
-    // Allocate device memory
     bf16 *d_q, *d_k, *d_v, *d_o;
     float *d_slopes;
     
-    cudaMalloc(&d_slopes,   ATTN_H * sizeof(float));
+    cudaMalloc(&d_slopes,   ATTN_H            * sizeof(float));
     cudaMalloc(&d_q,        TOTAL_ELEMENTS_QK * sizeof(bf16));
     cudaMalloc(&d_k,        TOTAL_ELEMENTS_QK * sizeof(bf16));
     cudaMalloc(&d_v,        TOTAL_ELEMENTS_VO * sizeof(bf16));
     cudaMalloc(&d_o,        TOTAL_ELEMENTS_VO * sizeof(bf16));
 
-    // Copy data to device
-    cudaMemcpy(d_slopes, slopes,   ATTN_H * sizeof(float),           cudaMemcpyHostToDevice);
-    cudaMemcpy(d_q,      q_bf,     TOTAL_ELEMENTS_QK * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k,      k_bf,     TOTAL_ELEMENTS_QK * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v,      v_bf,     TOTAL_ELEMENTS_VO * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_slopes, slopes,   ATTN_H            * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_q,      q_bf,     TOTAL_ELEMENTS_QK * sizeof(bf16),  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k,      k_bf,     TOTAL_ELEMENTS_QK * sizeof(bf16),  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v,      v_bf,     TOTAL_ELEMENTS_VO * sizeof(bf16),  cudaMemcpyHostToDevice);
     cudaDeviceSynchronize();
     CudaCheckError();
 
@@ -135,9 +129,6 @@ int main(int argc, char **argv) {
     // Performance metrics
     double avg_us = std::chrono::duration_cast<std::chrono::microseconds>(finish - start).count() / ITER;
     std::cout << "Average execution time: " << avg_us << " us" << std::endl;
-    uint64_t flops = calculate_flops(ATTN_B, ATTN_H, ATTN_N);
-    std::cout << "Operations executed: " << flops << std::endl;
-    std::cout << "Achieved FLOPS: " << double(flops) / avg_us / 1e6 << " TFLOPS" << std::endl;
 
     // Copy results back and compare
     cudaMemcpy(o_bf, d_o, TOTAL_ELEMENTS_VO * sizeof(bf16), cudaMemcpyDeviceToHost);

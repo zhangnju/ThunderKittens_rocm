@@ -44,7 +44,7 @@ def linear_attn(q, k, v, s):
 
 def save_test_case(q, k, v, s, o):
     
-    with open('randn.txt', 'w') as f:
+    with open('randn.txt', 'w') as f:    
         sf = s.to(torch.float32).flatten().cpu().numpy().tolist()
         qf = q.to(torch.float32).flatten().cpu().numpy().tolist()
         kf = k.to(torch.float32).flatten().cpu().numpy().tolist()
@@ -72,7 +72,7 @@ def save_test_case(q, k, v, s, o):
             f.write(' ')
 
 def main():
-    B, H, N = 2, 2, 1024 
+    B, H, N = 1, 1, 1024 
     q, k, v, s = generate_inputs(B, H, N)
     o = linear_attn(q, k, v, s)
     save_test_case(q, k, v, s, o)

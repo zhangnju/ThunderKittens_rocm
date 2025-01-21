@@ -101,7 +101,7 @@ def _fwd_kernel(
         # compute
         qk = tl.dot(q, k_trans)
         o_intra = tl.dot(qk, v)
-        o_inter = tl.dot(q, kv)
+        o_inter = tl.dot(q, kv) * q_decay
         o = o_intra + o_inter
 
         # save and update
@@ -110,8 +110,7 @@ def _fwd_kernel(
             o.to(O_block_ptr.dtype.element_ty),
             mask=off_block[:, None] < n,
         )
-        # kv = kv + tl.dot(k_trans, v)
-        kv = kv + tl.full([d, BLOCK_MODEL], 1.0, dtype=tl.float32)
+        kv = block_decay * kv + tl.dot(k_trans * k_trans_decay, v)
         off_block += BLOCK
 
 

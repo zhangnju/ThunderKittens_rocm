@@ -52,10 +52,39 @@ def _fwd_kernel(
     s_index = s * index
     s_index = tl.where(index >= 0, -s_index, float("-inf"))
     diag_decay = tl.exp(s_index)
+    
     kv = tl.zeros([d, BLOCK_MODEL], dtype=tl.float32)
 
     ##### compute
     for i in range(NUM_BLOCK):
+        # # load
+        # q = tl.load(
+        #     Q_block_ptr + off_block[:, None] * d, mask=off_block[:, None] < n, other=0.0
+        # ).to(tl.float32)
+        # k_trans = tl.load(
+        #     K_trans_block_ptr + off_block[None, :] * d,
+        #     mask=off_block[None, :] < n,
+        #     other=0.0,
+        # ).to(tl.float32)
+        # v = tl.load(
+        #     V_block_ptr + off_block[:, None] * e, mask=off_block[:, None] < n, other=0.0
+        # ).to(tl.float32)
+
+        # # compute
+        # qk = tl.dot(q, k_trans) * diag_decay
+        # o_intra = tl.dot(qk, v)
+        # o_inter = tl.dot(q, kv) * q_decay
+        # o = o_intra + o_inter
+
+        # # save and update
+        # tl.store(
+        #     O_block_ptr + off_block[:, None] * e,
+        #     o.to(O_block_ptr.dtype.element_ty),
+        #     mask=off_block[:, None] < n,
+        # )
+        # kv = block_decay * kv + tl.dot(k_trans * k_trans_decay, v)
+        # off_block += BLOCK
+        
         # load
         q = tl.load(
             Q_block_ptr + off_block[:, None] * d, mask=off_block[:, None] < n, other=0.0
@@ -70,9 +99,9 @@ def _fwd_kernel(
         ).to(tl.float32)
 
         # compute
-        qk = tl.dot(q, k_trans) * diag_decay
+        qk = tl.dot(q, k_trans)
         o_intra = tl.dot(qk, v)
-        o_inter = tl.dot(q, kv) * q_decay
+        o_inter = tl.dot(q, kv)
         o = o_intra + o_inter
 
         # save and update
@@ -81,7 +110,8 @@ def _fwd_kernel(
             o.to(O_block_ptr.dtype.element_ty),
             mask=off_block[:, None] < n,
         )
-        kv = block_decay * kv + tl.dot(k_trans * k_trans_decay, v)
+        # kv = kv + tl.dot(k_trans, v)
+        kv = kv + tl.full([d, BLOCK_MODEL], 1.0, dtype=tl.float32)
         off_block += BLOCK
 
 

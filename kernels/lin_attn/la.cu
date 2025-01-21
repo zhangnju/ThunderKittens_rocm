@@ -37,7 +37,7 @@ struct la_globals {
 template<ducks::rt::row_layout RT>
 __device__ static inline void custom_mask_wg(RT &dst, const RT &src, float slope) {
     const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(0.0f);
-    int i = warpid();
+    int i = warpid() % (kittens::WARPGROUP_WARPS);
     #pragma unroll
     for(int j = 0; j < dst.width; j++) {
         if(j < i) { // below diagonal: apply decay
@@ -112,25 +112,34 @@ __device__ static inline void custom_mask_wg(RT &dst, const RT &src, float slope
     group<4>::sync(10); 
 }
 
-template<ducks::rv::tile_layout T>
-__device__ static inline void arange_wg(T &vec) {
+__device__ static inline void wg_arange(auto &vec) {
     #pragma unroll
     for(int i = 0; i < vec.length; i++) {
-        float val = static_cast<float>(i) + (warpid() * vec.length); 
-        vec.data[i][0] = base_types::packing<typename T::dtype>::pack(val);
+        float val = static_cast<float>(i) + ((warpid() % kittens::WARPGROUP_WARPS) * vec.length); 
+        vec.data[i] = val; 
     }
-    group<4>::sync(10);
+    group<4>::sync(5); 
 }
 
-template<ducks::rv::tile_layout T>
-__device__ static inline void arange(T &vec) {
-    #pragma unroll
-    for(int i = 0; i < vec.length; i++) {
-        float val = static_cast<float>(i); 
-        vec.data[i][0] = base_types::packing<typename T::dtype>::pack(val);
-    }
-    __syncwarp();
-}
+// template<ducks::rv::tile_layout T>
+// __device__ static inline void arange_wg(T &vec) {
+//     #pragma unroll
+//     for(int i = 0; i < vec.length; i++) {
+//         float val = static_cast<float>(i) + (warpid() * vec.length); 
+//         vec.data[i][0] = base_types::packing<typename T::dtype>::pack(val);
+//     }
+//     group<4>::sync(10);
+// }
+
+// template<ducks::rv::tile_layout T>
+// __device__ static inline void arange(T &vec) {
+//     #pragma unroll
+//     for(int i = 0; i < vec.length; i++) {
+//         float val = static_cast<float>(i); 
+//         vec.data[i][0] = base_types::packing<typename T::dtype>::pack(val);
+//     }
+//     __syncwarp();
+// }
 
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
@@ -145,18 +154,22 @@ void la_kernel (const __grid_constant__ la_globals g, int N)
     float slope = g.slopes[head];
 
     // smem
-    using q_tile        = st_bf<CHUNK_SIZE, ATTN_F>;
-    using k_tile        = st_bf<CHUNK_SIZE, ATTN_F>;
-    using v_tile        = st_bf<CHUNK_SIZE, ATTN_D>;
-    using o_tile        = st_bf<CHUNK_SIZE, ATTN_D>;
-    using kv_state_tile = st_bf<ATTN_F,     ATTN_D>;
+    using q_tile              = st_bf<CHUNK_SIZE, ATTN_F>;
+    using k_tile              = st_bf<CHUNK_SIZE, ATTN_F>;
+    using v_tile              = st_bf<CHUNK_SIZE, ATTN_D>;
+    using o_tile              = st_bf<CHUNK_SIZE, ATTN_D>;
+    using kv_state_tile       = st_bf<ATTN_F,     ATTN_D>;
+    using kv_state_split_tile = st_bf<ATTN_F/2,   ATTN_D>;
 
-    q_tile (&q_smem)[2] = al.allocate<q_tile, 2>();
-    k_tile (&k_smem)[2] = al.allocate<k_tile, 2>();
-    v_tile (&v_smem)[2] = al.allocate<v_tile, 2>();
+    q_tile (&q_smem)[2]                 = al.allocate<q_tile, 2>();                 // 64 x 128 x 2 x 2 = 32k
+    k_tile (&k_smem)[2][NUM_WARPGROUPS] = al.allocate<k_tile, 2, NUM_WARPGROUPS>(); // 64 x 128 x 2 x 2 x 2 = 64k
+    v_tile (&v_smem)[2]                 = al.allocate<v_tile, 2>();                 // 64 x 128 x 2 x 2 = 32k
 
-    kv_state_tile (&kv_smem)                 = al.allocate<kv_state_tile>();
-    o_tile         (&o_smem)[NUM_WARPGROUPS] = al.allocate<o_tile, NUM_WARPGROUPS>();
+    kv_state_tile (&kv_smem)                 = al.allocate<kv_state_tile>(); // 128 x 128 x 2 = 32k
+    o_tile         (&o_smem)[NUM_WARPGROUPS] = al.allocate<o_tile, NUM_WARPGROUPS>(); // 64 x 128 x 2 x 2 = 32k
+
+    // col_vec<st_fl<CHUNK_SIZE, ATTN_D>> (&q_decay) = al.allocate<col_vec<st_fl<CHUNK_SIZE, ATTN_D>>>();
+    // col_vec<st_fl<CHUNK_SIZE, ATTN_D>> (&k_decay) = al.allocate<col_vec<st_fl<CHUNK_SIZE, ATTN_D>>>();
 
     int warpid      = kittens::warpid();
     int warpgroupid = warpid/4;
@@ -169,13 +182,28 @@ void la_kernel (const __grid_constant__ la_globals g, int N)
         init_semaphore(qkv_semaphore, 0, 1);
         tma::expect_bytes(qkv_semaphore, 
             size_bytes<typeof(q_smem[0])> + 
-            size_bytes<typeof(k_smem[0])> + 
+            size_bytes<typeof(k_smem[0][0])> + 
+            size_bytes<typeof(k_smem[0][1])> + 
             size_bytes<typeof(v_smem[0])>);
         
-        tma::load_async(q_smem[tic], g.q, {batch, head, 0, 0}, qkv_semaphore);
-        tma::load_async(k_smem[tic], g.k, {batch, head, 0, 0}, qkv_semaphore);
-        tma::load_async(v_smem[tic], g.v, {batch, head, 0, 0}, qkv_semaphore);
+        tma::load_async(q_smem[tic],    g.q, {batch, head, 0, 0}, qkv_semaphore);
+        tma::load_async(k_smem[tic][0], g.k, {batch, head, 0, 0}, qkv_semaphore);
+        tma::load_async(k_smem[tic][1], g.k, {batch, head, 0, 0}, qkv_semaphore);
+        tma::load_async(v_smem[tic],    g.v, {batch, head, 0, 0}, qkv_semaphore);
     }
+
+    // if (warpgroupid == 0) {
+    //     wg_arange(q_decay);
+    //     warpgroup::mul(q_decay, q_decay, -1.0f * slope);
+    //     warpgroup::exp(q_decay, q_decay);
+    // }
+    // if (warpgroupid == 1) {
+    //     wg_arange(k_decay);
+    //     warpgroup::mul(k_decay, k_decay, -1.0f); 
+    //     warpgroup::add(k_decay, k_decay, CHUNK_SIZE);
+    //     warpgroup::mul(k_decay, k_decay, -1.0f * slope);
+    //     warpgroup::exp(k_decay, k_decay);
+    // }
 
     zero(kv_smem);
 
@@ -187,12 +215,14 @@ void la_kernel (const __grid_constant__ la_globals g, int N)
         if (warpid == 0 && block < blocks-1) {
             tma::expect_bytes(qkv_semaphore,
                 size_bytes<typeof(q_smem[0])> + 
-                size_bytes<typeof(k_smem[0])> + 
+                size_bytes<typeof(k_smem[0][0])> + 
+                size_bytes<typeof(k_smem[0][1])> + 
                 size_bytes<typeof(v_smem[0])>
             );
-            tma::load_async(q_smem[toc], g.q, {batch, head, block+1, 0}, qkv_semaphore); 
-            tma::load_async(k_smem[toc], g.k, {batch, head, block+1, 0}, qkv_semaphore); 
-            tma::load_async(v_smem[toc], g.v, {batch, head, block+1, 0}, qkv_semaphore);
+            tma::load_async(q_smem[toc],    g.q, {batch, head, block+1, 0}, qkv_semaphore); 
+            tma::load_async(k_smem[toc][0], g.k, {batch, head, block+1, 0}, qkv_semaphore); 
+            tma::load_async(k_smem[toc][1], g.k, {batch, head, block+1, 0}, qkv_semaphore); 
+            tma::load_async(v_smem[toc],    g.v, {batch, head, block+1, 0}, qkv_semaphore);
         }
         __syncthreads();
 
@@ -202,10 +232,10 @@ void la_kernel (const __grid_constant__ la_globals g, int N)
             rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, CHUNK_SIZE> qk; 
             rt_bf<CHUNK_SIZE/kittens::WARPGROUP_WARPS, CHUNK_SIZE> qk_bf;
 
-            warpgroup::mm_ABt(qk, q_smem[tic], k_smem[tic]);
+            warpgroup::mm_ABt(qk, q_smem[tic], k_smem[tic][warpgroupid]);
             warpgroup::mma_async_wait();
 
-            custom_mask_wg(qk, qk, slope);
+            // custom_mask_wg(qk, qk, slope);
             copy(qk_bf, qk);
 
             warpgroup::mm_AB(linear_o, qk_bf, v_smem[tic]);
@@ -213,59 +243,74 @@ void la_kernel (const __grid_constant__ la_globals g, int N)
 
             warpgroup::store(o_smem[warpgroupid], linear_o);
 
-            if  (block != 0) { tma::store_async_wait(); }
-            if (warpid == 0) { tma::store_add_async(g.o, o_smem[warpgroupid], {batch, head, block, 0}); }
+            // if  (block != 0) { tma::store_async_wait(); }
+            if (warpid == 0) { 
+                tma::store_add_async(g.o, o_smem[warpgroupid], {batch, head, block, 0}); 
+                tma::store_async_wait();
+            }
         }
 
         if (warpgroupid == 1) {
-                    rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D>  linear_o;  
-            col_vec<rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D>> q_decay;
-            row_vec<rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D>> k_decay; 
-
-            arange(k_decay);
-            mul(k_decay, k_decay, -1.0f); 
-            add(k_decay, k_decay, CHUNK_SIZE);
-            mul(k_decay, k_decay, -1.0f * slope);
-            exp(k_decay, k_decay);
+            rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D> linear_o;  
 
             static_assert(NUM_WARPGROUPS == 2, "NUM_WARPGROUPS must be 2");
             rt_fl<ATTN_F/(kittens::WARPGROUP_WARPS * NUM_WARPGROUPS), ATTN_D> local_kv_0; 
             rt_fl<ATTN_F/(kittens::WARPGROUP_WARPS * NUM_WARPGROUPS), ATTN_D> local_kv_1;
 
-            auto k_subtile_0  = subtile_inplace<CHUNK_SIZE, ATTN_F/2>(k_smem[tic], {0, 0});
-            auto k_subtile_1  = subtile_inplace<CHUNK_SIZE, ATTN_F/2>(k_smem[tic], {0, 1});
+            rt_bf<ATTN_F/(kittens::WARPGROUP_WARPS * NUM_WARPGROUPS), ATTN_D> local_kv_0_bf; 
+            rt_bf<ATTN_F/(kittens::WARPGROUP_WARPS * NUM_WARPGROUPS), ATTN_D> local_kv_1_bf;
+
+            auto k_subtile_0  = subtile_inplace<CHUNK_SIZE, ATTN_F/2>(k_smem[tic][warpgroupid], {0, 0});
+            auto k_subtile_1  = subtile_inplace<CHUNK_SIZE, ATTN_F/2>(k_smem[tic][warpgroupid], {0, 1});
             auto kv_subtile_0 = subtile_inplace<ATTN_F/2, ATTN_D>(kv_smem, {0, 0});
             auto kv_subtile_1 = subtile_inplace<ATTN_F/2, ATTN_D>(kv_smem, {1, 0});
 
-            arange_wg(q_decay);
-            mul(q_decay, q_decay, -1.0f * slope);
-            exp(q_decay, q_decay);
-
             warpgroup::mm_AB(linear_o, q_smem[tic], kv_smem);
+            // warpgroup::mul_row(k_smem[tic][warpgroupid], k_smem[tic][warpgroupid], k_decay);
             warpgroup::mma_async_wait();
-
-            mul_row(linear_o, linear_o, q_decay);
 
             warpgroup::store(o_smem[warpgroupid], linear_o);
+            // warpgroup::mul_row(o_smem[warpgroupid], o_smem[warpgroupid], q_decay);
 
-            if  (block != 0) { tma::store_async_wait(); }
-            if (warpid == 0) { tma::store_add_async(g.o, o_smem[warpgroupid], {batch, head, block, 0}); }
+            // if  (block != 0) { tma::store_async_wait(); }
+            // if (warpid == 0) { tma::store_add_async(g.o, o_smem[warpgroupid], {batch, head, block, 0}); }
+            if (warpid == 4) {
+                tma::store_add_async(g.o, o_smem[warpgroupid], {batch, head, block, 0}); 
+                tma::store_async_wait();
+            }
 
-            float block_decay = __expf(-slope * static_cast<float>(CHUNK_SIZE));
+            // float block_decay = __expf(-slope * static_cast<float>(CHUNK_SIZE));
 
-            warpgroup::load(local_kv_0, kv_subtile_0); 
-            mul(local_kv_0, local_kv_0, block_decay);
-            warpgroup::mma_AtB(local_kv_0, k_subtile_0, v_smem[tic]);
+            warpgroup::load(local_kv_0_bf, kv_subtile_0); 
+            copy(local_kv_0, local_kv_0_bf);
+   
+            // warpgroup::mma_AtB(local_kv_0, k_subtile_0, v_smem[tic]);
             
-            warpgroup::load(local_kv_1, kv_subtile_1); 
-            mul(local_kv_1, local_kv_1, block_decay);
-            warpgroup::mma_AtB(local_kv_1, k_subtile_1, v_smem[tic]);
+            warpgroup::load(local_kv_1_bf, kv_subtile_1); 
+            copy(local_kv_1, local_kv_1_bf);
+          
+            // warpgroup::mma_AtB(local_kv_1, k_subtile_1, v_smem[tic]);
+        
+            // warpgroup::mma_async_wait();
             
-            warpgroup::mma_async_wait();
-            mul_col(local_kv_0, local_kv_0, k_decay);
-            mul_col(local_kv_1, local_kv_1, k_decay);
-            warpgroup::store(kv_subtile_0, local_kv_0);
-            warpgroup::store(kv_subtile_1, local_kv_1);
+            add(local_kv_0, local_kv_0, 1.0f);
+            add(local_kv_1, local_kv_1, 1.0f);
+
+            copy(local_kv_0_bf, local_kv_0);
+            copy(local_kv_1_bf, local_kv_1);
+            warpgroup::store(kv_subtile_0, local_kv_0_bf);
+            warpgroup::store(kv_subtile_1, local_kv_1_bf);
+
+            // if (threadIdx.x == (32 * 4)) {
+            //     // print out kv_smem
+            //     for (int r = 0; r < ATTN_F/2; r++) {
+            //         for (int c = 0; c < ATTN_D; c++) {
+            //             printf("%f ", __bfloat162float(kv_smem.data[r * ATTN_D + c]));
+            //         }
+            //         printf("\n");
+            //     }
+            //     printf("\n");
+            // }
         }
     }
 

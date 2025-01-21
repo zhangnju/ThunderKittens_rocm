@@ -85,7 +85,8 @@ def main():
     print(f"Max difference between PyTorch and Triton: {max_diff}")
     print(f"Average difference between PyTorch and Triton: {avg_diff}")
     
-    save_test_case(q, k, v, s, pytorch_out)
+    save_test_case(q, k, v, s, triton_out)
+    #### RUNNING TRITON ####
     print("Generated random test case")
 
 if __name__ == "__main__":

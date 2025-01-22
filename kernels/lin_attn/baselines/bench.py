@@ -47,11 +47,11 @@ def benchmark_attention(configurations):
 
 if __name__ == "__main__":
     configurations = [
-        (1, 1, 1024,  128),
-        (1, 1, 2048,  128),
-        (1, 1, 4096,  128),
-        (1, 1, 8192,  128),
-        (1, 1, 16384, 128)
+        (1, 8, 1024,  128),
+        (1, 8, 2048,  128),
+        (1, 8, 4096,  128),
+        (1, 8, 8192,  128),
+        (1, 8, 16384, 128)
     ]
 
     print("Linear Attention Benchmark")

@@ -201,7 +201,7 @@ int main(int argc, char **argv) {
         mem_size
     );
 
-    const int ITER = 1;
+    const int ITER = 10; 
     cudaDeviceSynchronize();
     CudaCheckError();
     std::cout << "Starting kernel with " << ATTN_B*ATTN_H << " blocks and " << NUM_THREADS << " threads\n";

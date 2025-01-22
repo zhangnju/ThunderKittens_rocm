@@ -5,8 +5,8 @@
 #include <chrono>
 
 #define ATTN_B (1)
-#define ATTN_H (1)
-#define ATTN_N (4096)
+#define ATTN_H (8)
+#define ATTN_N (1024)
 
 #define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
 inline void __cudaCheckError( const char *file, const int line ) {

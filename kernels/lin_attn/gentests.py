@@ -37,8 +37,9 @@ def linear_attn(q, k, v, s):
     o = torch.matmul(qk, v)
     return o
 
-def save_test_case(q, k, v, s, o):
-    with open('randn.txt', 'w') as f:    
+def save_test_case(q, k, v, s, o, n):
+    filename = f'randn_{n}.txt'
+    with open(filename, 'w') as f:    
         sf = s.to(torch.float32).flatten().cpu().numpy().tolist()
         qf = q.to(torch.float32).flatten().cpu().numpy().tolist()
         kf = k.to(torch.float32).flatten().cpu().numpy().tolist()
@@ -68,26 +69,28 @@ def save_test_case(q, k, v, s, o):
 def main():
     torch.manual_seed(0)
     
-    B, H, N = 1, 1, 4096 
+    B, H = 1, 8
+    sequence_lengths = [1024]
     
-    q, k, v, s = generate_inputs(B, H, N)
+    for N in sequence_lengths:
+        print(f"\nGenerating test case for sequence length {N}")
+        q, k, v, s = generate_inputs(B, H, N)
 
-    pytorch_out = linear_attn(q, k, v, s)
-    triton_out = lightning_attn2(q, k, v, s)
-    
-    avg_mag_pytorch = torch.mean(torch.abs(pytorch_out)).item()
-    avg_mag_triton = torch.mean(torch.abs(triton_out)).item()
-    max_diff = torch.max(torch.abs(pytorch_out - triton_out)).item()
-    avg_diff = torch.mean(torch.abs(pytorch_out - triton_out)).item()
-    
-    print(f"PyTorch output magnitude: {avg_mag_pytorch}")
-    print(f"Triton output magnitude: {avg_mag_triton}")
-    print(f"Max difference between PyTorch and Triton: {max_diff}")
-    print(f"Average difference between PyTorch and Triton: {avg_diff}")
-    
-    save_test_case(q, k, v, s, triton_out)
-    #### RUNNING TRITON ####
-    print("Generated random test case")
+        pytorch_out = linear_attn(q, k, v, s)
+        triton_out = lightning_attn2(q, k, v, s)
+        
+        avg_mag_pytorch = torch.mean(torch.abs(pytorch_out)).item()
+        avg_mag_triton = torch.mean(torch.abs(triton_out)).item()
+        max_diff = torch.max(torch.abs(pytorch_out - triton_out)).item()
+        avg_diff = torch.mean(torch.abs(pytorch_out - triton_out)).item()
+        
+        print(f"PyTorch output magnitude: {avg_mag_pytorch}")
+        print(f"Triton  output magnitude: {avg_mag_triton}")
+        print(f"Max     difference between PyTorch and Triton: {max_diff}")
+        print(f"Average difference between PyTorch and Triton: {avg_diff}")
+        
+        save_test_case(q, k, v, s, triton_out, N)
+        print(f"Generated random test case for N={N}")
 
 if __name__ == "__main__":
     main()

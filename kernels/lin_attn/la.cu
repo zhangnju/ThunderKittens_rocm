@@ -55,7 +55,6 @@ __device__ static inline void wg_mask(RT &dst, const RT &src, float slope) {
 
                 dst.tiles[i][j].data[k].x = src.tiles[i][j].data[k].x * decay_x;
                 dst.tiles[i][j].data[k].y = src.tiles[i][j].data[k].y * decay_y;
-                // dst.tiles[i][j].data[k] = src.tiles[i][j].data[k];
             }
         }
         else if(j > i) { // above the diagonal, zero
@@ -76,7 +75,6 @@ __device__ static inline void wg_mask(RT &dst, const RT &src, float slope) {
 
             dst.tiles[i][j].data[1].x = src.tiles[i][j].data[1].x * decay_x;
             dst.tiles[i][j].data[1].y = src.tiles[i][j].data[1].y * decay_y;
-            // dst.tiles[i][j].data[1] = src.tiles[i][j].data[1]; // below diagonal, copy
 
             dst.tiles[i][j].data[2] = packed_val; // above diagonal, zero
             

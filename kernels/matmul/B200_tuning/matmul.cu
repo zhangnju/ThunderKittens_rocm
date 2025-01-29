@@ -1,5 +1,6 @@
 #include "kittens.cuh"
 #include "prototype.cuh"
+#include "static_switch.h"
 #include <iostream>
 
 constexpr int NUM_CONSUMERS = (2); 
@@ -7,21 +8,18 @@ constexpr int NUM_PRODUCERS = (1);
 
 using namespace kittens;
 
-struct matmul_config {
-    static constexpr int Mb = 128;
-    static constexpr int Nb = 256;
-    static constexpr int Kb = 128;
+template<int Mb, int Nb, int Kb>
+struct matmul_config_t {
+    static constexpr int Mb_ = Mb;
+    static constexpr int Nb_ = Nb;
+    static constexpr int Kb_ = Kb;
 };
 
-template <typename Config = matmul_config>
+template <typename Config, int SUPER_M=8>
 struct matmul_globals {
-    static constexpr int Mb = Config::Mb;
-    static constexpr int Nb = Config::Nb;
-    static constexpr int Kb = Config::Kb;
-
-    using a_tile = st_fl8_e4m3<Mb,   Kb>;
-    using b_tile = st_fl8_e4m3<Nb/2, Kb>;
-    using d_tile = st_hf<Mb, 64>;
+    using a_tile = st_fl8_e4m3<Config::Mb_, Config::Kb_>;
+    using b_tile = st_fl8_e4m3<Config::Nb_/2, Config::Kb_>;
+    using d_tile = st_hf<Config::Mb_, 64>;
 
     using a_gl = gl<fp8e4m3, 1, 1, -1, -1, a_tile>;
     using b_gl = gl<fp8e4m3, 1, 1, -1, -1, b_tile>;
@@ -35,13 +33,14 @@ struct matmul_globals {
 constexpr int NUM_WORKERS = (NUM_CONSUMERS + NUM_PRODUCERS) * 4;
 constexpr int NUM_THREADS = NUM_WORKERS * kittens::WARP_THREADS;
 
-template <typename Config = matmul_config>
+template <typename Config>
 __device__ static inline int get_iters_per_task(const matmul_globals<Config> &g) {
-    return g.a.cols / Config::Kb;
+    return g.a.cols / Config::Kb_;
 }
 
-template<int SUPER_M=8, typename Config = matmul_config> __device__ static inline int2 get_task_idx(const matmul_globals<Config> &g, int task_iter, bool is_consumer) {
-    constexpr int CLUSTER_M = 4*Config::Mb, CLUSTER_N = Config::Nb;
+template<typename Config, int SUPER_M=8>
+__device__ static inline int2 get_task_idx(const matmul_globals<Config> &g, int task_iter, bool is_consumer) {
+    constexpr int CLUSTER_M = 4*Config::Mb_, CLUSTER_N = Config::Nb_;
     int cluster_x = clusterIdx().x, ctarank = cluster_ctarank();
     int task_id = task_iter * (gridDim.x/2) + cluster_x;
     int Rblocks = g.d.rows / CLUSTER_M, Cblocks = g.d.cols / CLUSTER_N;
@@ -66,7 +65,7 @@ template<int SUPER_M=8, typename Config = matmul_config> __device__ static inlin
     }
 }
 
-template <typename Config = matmul_config>
+template <typename Config>
 __global__ __cluster_dims__(2) __launch_bounds__(NUM_THREADS, 1)
 void matmul(const __grid_constant__ matmul_globals<Config> g) {
 
@@ -87,7 +86,7 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
 
     tma::cluster::sync();
     auto all_tmem = allocate_tmem<1, 2>();
-    using d_tmem_t = tmem<float, Config::Mb, Config::Nb>;
+    using d_tmem_t = tmem<float, Config::Mb_, Config::Nb_>;
 
     __shared__ kittens::semaphore inputs_arrived[PIPE_DEPTH], inputs_finished[PIPE_DEPTH], outputs_arrived, outputs_finished[NUM_CONSUMERS];
     uint32_t bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
@@ -111,7 +110,7 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
         if(warpgroup::warpid() == 3) {
             int input_ring = 0; // tracking which input block is being loaded
             for(int task_iter = 0; true; task_iter++) {
-                int2 rowcol = get_task_idx(g, task_iter, false);
+                int2 rowcol = get_task_idx<Config>(g, task_iter, false);
                 if(rowcol.x == -1) {
                     for(int idx = 0; idx < (PIPE_DEPTH); idx++) {
                         tma::cluster::wait(inputs_finished[input_ring], prototype::get_phasebit<1>(bitfield, input_ring));
@@ -133,10 +132,10 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
             }
         }
         else if(ctarank == 0 && (warpgroup::warpid() == 0 || warpgroup::warpid() == 1)) { // launch the MMA's
-            d_tmem_t d_tmem = all_tmem.subtile<d_tmem_t>(0, warpgroup::warpid()*Config::Nb);
+            d_tmem_t d_tmem = all_tmem.subtile<d_tmem_t>(0, warpgroup::warpid()*Config::Nb_);
             int input_ring = 0; // tracking which input block is being loaded
             for(int task_iter = 0; true; task_iter++) {
-                int2 rowcol = get_task_idx(g, task_iter, false);
+                int2 rowcol = get_task_idx<Config>(g, task_iter, false);
                 if(rowcol.x == -1) return;
                 tma::cluster::wait(outputs_finished[warpgroup::warpid()], (task_iter+1)%2); // make sure tensor memory is ready to be written to.
                 tma::cluster::wait(inputs_arrived[input_ring], prototype::get_phasebit<0>(bitfield, input_ring));
@@ -154,15 +153,15 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
     }
     else {
         warpgroup::increase_registers<224>();
-        d_tmem_t d_tmem = all_tmem.subtile<d_tmem_t>(0, warpgroupid*Config::Nb);
+        d_tmem_t d_tmem = all_tmem.subtile<d_tmem_t>(0, warpgroupid*Config::Nb_);
         for(int task_iter = 0; true; task_iter++) {
-            int2 rowcol = get_task_idx(g, task_iter, true);
+            int2 rowcol = get_task_idx<Config>(g, task_iter, true);
             if(rowcol.x == -1) return;
             kittens::wait(outputs_arrived, task_iter%2);
-            rt_hf<Config::Mb/4, d_tile::cols> d_reg[4];
+            rt_hf<Config::Mb_/4, d_tile::cols> d_reg[4];
             if(warpgroupid == 1) group<8>::sync(15);
             #pragma unroll
-            for(int i = 0; i < Config::Nb/d_tile::cols; i++) {
+            for(int i = 0; i < Config::Nb_/d_tile::cols; i++) {
                 warpgroup::load_async(d_reg[i], d_tmem.template subtile<tmem<float, 128, 64>>(0, 64*i));
             }
             tm_load_wait();
@@ -174,7 +173,7 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
             warpgroup::sync(warpgroupid);
             if(warpgroup::warpid() == 0) tma::store_async(g.d, d_smem, {rowcol.x, 4*rowcol.y+0});
             #pragma unroll
-            for(int i = 1; i < Config::Nb/d_tile::cols; i++) {
+            for(int i = 1; i < Config::Nb_/d_tile::cols; i++) {
                 tma::store_async_read_wait();
                 warpgroup::sync(warpgroupid);
                 warpgroup::store(d_smem, d_reg[i]);
@@ -189,7 +188,7 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
 }
 
 
-constexpr bool NCU = true;
+constexpr bool NCU = false;
 #include <iostream>
 #include <random>
 #include <cuda_bf16.h>
@@ -208,9 +207,16 @@ void cpu_gemm(float* a, float* b, float* c, int M, int N, int K) {
     }
 }
 
-template <typename Config = matmul_config>
-void inner_run(fp8e4m3 *d_A, fp8e4m3 *d_B, half *d_C, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
-    using globals  = matmul_globals<Config>;
+template<int M, int N>
+struct runtime_config {
+    static constexpr int Mb_ = M;
+    static constexpr int Nb_ = N;
+    static constexpr int Kb_ = 128;  // Default K tile size
+};
+
+template <typename Config>
+void dispatch_matmul(fp8e4m3 *d_A, fp8e4m3 *d_B, half *d_C, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
+    using globals = matmul_globals<Config>;
     typename globals::a_gl Ag{d_A, nullptr, nullptr, M, K};
     typename globals::b_gl Bg{d_B, nullptr, nullptr, N, K};
     typename globals::d_gl Dg{d_C, nullptr, nullptr, M, N};
@@ -218,12 +224,12 @@ void inner_run(fp8e4m3 *d_A, fp8e4m3 *d_B, half *d_C, size_t M, size_t N, size_t
     matmul<<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
 }
 
-template <typename Config = matmul_config>
+template <typename Config>
 int run_benchmark(size_t M, size_t N, size_t K) {
     cudaError_t cudaStatus;
 
     std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
-    std::cout << "Block size: " << Config::Mb*2 << "x" << Config::Nb<< "\n";
+    std::cout << "Block size: " << Config::Mb_ << "x" << Config::Nb_<< "\n";
 
     // Allocate host memory
     float *h_A = new float[M * K];
@@ -287,8 +293,8 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     dim3 block(NUM_THREADS);
     std::cout << "Launching warmup kernel with grid (" << grid.x << ", " << grid.y << "), block (" << block.x << ")\n";
     for(int i = 0; i < (NCU ? 1 : 1); i++) { // warmup
-        inner_run(d_A, d_B, d_C, M, N, K, grid, block);
-}
+        dispatch_matmul<Config>(d_A, d_B, d_C, M, N, K, grid, block);
+    }
 
     // Start timing
     cudaDeviceSynchronize();
@@ -297,7 +303,7 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 
     constexpr int ITERS = (NCU ? 1 : 5);
     for(int i = 0; i < ITERS; i++) {
-        inner_run(d_A, d_B, d_C, M, N, K, grid, block);
+        dispatch_matmul<Config>(d_A, d_B, d_C, M, N, K, grid, block);
     }
     cudaDeviceSynchronize();
 
@@ -365,17 +371,32 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     return 0;
 }
 
+int run_matmul_with_config(size_t M, size_t N, size_t K, int tile_m, int tile_n, int tile_k) {
+    int result = -1;
+    TILEMN_SWITCH_128_256(tile_m, tile_n, [&]() {
+        result = run_benchmark<runtime_config<kTileM, kTileN>>(M, N, K);
+    });
+    return result;
+}
+
 int main() {
-    int N;
-    // N = 1024;
-    // run_benchmark(N, N, N);
-    // N = 2048;
-    // run_benchmark(N, N, N);
-    // N = 4096;
-    // run_benchmark(N, N, N);
-    N = 8192;
-    run_benchmark(N, N, N);
-    N = 16384;
-    run_benchmark(N, N, N);
+    int M = 128;
+    // int N = 14336;
+    int N = 8192;
+    int K = 8192;
+    
+    // Example configurations to try
+    std::vector<std::tuple<int, int, int>> configs = {
+        // {128, 128, 128},
+        // {128, 192, 128},
+        {128, 256, 128},
+        // {256, 192, 128} // errors
+    };
+    
+    for (const auto& [tile_m, tile_n, tile_k] : configs) {
+        std::cout << "\nTesting configuration: TileM=" << tile_m << " TileN=" << tile_n << " TileK=" << tile_k << std::endl;
+        run_matmul_with_config(M, N, K, tile_m, tile_n, tile_k);
+    }
+
     return 0;
 }

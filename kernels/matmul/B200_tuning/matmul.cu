@@ -7,11 +7,18 @@ constexpr int NUM_PRODUCERS = (1);
 
 using namespace kittens;
 
-static constexpr int Mb = 128;
-static constexpr int Nb = 256;
-static constexpr int Kb = 128;
+struct matmul_config {
+    static constexpr int Mb = 128;
+    static constexpr int Nb = 256;
+    static constexpr int Kb = 128;
+};
 
+template <typename Config = matmul_config>
 struct matmul_globals {
+    static constexpr int Mb = Config::Mb;
+    static constexpr int Nb = Config::Nb;
+    static constexpr int Kb = Config::Kb;
+
     using a_tile = st_fl8_e4m3<Mb,   Kb>;
     using b_tile = st_fl8_e4m3<Nb/2, Kb>;
     using d_tile = st_hf<Mb, 64>;
@@ -28,11 +35,13 @@ struct matmul_globals {
 constexpr int NUM_WORKERS = (NUM_CONSUMERS + NUM_PRODUCERS) * 4;
 constexpr int NUM_THREADS = NUM_WORKERS * kittens::WARP_THREADS;
 
-__device__ static inline int get_iters_per_task(const matmul_globals &g) {
-    return g.a.cols / Kb;
+template <typename Config = matmul_config>
+__device__ static inline int get_iters_per_task(const matmul_globals<Config> &g) {
+    return g.a.cols / Config::Kb;
 }
-template<int SUPER_M=8> __device__ static inline int2 get_task_idx(const matmul_globals &g, int task_iter, bool is_consumer) {
-    constexpr int CLUSTER_M = 4*Mb, CLUSTER_N = Nb;
+
+template<int SUPER_M=8, typename Config = matmul_config> __device__ static inline int2 get_task_idx(const matmul_globals<Config> &g, int task_iter, bool is_consumer) {
+    constexpr int CLUSTER_M = 4*Config::Mb, CLUSTER_N = Config::Nb;
     int cluster_x = clusterIdx().x, ctarank = cluster_ctarank();
     int task_id = task_iter * (gridDim.x/2) + cluster_x;
     int Rblocks = g.d.rows / CLUSTER_M, Cblocks = g.d.cols / CLUSTER_N;
@@ -57,8 +66,9 @@ template<int SUPER_M=8> __device__ static inline int2 get_task_idx(const matmul_
     }
 }
 
+template <typename Config = matmul_config>
 __global__ __cluster_dims__(2) __launch_bounds__(NUM_THREADS, 1)
-void matmul(const __grid_constant__ matmul_globals g) {
+void matmul(const __grid_constant__ matmul_globals<Config> g) {
 
     extern __shared__ int __shm[]; 
     tma_swizzle_allocator al((int*)&__shm[0]);
@@ -67,9 +77,9 @@ void matmul(const __grid_constant__ matmul_globals g) {
 
     constexpr int PIPE_DEPTH = 4;
 
-    using a_tile = matmul_globals::a_tile;
-    using b_tile = matmul_globals::b_tile;
-    using d_tile = matmul_globals::d_tile;
+    using a_tile = matmul_globals<Config>::a_tile;
+    using b_tile = matmul_globals<Config>::b_tile;
+    using d_tile = matmul_globals<Config>::d_tile;
     
     a_tile (&a_smem)[PIPE_DEPTH][NUM_CONSUMERS] = al.allocate<a_tile, PIPE_DEPTH, NUM_CONSUMERS>();
     b_tile (&b_smem)[PIPE_DEPTH]                = al.allocate<b_tile, PIPE_DEPTH>();
@@ -77,7 +87,7 @@ void matmul(const __grid_constant__ matmul_globals g) {
 
     tma::cluster::sync();
     auto all_tmem = allocate_tmem<1, 2>();
-    using d_tmem_t = tmem<float, Mb, Nb>;
+    using d_tmem_t = tmem<float, Config::Mb, Config::Nb>;
 
     __shared__ kittens::semaphore inputs_arrived[PIPE_DEPTH], inputs_finished[PIPE_DEPTH], outputs_arrived, outputs_finished[NUM_CONSUMERS];
     uint32_t bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
@@ -123,7 +133,7 @@ void matmul(const __grid_constant__ matmul_globals g) {
             }
         }
         else if(ctarank == 0 && (warpgroup::warpid() == 0 || warpgroup::warpid() == 1)) { // launch the MMA's
-            d_tmem_t d_tmem = all_tmem.subtile<d_tmem_t>(0, warpgroup::warpid()*Nb);
+            d_tmem_t d_tmem = all_tmem.subtile<d_tmem_t>(0, warpgroup::warpid()*Config::Nb);
             int input_ring = 0; // tracking which input block is being loaded
             for(int task_iter = 0; true; task_iter++) {
                 int2 rowcol = get_task_idx(g, task_iter, false);
@@ -144,16 +154,16 @@ void matmul(const __grid_constant__ matmul_globals g) {
     }
     else {
         warpgroup::increase_registers<224>();
-        d_tmem_t d_tmem = all_tmem.subtile<d_tmem_t>(0, warpgroupid*Nb);
+        d_tmem_t d_tmem = all_tmem.subtile<d_tmem_t>(0, warpgroupid*Config::Nb);
         for(int task_iter = 0; true; task_iter++) {
             int2 rowcol = get_task_idx(g, task_iter, true);
             if(rowcol.x == -1) return;
             kittens::wait(outputs_arrived, task_iter%2);
-            rt_hf<Mb/4, d_tile::cols> d_reg[4];
+            rt_hf<Config::Mb/4, d_tile::cols> d_reg[4];
             if(warpgroupid == 1) group<8>::sync(15);
             #pragma unroll
-            for(int i = 0; i < Nb/d_tile::cols; i++) {
-                warpgroup::load_async(d_reg[i], d_tmem.subtile<tmem<float, 128, 64>>(0, 64*i));
+            for(int i = 0; i < Config::Nb/d_tile::cols; i++) {
+                warpgroup::load_async(d_reg[i], d_tmem.template subtile<tmem<float, 128, 64>>(0, 64*i));
             }
             tm_load_wait();
             warpgroup::sync(warpgroupid);
@@ -164,7 +174,7 @@ void matmul(const __grid_constant__ matmul_globals g) {
             warpgroup::sync(warpgroupid);
             if(warpgroup::warpid() == 0) tma::store_async(g.d, d_smem, {rowcol.x, 4*rowcol.y+0});
             #pragma unroll
-            for(int i = 1; i < Nb/d_tile::cols; i++) {
+            for(int i = 1; i < Config::Nb/d_tile::cols; i++) {
                 tma::store_async_read_wait();
                 warpgroup::sync(warpgroupid);
                 warpgroup::store(d_smem, d_reg[i]);
@@ -198,8 +208,9 @@ void cpu_gemm(float* a, float* b, float* c, int M, int N, int K) {
     }
 }
 
+template <typename Config = matmul_config>
 void inner_run(fp8e4m3 *d_A, fp8e4m3 *d_B, half *d_C, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
-    using globals  = matmul_globals;
+    using globals  = matmul_globals<Config>;
     typename globals::a_gl Ag{d_A, nullptr, nullptr, M, K};
     typename globals::b_gl Bg{d_B, nullptr, nullptr, N, K};
     typename globals::d_gl Dg{d_C, nullptr, nullptr, M, N};
@@ -207,11 +218,12 @@ void inner_run(fp8e4m3 *d_A, fp8e4m3 *d_B, half *d_C, size_t M, size_t N, size_t
     matmul<<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
 }
 
+template <typename Config = matmul_config>
 int run_benchmark(size_t M, size_t N, size_t K) {
     cudaError_t cudaStatus;
 
     std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
-    std::cout << "Block size: " << Mb*2 << "x" << Nb<< "\n";
+    std::cout << "Block size: " << Config::Mb*2 << "x" << Config::Nb<< "\n";
 
     // Allocate host memory
     float *h_A = new float[M * K];
@@ -268,7 +280,7 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     std::cout << "Performed CPU matrix multiplication" << std::endl;
 
     unsigned long mem_size = MAX_SHARED_MEMORY - 1024;
-    cudaFuncSetAttribute(matmul, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    cudaFuncSetAttribute(matmul<Config>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
 
     // Launch kernel
     dim3 grid(148, 1);
@@ -276,7 +288,7 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     std::cout << "Launching warmup kernel with grid (" << grid.x << ", " << grid.y << "), block (" << block.x << ")\n";
     for(int i = 0; i < (NCU ? 1 : 1); i++) { // warmup
         inner_run(d_A, d_B, d_C, M, N, K, grid, block);
-    }
+}
 
     // Start timing
     cudaDeviceSynchronize();
@@ -334,7 +346,7 @@ int run_benchmark(size_t M, size_t N, size_t K) {
         }
         max_error = std::max(max_error, error);
     }
-
+    
     std::cout << "Max error: " << max_error << std::endl;
     std::cout << "Error count: " << error_count << std::endl;
 

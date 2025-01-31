@@ -6,24 +6,23 @@
 constexpr int NUM_CONSUMERS = (2); 
 constexpr int NUM_PRODUCERS = (1);
 
-constexpr int NCTA = 2;
-constexpr int CLUSTER_DIM = 2;
-constexpr int PIPE_DEPTH = 4;
-
 using namespace kittens;
 
-template<int Mb, int Nb, int Kb>
+template<int Mb, int Nb, int Kb, int NCTA = 2, int CLUSTER_DIM = 2, int PIPE_DEPTH = 4>
 struct matmul_config_t {
     static constexpr int Mb_ = Mb;
     static constexpr int Nb_ = Nb;
     static constexpr int Kb_ = Kb;
+    static constexpr int NCTA_ = NCTA;
+    static constexpr int CLUSTER_DIM_ = CLUSTER_DIM;
+    static constexpr int PIPE_DEPTH_ = PIPE_DEPTH;
 };
 
 template <typename Config>
 struct matmul_globals {
     using a_tile = st_fl8_e4m3<Config::Mb_, Config::Kb_>;
-    using b_tile = st_fl8_e4m3<Config::Nb_/CLUSTER_DIM, Config::Kb_>;
-    using d_tile = st_hf<Config::Mb_, Config::Nb_/PIPE_DEPTH>;
+    using b_tile = st_fl8_e4m3<Config::Nb_/Config::CLUSTER_DIM_, Config::Kb_>;
+    using d_tile = st_hf<Config::Mb_, Config::Nb_/Config::PIPE_DEPTH_>;
 
     using a_gl = gl<fp8e4m3, 1, 1, -1, -1, a_tile>;
     using b_gl = gl<fp8e4m3, 1, 1, -1, -1, b_tile>;
@@ -70,7 +69,7 @@ __device__ static inline int2 get_task_idx(const matmul_globals<Config> &g, int 
 }
 
 template <typename Config>
-__global__ __cluster_dims__(CLUSTER_DIM) __launch_bounds__(NUM_THREADS, 1)
+__global__ __cluster_dims__(Config::CLUSTER_DIM_) __launch_bounds__(NUM_THREADS, 1)
 void matmul(const __grid_constant__ matmul_globals<Config> g) {
 
     extern __shared__ int __shm[]; 
@@ -82,19 +81,19 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
     using b_tile = matmul_globals<Config>::b_tile;
     using d_tile = matmul_globals<Config>::d_tile;
     
-    a_tile (&a_smem)[PIPE_DEPTH][NUM_CONSUMERS] = al.allocate<a_tile, PIPE_DEPTH, NUM_CONSUMERS>();
-    b_tile (&b_smem)[PIPE_DEPTH]                = al.allocate<b_tile, PIPE_DEPTH>();
+    a_tile (&a_smem)[Config::PIPE_DEPTH_][Config::NCTA_] = al.allocate<a_tile, Config::PIPE_DEPTH_, Config::NCTA_>();
+    b_tile (&b_smem)[Config::PIPE_DEPTH_]                = al.allocate<b_tile, Config::PIPE_DEPTH_>();
     d_tile (&d_smem)                            = al.allocate<d_tile>();
 
     tma::cluster::sync();
-    auto all_tmem = allocate_tmem<1, NCTA>();
+    auto all_tmem = allocate_tmem<1, Config::NCTA_>();
     using d_tmem_t = tmem<float, Config::Mb_, Config::Nb_>;
 
-    __shared__ kittens::semaphore inputs_arrived[PIPE_DEPTH], inputs_finished[PIPE_DEPTH], outputs_arrived, outputs_finished[NUM_CONSUMERS];
+    __shared__ kittens::semaphore inputs_arrived[Config::PIPE_DEPTH_], inputs_finished[Config::PIPE_DEPTH_], outputs_arrived, outputs_finished[NUM_CONSUMERS];
     uint32_t bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
 
     if (threadIdx.x == 0) { 
-        for(int i = 0; i < PIPE_DEPTH; i++) {
+        for(int i = 0; i < Config::PIPE_DEPTH_; i++) {
             init_semaphore(inputs_arrived[i], 0, 2); 
             init_semaphore(inputs_finished[i], 0, NUM_CONSUMERS); 
         }
@@ -114,9 +113,9 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
             for(int task_iter = 0; true; task_iter++) {
                 int2 rowcol = get_task_idx<Config>(g, task_iter, false);
                 if(rowcol.x == -1) {
-                    for(int idx = 0; idx < (PIPE_DEPTH); idx++) {
+                    for(int idx = 0; idx < Config::PIPE_DEPTH_; idx++) {
                         tma::cluster::wait(inputs_finished[input_ring], prototype::get_phasebit<1>(bitfield, input_ring));
-                        input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring);
+                        input_ring=prototype::ring_advance<Config::PIPE_DEPTH_>(input_ring);
                     }
                     if(laneid() == 0) arrive(outputs_arrived);
                     return;
@@ -124,17 +123,17 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
                 for (int idx = 0; idx < iters_per_task; idx++) {
                     tma::cluster::wait(inputs_finished[input_ring], prototype::get_phasebit<1>(bitfield, input_ring));
                     prototype::update_phasebit<1>(bitfield, input_ring);
-                    if(task_iter>0 && idx==PIPE_DEPTH-1 && laneid() == 0) arrive(outputs_arrived); 
+                    if(task_iter>0 && idx==Config::PIPE_DEPTH_-1 && laneid() == 0) arrive(outputs_arrived); 
                     tma::cluster::expect(inputs_arrived[input_ring], 0, a_smem[0][0], a_smem[0][1], b_smem[0]);
                     tma::cluster::load_async(a_smem[input_ring][0], g.a, {(rowcol.x+0), idx}, inputs_arrived[input_ring], (uint16_t)(1<<ctarank), 0);
                     tma::cluster::load_async(a_smem[input_ring][1], g.a, {(rowcol.x+1), idx}, inputs_arrived[input_ring], (uint16_t)(1<<ctarank), 0);
                     tma::cluster::load_async(b_smem[input_ring],    g.b, { rowcol.y,    idx}, inputs_arrived[input_ring], (uint16_t)(1<<ctarank), 0);
-                    input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring);
+                    input_ring=prototype::ring_advance<Config::PIPE_DEPTH_>(input_ring);
                 }
             }
         }
         else if(ctarank == 0 && (warpgroup::warpid() == 0 || warpgroup::warpid() == 1)) { // launch the MMA's
-            d_tmem_t d_tmem = all_tmem.subtile<d_tmem_t>(0, warpgroup::warpid()*Config::Nb_);
+            d_tmem_t d_tmem = all_tmem.template subtile<d_tmem_t>(0, warpgroup::warpid()*Config::Nb_);
             int input_ring = 0; // tracking which input block is being loaded
             for(int task_iter = 0; true; task_iter++) {
                 int2 rowcol = get_task_idx<Config>(g, task_iter, false);
@@ -143,19 +142,19 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
                 tma::cluster::wait(inputs_arrived[input_ring], prototype::get_phasebit<0>(bitfield, input_ring));
                 prototype::update_phasebit<0>(bitfield, input_ring);
                 mm2_ABt(d_tmem, a_smem[0][warpgroup::warpid()], b_smem[0], inputs_finished[0]);
-                input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring);
+                input_ring=prototype::ring_advance<Config::PIPE_DEPTH_>(input_ring);
                 for(int idx = 1; idx < iters_per_task; idx++) {
                     tma::cluster::wait(inputs_arrived[input_ring], prototype::get_phasebit<0>(bitfield, input_ring));
                     prototype::update_phasebit<0>(bitfield, input_ring);
                     mma2_ABt(d_tmem, a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
-                    input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring);
+                    input_ring=prototype::ring_advance<Config::PIPE_DEPTH_>(input_ring);
                 }
             }
         }
     }
     else {
         warpgroup::increase_registers<224>();
-        d_tmem_t d_tmem = all_tmem.subtile<d_tmem_t>(0, warpgroupid*Config::Nb_);
+        d_tmem_t d_tmem = all_tmem.template subtile<d_tmem_t>(0, warpgroupid*Config::Nb_);
         for(int task_iter = 0; true; task_iter++) {
             int2 rowcol = get_task_idx<Config>(g, task_iter, true);
             if(rowcol.x == -1) return;
@@ -164,7 +163,7 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
             if(warpgroupid == 1) group<8>::sync(15);
             #pragma unroll
             for(int i = 0; i < Config::Nb_/d_tile::cols; i++) {
-                warpgroup::load_async(d_reg[i], d_tmem.template subtile<tmem<float, Config::Mb_, Config::Nb_/PIPE_DEPTH>>(0, Config::Nb_/PIPE_DEPTH*i));
+                warpgroup::load_async(d_reg[i], d_tmem.template subtile<tmem<float, Config::Mb_, Config::Nb_/Config::PIPE_DEPTH_>>(0, Config::Nb_/Config::PIPE_DEPTH_*i));
             }
             tm_load_wait();
             warpgroup::sync(warpgroupid);
@@ -190,7 +189,7 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
 }
 
 
-constexpr bool NCU = false;
+// constexpr bool NCU = false;
 #include <iostream>
 #include <random>
 #include <cuda_bf16.h>
@@ -202,19 +201,12 @@ void cpu_gemm(float* a, float* b, float* c, int M, int N, int K) {
         for (int j = 0; j < N; j++) {
             float sum = 0.0f;
             for (int k = 0; k < K; k++) {
-                sum += a[i * K + k] * b[j * N + k];
+                sum += a[i * K + k] * b[j * K + k];
             }
             c[i * N + j] = sum;
         }
     }
 }
-
-template<int M, int N, int K>
-struct runtime_config {
-    static constexpr int Mb_ = M;
-    static constexpr int Nb_ = N;
-    static constexpr int Kb_ = K;
-};
 
 template <typename Config>
 void dispatch_matmul(fp8e4m3 *d_A, fp8e4m3 *d_B, half *d_C, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
@@ -230,16 +222,15 @@ template <typename Config>
 int run_benchmark(size_t M, size_t N, size_t K) {
     cudaError_t cudaStatus;
 
-    std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
-    std::cout << "Block size: " << Config::Mb_ << "x" << Config::Nb_<< "\n";
+    std::cout << "----------------------------------------\n";
+    std::cout << "Matrix multiplication (" << M << "x" << K << " @ " << K << "x" << N << "):\n";
+    std::cout << "TileM=" << Config::Mb_ << " TileN=" << Config::Nb_ << " TileK=" << Config::Kb_ << "\n";
 
     // Allocate host memory
     float *h_A = new float[M * K];
     float *h_B = new float[K * N];
     float *h_C = new float[M * N];
     float *h_C_ref = new float[M * N];
-
-    std::cout << "Allocated host memory" << std::endl;
 
     // Initialize random number generator
     std::random_device rd;
@@ -249,8 +240,6 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     // Initialize matrices with random values
     for (int i = 0; i < M * K; ++i) h_A[i] = dis(gen);
     for (int i = 0; i < K * N; ++i) h_B[i] = dis(gen);
-
-    std::cout << "Initialized matrices" << std::endl;
 
     // Allocate device memory
     fp8e4m3 *d_A, *d_B;
@@ -263,13 +252,10 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     cudaStatus = cudaGetLastError();
     if (cudaStatus != cudaSuccess) {
         std::cerr << "CUDA error: " << cudaGetErrorString(cudaStatus) << std::endl;
-        // Optionally, you might want to exit the program or handle the error in some way
         return -1;
     }
 
-    std::cout << "Allocated device memory" << std::endl;
-
-    // Convert to __nv_bfloat16 and copy to device
+    // Convert to fp8 and copy to device
     fp8e4m3 *h_A_fp8 = new fp8e4m3[M * K];
     fp8e4m3 *h_B_fp8 = new fp8e4m3[K * N];
     for (int i = 0; i < M * K; ++i) h_A_fp8[i] = fp8e4m3(h_A[i]);
@@ -280,12 +266,8 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     cudaMemcpy(d_A, h_A_fp8, M*K*sizeof(fp8e4m3), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B_fp8, K*N*sizeof(fp8e4m3), cudaMemcpyHostToDevice);
 
-    std::cout << "Copied matrices to device" << std::endl;
-
     // Perform CPU matrix multiplication for reference
     if(true) cpu_gemm(h_A, h_B, h_C_ref, M, N, K);
-
-    std::cout << "Performed CPU matrix multiplication" << std::endl;
 
     unsigned long mem_size = MAX_SHARED_MEMORY - 1024;
     cudaFuncSetAttribute(matmul<Config>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
@@ -293,72 +275,75 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     // Launch kernel
     dim3 grid(148, 1);
     dim3 block(NUM_THREADS);
-    std::cout << "Launching warmup kernel with grid (" << grid.x << ", " << grid.y << "), block (" << block.x << ")\n";
-    for(int i = 0; i < (NCU ? 1 : 1); i++) { // warmup
-        dispatch_matmul<Config>(d_A, d_B, d_C, M, N, K, grid, block);
+
+    // Create timing events
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    std::vector<float> runtimes;
+    float iqr = std::numeric_limits<float>::infinity();
+    auto benchmark_start = std::chrono::high_resolution_clock::now();
+
+    // Sample until variance is < 5% or 5 seconds elapsed
+    while (iqr > 0.05 && 
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - benchmark_start).count() < 5.0) {
+        
+        for (int i = 0; i < 10; i++) {
+
+            cudaEventRecord(start);
+            dispatch_matmul<Config>(d_A, d_B, d_C, M, N, K, grid, block);
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+
+            float milliseconds = 0;
+            cudaEventElapsedTime(&milliseconds, start, stop);
+            runtimes.push_back(milliseconds / 1000.0); // Convert to seconds
+        }
+
+        std::sort(runtimes.begin(), runtimes.end());
+        size_t n = runtimes.size();
+        float q1 = runtimes[n/4];
+        float q3 = runtimes[3*n/4];
+        float median = runtimes[n/2];
+        iqr = (q3 - q1) / median;
     }
 
-    // Start timing
-    cudaDeviceSynchronize();
-    std::cout << "Launching kernel with grid (" << grid.x << ", " << grid.y << "), block (" << block.x << ")\n";
-    auto start = std::chrono::high_resolution_clock::now();
+    float median_runtime = runtimes[runtimes.size()/2];
+    double flops = 2.0 * M * N * K;
+    double tflops = (flops / median_runtime) / 1e12;
+    size_t bytes_accessed = (M * K + K * N + M * N) * sizeof(fp8e4m3); 
+    double bandwidth_gb = (bytes_accessed / median_runtime) / 1e9;
 
-    constexpr int ITERS = (NCU ? 1 : 5);
-    for(int i = 0; i < ITERS; i++) {
-        dispatch_matmul<Config>(d_A, d_B, d_C, M, N, K, grid, block);
-    }
-    cudaDeviceSynchronize();
+    std::cout << "Median runtime: " << median_runtime * 1e6 << " µs (+/- " 
+              << iqr * 100 << "% over " << runtimes.size() << " runs)\n";
+    std::cout << "Performance: " << tflops << " TFLOPs\n";
+    std::cout << "Memory bandwidth: " << bandwidth_gb << " GB/s\n";
 
-    // End timing
-    auto end = std::chrono::high_resolution_clock::now();
-
-    // Calculate duration
-    std::chrono::duration<double> diff = end - start;
-    double useconds = diff.count() * 1e6 / ITERS;
-
-    // Calculate TFLOPs
-    double flops = double(2.0) * M * N * K; // 2 FLOPs per multiply-add
-    double tflops = (flops / useconds) / 1e6;
-
-    std::cout << "Avg Kernel execution time: " << useconds << " us\n";
-    std::cout << "Achieved performance: " << tflops << " TFLOPs\n";
-    
-    // Check for CUDA errors
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        std::cerr << "CUDA error: " << cudaGetErrorString(cudaStatus) << std::endl;
-        // Optionally, you might want to exit the program or handle the error in some way
-        return -1;
-    }
-
-    // Copy result back to host
+    // Check result
     half *h_C_fp16 = new half[M * N];
     cudaMemcpy(h_C_fp16, d_C, M*N*sizeof(half), cudaMemcpyDeviceToHost);
-
-    std::cout << "Copied result back to host" << std::endl;
 
     // Convert result back to float for comparison
     for (int i = 0; i < M * N; ++i) h_C[i] = __half2float(h_C_fp16[i]);
 
-    std::cout << "Converted result back to float" << std::endl;
-
-    // Check result
+    // Check accuracy
     float max_error = 0.0f;
     int error_count = 0;
     for (int i = 0; i < M * N; ++i) {
         float error = std::abs(h_C[i] - h_C_ref[i]);
-        if(error > 1.0) { // large because of bf16 vs fp32 numerics
-            if(error_count < 20) std::cout << "Error at row " << i / N << " col " << i % N << ": " << h_C[i] << " != " << h_C_ref[i] << " (ref)" << std::endl;
-            else if(error_count == 21) std::cout << "Too many errors to show them all.\n";
+        if(error > 1.0) {
+            if(error_count < 10) std::cout << "Error at row " << i / N << " col " << i % N 
+                                         << ": " << h_C[i] << " != " << h_C_ref[i] << " (ref)\n";
             error_count++;
         }
         max_error = std::max(max_error, error);
     }
     
-    std::cout << "Max error: " << max_error << std::endl;
-    std::cout << "Error count: " << error_count << std::endl;
+    std::cout << "Max error: " << max_error << "\n";
+    std::cout << "Error count: " << error_count << "\n";
 
-    // Clean up
+    // Cleanup
     delete[] h_A;
     delete[] h_B;
     delete[] h_C;
@@ -369,6 +354,8 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
     return 0;
 }
@@ -378,7 +365,7 @@ int run_matmul_with_config(size_t M, size_t N, size_t K, int tile_m, int tile_n,
     // TILEM_SWITCH(tile_m, [&]() {
         TILEN_SWITCH(tile_n, [&]() {
             TILEK_SWITCH(tile_k, [&]() {
-                result = run_benchmark<runtime_config<128, kTileN, kTileK>>(M, N, K);
+                result = run_benchmark<matmul_config_t<128, kTileN, kTileK>>(M, N, K);
             });
         });
     // });
@@ -387,7 +374,7 @@ int run_matmul_with_config(size_t M, size_t N, size_t K, int tile_m, int tile_n,
 
 int main() {
     std::vector<std::tuple<int,int,int>> shapes = {
-        // {8192, 8192, 8192},
+        {8192, 8192, 8192},
         {16384, 16384, 16384},
         // {128, 14336, 8192},
         // {256, 14336, 8192},
@@ -405,18 +392,16 @@ int main() {
         // {64, 128, 128},
         // {64, 256, 64},
         // {64, 256, 128},
-        {128, 64, 64},
-        {128, 64, 128},
-        {128, 128, 64},
-        {128, 128, 128},
-        {128, 256, 64},
+        // {128, 64, 64},
+        // {128, 64, 128},
+        // {128, 128, 64},
+        // {128, 128, 128},
+        // {128, 256, 64},
         {128, 256, 128},
     };
 
-    for (const auto& [tile_m, tile_n, tile_k] : configs) {
-        std::cout << "\nTesting configuration: TileM=" << tile_m << " TileN=" << tile_n << " TileK=" << tile_k << std::endl;
-        for(const auto& [M, N, K] : shapes) {
-            std::cout << "Running with shape: M=" << M << " N=" << N << " K=" << K << std::endl;
+    for(const auto& [M, N, K] : shapes) {
+        for (const auto& [tile_m, tile_n, tile_k] : configs) {
             run_matmul_with_config(M, N, K, tile_m, tile_n, tile_k);
         }
     }

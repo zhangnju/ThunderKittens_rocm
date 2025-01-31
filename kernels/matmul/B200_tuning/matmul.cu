@@ -6,6 +6,10 @@
 constexpr int NUM_CONSUMERS = (2); 
 constexpr int NUM_PRODUCERS = (1);
 
+constexpr int NCTA = 2;
+constexpr int CLUSTER_DIM = 2;
+constexpr int PIPE_DEPTH = 4;
+
 using namespace kittens;
 
 template<int Mb, int Nb, int Kb>
@@ -15,11 +19,11 @@ struct matmul_config_t {
     static constexpr int Kb_ = Kb;
 };
 
-template <typename Config, int SUPER_M=8>
+template <typename Config>
 struct matmul_globals {
     using a_tile = st_fl8_e4m3<Config::Mb_, Config::Kb_>;
-    using b_tile = st_fl8_e4m3<Config::Nb_/2, Config::Kb_>;
-    using d_tile = st_hf<Config::Mb_, 64>;
+    using b_tile = st_fl8_e4m3<Config::Nb_/CLUSTER_DIM, Config::Kb_>;
+    using d_tile = st_hf<Config::Mb_, Config::Nb_/PIPE_DEPTH>;
 
     using a_gl = gl<fp8e4m3, 1, 1, -1, -1, a_tile>;
     using b_gl = gl<fp8e4m3, 1, 1, -1, -1, b_tile>;
@@ -66,15 +70,13 @@ __device__ static inline int2 get_task_idx(const matmul_globals<Config> &g, int 
 }
 
 template <typename Config>
-__global__ __cluster_dims__(2) __launch_bounds__(NUM_THREADS, 1)
+__global__ __cluster_dims__(CLUSTER_DIM) __launch_bounds__(NUM_THREADS, 1)
 void matmul(const __grid_constant__ matmul_globals<Config> g) {
 
     extern __shared__ int __shm[]; 
     tma_swizzle_allocator al((int*)&__shm[0]);
     int warpid = kittens::warpid(), warpgroupid = warpgroup::groupid();
     int iters_per_task = get_iters_per_task(g);
-
-    constexpr int PIPE_DEPTH = 4;
 
     using a_tile = matmul_globals<Config>::a_tile;
     using b_tile = matmul_globals<Config>::b_tile;
@@ -85,7 +87,7 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
     d_tile (&d_smem)                            = al.allocate<d_tile>();
 
     tma::cluster::sync();
-    auto all_tmem = allocate_tmem<1, 2>();
+    auto all_tmem = allocate_tmem<1, NCTA>();
     using d_tmem_t = tmem<float, Config::Mb_, Config::Nb_>;
 
     __shared__ kittens::semaphore inputs_arrived[PIPE_DEPTH], inputs_finished[PIPE_DEPTH], outputs_arrived, outputs_finished[NUM_CONSUMERS];
@@ -162,7 +164,7 @@ void matmul(const __grid_constant__ matmul_globals<Config> g) {
             if(warpgroupid == 1) group<8>::sync(15);
             #pragma unroll
             for(int i = 0; i < Config::Nb_/d_tile::cols; i++) {
-                warpgroup::load_async(d_reg[i], d_tmem.template subtile<tmem<float, 128, 64>>(0, 64*i));
+                warpgroup::load_async(d_reg[i], d_tmem.template subtile<tmem<float, Config::Mb_, Config::Nb_/PIPE_DEPTH>>(0, Config::Nb_/PIPE_DEPTH*i));
             }
             tm_load_wait();
             warpgroup::sync(warpgroupid);
@@ -207,11 +209,11 @@ void cpu_gemm(float* a, float* b, float* c, int M, int N, int K) {
     }
 }
 
-template<int M, int N>
+template<int M, int N, int K>
 struct runtime_config {
     static constexpr int Mb_ = M;
     static constexpr int Nb_ = N;
-    static constexpr int Kb_ = 128;  // Default K tile size
+    static constexpr int Kb_ = K;
 };
 
 template <typename Config>
@@ -373,29 +375,50 @@ int run_benchmark(size_t M, size_t N, size_t K) {
 
 int run_matmul_with_config(size_t M, size_t N, size_t K, int tile_m, int tile_n, int tile_k) {
     int result = -1;
-    TILEMN_SWITCH_128_256(tile_m, tile_n, [&]() {
-        result = run_benchmark<runtime_config<kTileM, kTileN>>(M, N, K);
-    });
+    // TILEM_SWITCH(tile_m, [&]() {
+        TILEN_SWITCH(tile_n, [&]() {
+            TILEK_SWITCH(tile_k, [&]() {
+                result = run_benchmark<runtime_config<128, kTileN, kTileK>>(M, N, K);
+            });
+        });
+    // });
     return result;
 }
 
 int main() {
-    int M = 128;
-    // int N = 14336;
-    int N = 8192;
-    int K = 8192;
-    
-    // Example configurations to try
-    std::vector<std::tuple<int, int, int>> configs = {
-        // {128, 128, 128},
-        // {128, 192, 128},
-        {128, 256, 128},
-        // {256, 192, 128} // errors
+    std::vector<std::tuple<int,int,int>> shapes = {
+        // {8192, 8192, 8192},
+        {16384, 16384, 16384},
+        // {128, 14336, 8192},
+        // {256, 14336, 8192},
+        // {512, 14336, 8192},
+        // {1024, 14336, 8192},
+        // {4096, 14336, 8192},
+        {8192, 14336, 8192}
     };
-    
+
+
+    std::vector<std::tuple<int, int, int>> configs = {  
+        // {64, 64, 64},
+        // {64, 64, 128},
+        // {64, 128, 64},
+        // {64, 128, 128},
+        // {64, 256, 64},
+        // {64, 256, 128},
+        {128, 64, 64},
+        {128, 64, 128},
+        {128, 128, 64},
+        {128, 128, 128},
+        {128, 256, 64},
+        {128, 256, 128},
+    };
+
     for (const auto& [tile_m, tile_n, tile_k] : configs) {
         std::cout << "\nTesting configuration: TileM=" << tile_m << " TileN=" << tile_n << " TileK=" << tile_k << std::endl;
-        run_matmul_with_config(M, N, K, tile_m, tile_n, tile_k);
+        for(const auto& [M, N, K] : shapes) {
+            std::cout << "Running with shape: M=" << M << " N=" << N << " K=" << K << std::endl;
+            run_matmul_with_config(M, N, K, tile_m, tile_n, tile_k);
+        }
     }
 
     return 0;

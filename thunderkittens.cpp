@@ -99,6 +99,13 @@ extern torch::Tensor fftconv(
 );
 #endif
 
+#ifdef TK_COMPILE_FP8_GEMM
+extern torch::Tensor fp8_gemm(
+    const torch::Tensor a,
+    const torch::Tensor b
+);
+#endif
+
 #ifdef TK_COMPILE_FUSED_ROTARY
 extern torch::Tensor fused_rotary(
     const torch::Tensor x,
@@ -155,6 +162,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 #ifdef TK_COMPILE_FFTCONV
     m.def("fftconv", fftconv, "FFTConv TK. Takes tensors (u_real, kf_real, kf_imag, f_real, f_imag, finv_real, finv_imag, tw_real, tw_imag, twinv_real, twinv_imag, B, H, N, N1). All tensors are bf16 except B, H, N, N1 which are ints. Returns (B, H, N, N1) in bf16.");
+#endif
+
+#ifdef TK_COMPILE_FP8_GEMM
+    m.def("fp8_gemm", fp8_gemm, "FP8 GEMM TK. Takes tensors (a, b). Both tensors are bf16. Returns (B, H, N, 128) in bf16.");
 #endif
 
 #ifdef TK_COMPILE_FUSED_ROTARY

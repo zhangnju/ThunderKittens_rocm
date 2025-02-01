@@ -1,6 +1,10 @@
 #include "kittens.cuh"
 #include "prototype.cuh"
 
+#ifdef TORCH_COMPILE
+#define TK_COMPILE_FP8_GEMM
+#endif
+
 using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::lcf;
@@ -131,6 +135,53 @@ void inner_run(fp8e4m3 *d_A, fp8e4m3 *d_B, fp8e4m3 *d_C, size_t M, size_t N, siz
     globals G{Ag, Bg, Cg};
     prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
 }
+
+#ifdef TK_COMPILE_FP8_GEMM
+#include <ATen/cuda/CUDAContext.h> 
+#include "common/pyutils/torch_helpers.cuh"
+#include <iostream>
+
+template<typename mmt>
+void dispatch_fp8_gemm( 
+    fp8e4m3 *d_A, fp8e4m3 *d_B, fp8e4m3 *d_C,
+    int M, int N, int K
+){
+    using a_layout = typename mmt::layout::a_layout;
+    using b_layout = typename mmt::layout::b_layout;
+    using c_layout = typename mmt::layout::c_layout;
+    using globals  = typename mmt::layout::globals;
+    a_layout Ag{d_A, nullptr, nullptr, M, K};
+    b_layout Bg{d_B, nullptr, nullptr, N, K};
+    c_layout Cg{d_C, nullptr, nullptr, M, N};
+    globals G{Ag, Bg, Cg};
+    dim3 grid = mmt::grid(M, N, K);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    dim3 block = kittens::prototype::detail::NUM_THREADS_v<mmt>;
+    prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024, stream>>>(G);
+}
+
+torch::Tensor fp8_gemm(torch::Tensor A, torch::Tensor B) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(B);
+
+    auto M = A.size(0);
+    auto N = B.size(0);
+    auto K = A.size(1);
+    torch::Tensor C = torch::empty({M, N}, A.options());
+
+    // convert to bf16
+    c10::Float8_e4m3fn *A_fp8 = A.data_ptr<c10::Float8_e4m3fn>();
+    c10::Float8_e4m3fn *B_fp8 = B.data_ptr<c10::Float8_e4m3fn>();
+
+    fp8e4m3 *d_A = reinterpret_cast<fp8e4m3*>(A_fp8);
+    fp8e4m3 *d_B = reinterpret_cast<fp8e4m3*>(B_fp8);
+    fp8e4m3 *d_C = reinterpret_cast<fp8e4m3*>(C.data_ptr<c10::Float8_e4m3fn>());
+
+    dispatch_fp8_gemm<matmul_template<8>>(d_A, d_B, d_C, M, N, K);
+    CHECK_CUDA_ERROR(cudaGetLastError());
+    return C;
+}
+#else
 
 template<typename mmt>
 int run_benchmark(size_t M, size_t N, size_t K) {
@@ -309,4 +360,4 @@ int main() {
 
     return 0;
 }
-
+#endif

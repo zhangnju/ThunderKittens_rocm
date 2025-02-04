@@ -65,7 +65,6 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
     q_tile    (&q_smem)[CONSUMER_WARPGROUPS] = al.allocate<q_tile, CONSUMER_WARPGROUPS>();
     k_tile    (&k_smem)[K::stages]           = al.allocate<k_tile, K::stages          >();
     v_tile    (&v_smem)[K::stages]           = al.allocate<v_tile, K::stages          >();
-    l_col_vec (&l_smem)[CONSUMER_WARPGROUPS] = al.allocate<l_col_vec, CONSUMER_WARPGROUPS>();
     auto      (*o_smem)                      = reinterpret_cast<o_tile(*)>(q_smem);
     
     int kv_blocks   = g.N / (K::kv_height);
@@ -211,20 +210,8 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             tma::store_async(g.o, o_smem[warpgroupid], o_tile_idx);
         }
 
-        mul(max_vec_scaled,   max_vec_scaled, 0.69314718056f);
-        log(norm_vec, norm_vec);
-        add(norm_vec, norm_vec, max_vec_scaled);
-
-        if constexpr (D == 64) { mul(norm_vec, norm_vec, -8.0f); }
-        else                   { mul(norm_vec, norm_vec, -11.313708499f); }
-    
-        warpgroup::store(l_smem[warpgroupid], norm_vec);
         warpgroup::sync(warpgroupid+4);
-
-        if (warpid % 4 == 0) {
-            coord<l_col_vec> tile_idx = {blockIdx.z, blockIdx.y, 0, (seq_idx) + warpgroupid};
-            tma::store_async(g.l, l_smem[warpgroupid], tile_idx);
-        }
+        
         tma::store_async_wait();
     }
 }

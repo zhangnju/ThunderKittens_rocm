@@ -17,8 +17,8 @@ H = 32
 N = 1024
 D = 128 
 
-Q_LEN = 10
-L_NEW = 3
+Q_LEN = 1
+L_NEW = 1
 
 
 TESTNAME = sys.argv[1]
@@ -192,7 +192,6 @@ out_torch = mha_fwd_kvcache_torch(
         is_causal=True
     )
 
-breakpoint()
 
 fn = f'{TESTNAME}_{N}_{D}.txt'
 with open(fn, 'w') as f:

@@ -1,175 +1,238 @@
 import torch
+import random
+from einops import rearrange
+from typing import Optional, Tuple, Union
+import torch
 from tqdm import trange
 import numpy as np
 import sys
+from einops import rearrange, repeat
 import math
 
-# pip install "grouped-query-attention-pytorch @ git+ssh://git@github.com/fkodom/grouped-query-attention-pytorch.git"
-from grouped_query_attention_pytorch.attention import scaled_dot_product_gqa
 
 # only generate a single batch/head of data, which makes file loading much faster.
 # it does mean we'll have to check batch/head behavior separately later, but that should be much easier to debug.
-B = 1
-N = int(sys.argv[1])
-D = int(sys.argv[2])
+B = 4
+H = 32
+N = 1024
+D = 128 
 
-H_QO = int(sys.argv[3])
-H_KV = int(sys.argv[4])
+Q_LEN = 10
+L_NEW = 3
 
-causal = False
 
-torch.random.manual_seed(42)
-q = (torch.randn((B, H_QO, N, D), dtype=torch.bfloat16, device='cuda')).requires_grad_()
-k = (torch.randn((B, H_KV, N, D), dtype=torch.bfloat16, device='cuda')).requires_grad_()
-v = (torch.randn((B, H_KV, N, D), dtype=torch.bfloat16, device='cuda')).requires_grad_()
-grad_output = (torch.randn((B, H_QO, N, D), dtype=torch.bfloat16, device='cuda'))
+TESTNAME = sys.argv[1]
+dtype=torch.bfloat16
+if TESTNAME == 'ones':
 
-# pad seqlen to multiple of 128
-o, _ = scaled_dot_product_gqa(
-    q.permute(0, 2, 1, 3).contiguous(),
-    k.permute(0, 2, 1, 3).contiguous(),
-    v.permute(0, 2, 1, 3).contiguous(),
-    is_causal=causal,
-    need_weights=False,
-)
-o = o.permute(0, 2, 1, 3).contiguous()
+    q = torch.ones(B, Q_LEN, H, D, device="cuda", dtype=dtype)
+    k_cache = torch.ones(B, N, H, D, device="cuda", dtype=dtype)
+    v_cache = torch.ones(B, N, H, D, device="cuda", dtype=dtype)
+    k_seqlens = torch.randint(1, N-20, (B,), device="cuda").int()
 
-##########################################
-### EXACT GQA COMPUTATION FROM LLAMA 3 ###
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    for i in range(B):
+        k_cache[i, k_seqlens[i]:] = 0
+        v_cache[i, k_seqlens[i]:] = 0
+
+    k_new = torch.ones(B, L_NEW, H, D, device="cuda", dtype=dtype)
+    v_new = torch.ones(B, L_NEW, H, D, device="cuda", dtype=dtype)
+
+else:
+    print('Invalid test name')
+    sys.exit(0)
+
+
+#########
+
+# the reference PyTorch implementation, written out by hand
+def mha_fwd_kvcache_torch(
+    q: torch.Tensor,         # batch_size x seqlen_q x num_heads x head_size
+    k_cache: torch.Tensor,   # batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+    v_cache: torch.Tensor,   # batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+    k: Optional[torch.Tensor] = None, # batch_size x seqlen_knew x num_heads_k x head_size
+    v: Optional[torch.Tensor] = None, # batch_size x seqlen_knew x num_heads_k x head_size
+    seqlens_k: Optional[torch.Tensor] = None, # batch_size
+    rotary_cos: Optional[torch.Tensor] = None, # seqlen_ro x (rotary_dim / 2)
+    rotary_sin: Optional[torch.Tensor] = None, # seqlen_ro x (rotary_dim / 2)     
+    cache_batch_idx: Optional[torch.Tensor] = None, # indices to index into the KV cache
+    leftpad_k: Optional[torch.Tensor] = None, # batch_size
+    block_table: Optional[torch.Tensor] = None, # batch_size x max_num_blocks_per_seq
+    alibi_slopes: Optional[torch.Tensor] = None, # num_heads or batch_size x num_heads
+    out: Optional[torch.Tensor] = None, # batch_size x seqlen_q x num_heads x head_size
+    softmax_scale: Optional[float] = None,
+    is_causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    is_rotary_interleaved: bool = True,
+    num_splits: int = 0,
+) -> torch.Tensor:
+    assert alibi_slopes is None, "alibi_slopes not supported"
+    if out is None:
+        out = torch.empty_like(q)
+    
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    if seqlens_k is not None and isinstance(seqlens_k, int):
+        seqlens_k = torch.full(
+            (k_cache.shape[0],), seqlens_k, dtype=torch.int32, device=k_cache.device
+        )
+
+    seqlen_knew = k.shape[1] if k is not None else 0
+
+    if block_table is not None:
+        assert False, "paged KV cache not supported"
+        # TODO: paged KV cache
+        pass
+    else:
+        if cache_batch_idx is None:
+            cache_batch_idx = torch.arange(k_cache.shape[0], device=k_cache.device).long()
+
+        # concatenate k and v with k_cache and v_cache using cache_batch_idx
+        if k is not None:
+            assert v is not None
+            assert seqlens_k is not None
+            
+            if leftpad_k is not None:
+                assert False, "left pad k not supported"
+                # Create offset indices for the cache
+                offset = leftpad_k + seqlens_k  # [batch_size]
+                # Create indices for the new sequence length
+                seq_idx = torch.arange(k.shape[1], device=k.device)  # [seqlen_knew]
+                # Broadcast to create all indices: [batch_size, seqlen_knew]
+                indices = (offset.unsqueeze(1) + seq_idx.unsqueeze(0)).long()
+                # Update cache using advanced indexing
+                k_cache[cache_batch_idx[:, None], indices] = k
+                v_cache[cache_batch_idx[:, None], indices] = v
+            else:
+                # Similar to above but without leftpad_k
+                offset = seqlens_k  # [batch_size]
+                seq_idx = torch.arange(k.shape[1], device=k.device)  # [seqlen_knew]
+                indices = (offset.unsqueeze(1) + seq_idx.unsqueeze(0)).long()  # [batch_size, seqlen_knew]
+                k_cache[cache_batch_idx[:, None], indices] = k
+                v_cache[cache_batch_idx[:, None], indices] = v
+        else:
+            offset = seqlens_k
+
+    # apply rotary embedding if rotary_cos and rotary_sin are passed in
+    if rotary_cos is not None and rotary_sin is not None:
+        assert False, "rotary embedding not supported"
+        if is_rotary_interleaved:
+            pass
+        else:
+            pass
+
+    if block_table is not None:
+        pass
+    else:
+
+        # For each batch item, we need to only attend up to its sequence length
+        seqlen_total = seqlens_k + seqlen_knew if k is not None else seqlens_k
+        # Create a mask for valid positions based on sequence lengths
+        batch_size = q.shape[0]
+        valid_mask = torch.arange(k_cache[cache_batch_idx].shape[1], device=q.device)[None, :] < seqlen_total[:, None]  # [batch_size, seqlen_k]
+        valid_mask = valid_mask.view(batch_size, 1, 1, -1)  # [batch_size, 1, 1, seqlen_k]
+
+        # compute attention scores
+        att = (
+            # b, h, l_q, d @ b, h, d, l_k -> b, h, l_q, l_k
+            q.transpose(1, 2) @ k_cache[cache_batch_idx].permute(0, 2, 3, 1)
+        ) * softmax_scale
+
+        if softcap > 0:
+            att = att / softcap
+            att = att.tanh()
+            att = att * softcap
+
+        # Mask out padding tokens
+        if seqlens_k is not None:
+            att = att.masked_fill(~valid_mask, float('-inf'))
+
+        # apply causal mask if needed
+        if is_causal:
+            q_idx = torch.arange(q.size(1), device=q.device)
+            k_idx = torch.arange(k_cache.shape[1], device=q.device)
+            mask = k_idx[None, None, :] <= (q_idx[None, :, None] + (seqlen_total.view(-1, 1, 1) - q.size(1)))  # [batch_size, seqlen_q, seqlen_k]
+            mask = mask.view(batch_size, 1, q.size(1), k_cache.shape[1])
+            att = att.masked_fill(~mask, float('-inf'))
+
+        # apply sliding window if specified
+        if window_size_left != -1 or window_size_right != -1:
+            assert False, "sliding window not supported"
+            # This is Claude, NOT TESTED!
+            q_idx = torch.arange(q.size(1), device=q.device)
+            k_idx = torch.arange(seqlen_total, device=q.device)
+            
+            # Calculate relative positions
+            relative_pos = k_idx[None, :] - (q_idx[:, None] + (seqlen_total - q.size(1)))
+            
+            # Create window mask
+            window_mask = (relative_pos >= -window_size_left) & (relative_pos <= window_size_right)
+            window_mask = window_mask.view(1, 1, q.size(1), seqlen_total)
+            att = att.masked_fill(~window_mask, float('-inf'))
+
+        # apply softmax
+        att = torch.softmax(att, dim=-1)
+
+        # compute output
+        out = (
+            # b, h, l_q, l_k @ b, h, l_k, d -> b, h, l_q, d
+            att @ v_cache[cache_batch_idx].permute(0, 2, 1, 3)
+        ).transpose(1, 2).contiguous()
+    
+    return out
+
+#########
+
+out_torch = mha_fwd_kvcache_torch(
+        q, 
+        k_cache, v_cache, 
+        k = k_new, v = v_new, 
+        seqlens_k = k_seqlens, 
+        is_causal=True
     )
 
+breakpoint()
 
-keys_l = repeat_kv(k.permute(0, 2, 1, 3), H_QO // H_KV).permute(0, 2, 1, 3)
-values_l = repeat_kv(v.permute(0, 2, 1, 3), H_QO // H_KV).permute(0, 2, 1, 3)
+fn = f'{TESTNAME}_{N}_{D}.txt'
+with open(fn, 'w') as f:
 
-scores = torch.matmul(q, keys_l.transpose(2, 3)) / math.sqrt(D)
-
-mask = torch.full((N, N), float('-inf'), device=q.device, dtype=q.dtype)
-mask = torch.triu(mask, diagonal=1)
-if mask is not None and causal:
-    scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-scores = torch.nn.functional.softmax(scores, dim=-1).type_as(q)
-output = torch.matmul(scores, values_l)  # (bs, n_local_heads, seqlen, head_dim)
-### EXACT GQA COMPUTATION FROM LLAMA 3 ###
-##########################################
-
-# now do backwards computations
-o.backward(grad_output)
-
-q_grad = q.grad
-k_grad = k.grad
-v_grad = v.grad
-    
-softmax_scale = 1 / math.sqrt(D)
-l_vec = torch.empty((B, H_QO, N, N), dtype=torch.bfloat16, device=q.device)
-
-for i in range(H_QO):
-    group_idx = i // (H_QO // H_KV)
-    l_vec[:, i] = torch.einsum("bnd,bmd->bnm", q[:, i], k[:, group_idx]) * softmax_scale
-
-mask = torch.triu(torch.ones(N, N), diagonal=1).to('cuda').bool().unsqueeze(0).unsqueeze(0).expand(B, H_QO, -1, -1)
-if causal:
-    l_vec = l_vec.masked_fill(mask, float('-inf'))
-
-max_vec = l_vec.max(dim=-1, keepdim=True).values
-l_vec = l_vec - max_vec
-l_vec = torch.exp(l_vec)
-l_vec_sum = l_vec.sum(dim=-1, keepdim=True)
-l_vec = max_vec + torch.log(l_vec_sum)
-
-d_vec = torch.mul(o.to(torch.bfloat16), grad_output.to(torch.bfloat16))
-d_vec = d_vec.to(torch.bfloat16).sum(dim=-1, keepdim=True)
-
-
-print("--------------------------------------")
-print("Q shape: ",      q.shape)
-print("K shape: ",      k.shape)
-print("V shape: ",      v.shape)
-print("O shape: ",      o.shape)
-print("Q grad shape: ", q_grad.shape)
-print("K grad shape: ", k_grad.shape)
-print("V grad shape: ", v_grad.shape)
-print("L shape: ",      l_vec.shape)
-print("D shape: ",      d_vec.shape)
-print("--------------------------------------")
-
-# print out avg magnitude of output tensor
-print(f'Average magnitude of OUTPUT tensor: {o.abs().mean()}')
-print(f'1/100 magnitude of OUTPUT tensor:   {o.abs().mean()/100}')
-print(f'Average magnitude of Q_GRAD tensor: {q_grad.abs().mean()}')
-print(f'1/100 magnitude of Q_GRAD tensor:   {q_grad.abs().mean()/100}')
-print(f'Average magnitude of K_GRAD tensor: {k_grad.abs().mean()}')
-print(f'1/100 magnitude of K_GRAD tensor:   {k_grad.abs().mean()/100}')
-print(f'Average magnitude of V_GRAD tensor: {v_grad.abs().mean()}')
-print(f'1/100 magnitude of V_GRAD tensor:   {v_grad.abs().mean()/100}')
-print(f'Average magnitude of L tensor:      {l_vec.abs().mean()}')
-print(f'1/100 magnitude of L tensor:        {l_vec.abs().mean()/100}')
-print(f'Average magnitude of D tensor:      {d_vec.abs().mean()}')
-print(f'1/100 magnitude of D tensor:        {d_vec.abs().mean()/100}')
-print("--------------------------------------")
-
-filename = f'randn_{N}N_{D}D_{H_QO}QO_{H_KV}KV'
-
-if causal:
-    filename += '_causal'
-if H_QO != H_KV:
-    filename += '_gqa'
-
-filename += '.txt'
-
-with open(filename, 'w') as f:
     # inputs
-    qf = q.to(torch.float32).flatten().detach().cpu().numpy()
-    kf = k.to(torch.float32).flatten().detach().cpu().numpy()
-    vf = v.to(torch.float32).flatten().detach().cpu().numpy()
-    of = o.to(torch.float32).flatten().detach().cpu().numpy()
+    qf = q.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy() 
+    k_cachef = k_cache.to(torch.float32).flatten().detach().cpu().numpy()
+    v_cachef = v_cache.to(torch.float32).flatten().detach().cpu().numpy()
+    k_newf = k_new.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy()
+    v_newf = v_new.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy()
+    k_seqlensf = k_seqlens.to(torch.float32).detach().cpu().numpy()
+    outf = out_torch.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy()
     
-    og_f = grad_output.to(torch.float32).flatten().detach().cpu().numpy()
+    for i in trange(qf.shape[0]):
+        f.write(repr(qf[i]))
+        f.write(' ')
+    for i in trange(k_cachef.shape[0]):
+        f.write(repr(k_cache[i]))
+        f.write(' ')
+    for i in trange(v_cachef.shape[0]):
+        f.write(repr(v_cache[i]))
+        f.write(' ')
+    for i in trange(k_newf.shape[0]):
+        f.write(repr(k_new[i]))
+        f.write(' ')
+    for i in trange(v_newf.shape[0]):
+        f.write(repr(v_new[i]))
+        f.write(' ')
+    for i in trange(k_seqlensf.shape[0]):
+        f.write(repr(k_seqlens[i]))
+        f.write(' ')
+
+    # output
+    for i in trange(outf.shape[0]):
+        f.write(repr(outf[i]))
+        f.write(' ')
+
+    print('Done!')
+
+
     
-    # intermediate
-    l_vecf = l_vec.to(torch.float32).flatten().detach().cpu().numpy()
-    d_vecf = d_vec.to(torch.float32).flatten().detach().cpu().numpy()
+
     
-    qg_f = q_grad.to(torch.float32).flatten().detach().cpu().numpy()
-    kg_f = k_grad.to(torch.float32).flatten().detach().cpu().numpy()
-    vg_f = v_grad.to(torch.float32).flatten().detach().cpu().numpy()
-    
-    for i in trange(q.shape[0] * q.shape[1] * q.shape[2] * q.shape[3]):
-        f.write(repr(float(qf[i])))
-        f.write(' ')
-    for i in trange(k.shape[0] * k.shape[1] * k.shape[2] * k.shape[3]):
-        f.write(repr(float(kf[i])))
-        f.write(' ')
-    for i in trange(v.shape[0] * v.shape[1] * v.shape[2] * v.shape[3]):
-        f.write(repr(float(vf[i])))
-        f.write(' ')
-    for i in trange(o.shape[0] * o.shape[1] * o.shape[2] * o.shape[3]):
-        f.write(repr(float(of[i])))
-        f.write(' ')
-    for i in trange(l_vec.shape[0] * l_vec.shape[1] * l_vec.shape[2]):
-        f.write(repr(float(l_vecf[i])))
-        f.write(' ')
-    for i in trange(d_vec.shape[0] * d_vec.shape[1] * d_vec.shape[2]):
-        f.write(repr(float(d_vecf[i])))
-        f.write(' ')
-    for i in trange(grad_output.shape[0] * grad_output.shape[1] * grad_output.shape[2] * grad_output.shape[3]):
-        f.write(repr(float(og_f[i])))
-        f.write(' ')
-    for i in trange(q_grad.shape[0] * q_grad.shape[1] * q_grad.shape[2] * q_grad.shape[3]):
-        f.write(repr(float(qg_f[i])))
-        f.write(' ')
-    for i in trange(k_grad.shape[0] * k_grad.shape[1] * k_grad.shape[2] * k_grad.shape[3]):
-        f.write(repr(float(kg_f[i])))
-        f.write(' ')
-    for i in trange(v_grad.shape[0] * v_grad.shape[1] * v_grad.shape[2] * v_grad.shape[3]):
-        f.write(repr(float(vg_f[i])))
-        f.write(' ')

@@ -192,16 +192,19 @@ out_torch = mha_fwd_kvcache_torch(
         is_causal=True
     )
 
+breakpoint()
+
 fn = f'{TESTNAME}_{N}_{D}.txt'
 with open(fn, 'w') as f:
-    
+
     # inputs
     qf = q.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy() 
     k_cachef = k_cache.to(torch.float32).flatten().detach().cpu().numpy()
-    v_cache f= v_cache.to(torch.float32).flatten().detach().cpu().numpy()
+    v_cachef = v_cache.to(torch.float32).flatten().detach().cpu().numpy()
     k_newf = k_new.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy()
     v_newf = v_new.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy()
     k_seqlensf = k_seqlens.to(torch.float32).detach().cpu().numpy()
+    outf = out_torch.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy()
     
     for i in trange(qf.shape[0]):
         f.write(repr(qf[i]))
@@ -222,6 +225,10 @@ with open(fn, 'w') as f:
         f.write(repr(k_seqlens[i]))
         f.write(' ')
 
+    # output
+    for i in trange(outf.shape[0]):
+        f.write(repr(outf[i]))
+        f.write(' ')
 
     print('Done!')
 

@@ -11,17 +11,11 @@ using namespace kittens;
 namespace cg = cooperative_groups;
 
 template<int D> struct fwd_attend_ker_tile_dims {};
-template<> struct fwd_attend_ker_tile_dims<64> {
-    constexpr static int tile_width = (64);
-    constexpr static int qo_height  = (4*16);
-    constexpr static int kv_height  = (8*16);
-    constexpr static int stages     = (4); 
-};
 template<> struct fwd_attend_ker_tile_dims<128> {
     constexpr static int tile_width = (128);
     constexpr static int qo_height  = (4*16);
     constexpr static int kv_height  = (8*16);
-    constexpr static int stages     = (2); 
+    constexpr static int stages     = (2);
 };
 
 template<int D> struct fwd_globals {
@@ -100,7 +94,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
     int pipe_idx = K::stages - 1; 
     
     if(warpgroupid == NUM_WARPGROUPS-1) {
-        warpgroup::decrease_registers<32>();      
+        warpgroup::decrease_registers<32>();     
         
         int kv_iters; 
         if constexpr (is_causal) {
@@ -186,12 +180,12 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             sub_row(att_block, att_block, max_vec_scaled);
             exp2(att_block, att_block);
             sub(max_vec_last_scaled, max_vec_last_scaled, max_vec_scaled);
-            exp2(max_vec_last_scaled,       max_vec_last_scaled);
-            mul(norm_vec,            norm_vec,     max_vec_last_scaled);
-            row_sum(norm_vec,  att_block, norm_vec);
+            exp2(max_vec_last_scaled, max_vec_last_scaled);
+            mul(norm_vec, norm_vec, max_vec_last_scaled);
+            row_sum(norm_vec, att_block, norm_vec);
             add(att_block, att_block, 0.f);
-            copy(att_block_mma, att_block); 
-            mul_row(o_reg, o_reg, max_vec_last_scaled); 
+            copy(att_block_mma, att_block);
+            mul_row(o_reg, o_reg, max_vec_last_scaled);
 
             wait(v_smem_arrived[(kv_idx)%K::stages], (kv_idx/K::stages)%2); 
 
@@ -211,7 +205,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
         }
 
         warpgroup::sync(warpgroupid+4);
-        
+
         tma::store_async_wait();
     }
 }

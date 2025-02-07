@@ -17,7 +17,10 @@ __global__ void attend_ker(
     int* k_seqlens,                         // KCache sequence length
     int k_new_seqlen,                       // KNew sequence length
     bool causal,                            // causal attention flag
-    int* cache_batch_idx                    // cache batch indices
+    int* cache_batch_idx,                   // cache batch indices
+    int* block_table,                       // block table: batch_size x max_num_blocks_per_seq
+    int page_block_size,                    // size of pages in paged cache
+    int max_num_blocks_per_seq              // maximum number of blocks per sequence
 ) {
     auto ZERO = kittens::base_types::constants<bf16>::zero();
     auto NEG_INF = kittens::base_types::constants<bf16>::neg_infty();
@@ -79,8 +82,13 @@ __global__ void attend_ker(
 
     int tic = 0;
 
-    auto k_coords = (SEQ_AXIS == 2 ? coord{kv_batch, head, loadid, 0} : coord{kv_batch, loadid, head, 0});
-    auto v_coords = (SEQ_AXIS == 2 ? coord{kv_batch, head, loadid, 0} : coord{kv_batch, loadid, head, 0});
+    // this part changes now!
+    // auto k_coords = (SEQ_AXIS == 2 ? coord{kv_batch, head, loadid, 0} : coord{kv_batch, loadid, head, 0});
+    // auto v_coords = (SEQ_AXIS == 2 ? coord{kv_batch, head, loadid, 0} : coord{kv_batch, loadid, head, 0});
+
+    int block_id = cache_batch_idx[q_batch * max_num_blocks_per_seq];
+    auto k_coords = coord{block_id, loadid, head, 0};
+    auto v_coords = coord{block_id, loadid, head, 0};
 
     if (kv_blocks > 0 && loadid * ROWS<D> < k_seqlen) {
         auto n_rows = loadid * ROWS<D> < k_seqlen ? ROWS<D> : k_seqlen - loadid * ROWS<D>;
@@ -88,6 +96,7 @@ __global__ void attend_ker(
         load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(k_smem[loadid][0], g.KCacheg, k_coords, n_rows, NEG_INF);
         load_group::load_async<shared_tile<D>, global_layout<D>, SEQ_AXIS>(v_smem[loadid][0], g.VCacheg, v_coords, n_rows, ZERO);
     } else if (k_new_seqlen > 0 && loadid * ROWS<D> < k_new_seqlen) {
+        // this part stays the same for paging
         auto next_coords = (SEQ_AXIS == 2 ? coord{q_batch, head, loadid, 0} : coord{q_batch, loadid, head, 0});
         auto n_rows = loadid * ROWS<D> < k_new_seqlen ? ROWS<D> : k_new_seqlen - loadid * ROWS<D>;
 
@@ -112,7 +121,14 @@ __global__ void attend_ker(
             // every two workers are working together to load the next tiles, then broadcast to all workers
             // we need to load the next times for all workers, and then skip selectively in the individual worker
             int next_tic = (tic+1)%3;
-            auto next_coords = (SEQ_AXIS == 2 ? coord{kv_batch, head, next_load_idx, 0} : coord{kv_batch, next_load_idx, head, 0});
+
+            // this changes now!
+            int page_idx = next_load_idx / page_block_size;
+            block_id = block_table[q_batch * max_num_blocks_per_seq + page_idx];
+            int block_offset = next_load_idx % page_block_size;
+
+            // index into the new block
+            auto next_coords = coord{block_id, block_offset, head, 0};
 
             auto n_rows = (next_load_idx + 1) * ROWS<D> > k_seqlen ? k_seqlen - (next_load_idx + 1) * ROWS<D> : ROWS<D>;
 
@@ -209,6 +225,8 @@ __global__ void attend_ker(
         store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.Og, qo_smem[workerid], q_out_coords, n_rows);
 
         if (k_new_seqlen > 0) {
+            // this part is not supported for paging yet!
+
             // TODO(danfu): this needs to be fixed for when k_seqlen % 32 != 0
             int kv_blocks_orig = (k_seqlen + ROWS<D> - 1) / ROWS<D>;
             auto kv_cache_coords = (SEQ_AXIS == 2 ? coord{kv_batch, head, kv_blocks_orig + q_seq, 0} : coord{kv_batch, kv_blocks_orig + q_seq, head, 0});

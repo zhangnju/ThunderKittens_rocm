@@ -10,46 +10,40 @@ from einops import rearrange, repeat
 import math
 
 
-# only generate a single batch/head of data, which makes file loading much faster.
-# it does mean we'll have to check batch/head behavior separately later, but that should be much easier to debug.
-B = 32
+B = 4
 H = 4
 N = 768
 D = 128 
 
+# Q_LEN = 10
+# L_NEW = 3
 Q_LEN = 1
 L_NEW = 1
 
 
-TESTNAME = sys.argv[1]
 dtype=torch.bfloat16
-if TESTNAME == 'randn':
-    q         = torch.randn(B, Q_LEN, H, D,  device="cuda", dtype=dtype)
-    k_cache   = torch.randn(B, N, H, D,      device="cuda", dtype=dtype)
-    v_cache   = torch.randn(B, N, H, D,      device="cuda", dtype=dtype)
-    k_seqlens = torch.randint(1, N-20, (B,), device="cuda").int()
 
-    for i in range(B):
-        k_cache[i, k_seqlens[i]:] = 0
-        v_cache[i, k_seqlens[i]:] = 0
+q         = torch.randn(B, Q_LEN, H, D, device="cuda", dtype=dtype)
+k_cache   = torch.randn(B, N, H, D, device="cuda", dtype=dtype)
+v_cache   = torch.randn(B, N, H, D, device="cuda", dtype=dtype)
+k_seqlens = torch.randint(1, N-20, (B,), device="cuda").int()
 
-    k_new = torch.randn(B, L_NEW, H, D, device="cuda", dtype=dtype)
-    v_new = torch.randn(B, L_NEW, H, D, device="cuda", dtype=dtype)
+for i in range(B):
+    k_cache[i, k_seqlens[i]:] = 0
+    v_cache[i, k_seqlens[i]:] = 0
 
-else:
-    print('Invalid test name')
-    sys.exit(0)
-
+k_new = torch.randn(B, L_NEW, H, D, device="cuda", dtype=dtype)
+v_new = torch.randn(B, L_NEW, H, D, device="cuda", dtype=dtype)
 
 #########
-# the reference PyTorch implementation, written out by hand
 
+# the reference PyTorch implementation, written out by hand
 def mha_fwd_kvcache_torch(
-    q: torch.Tensor,                                # batch_size x seqlen_q x num_heads x head_size
-    k_cache: torch.Tensor,                          # batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-    v_cache: torch.Tensor,                          # batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-    k: Optional[torch.Tensor] = None,               # batch_size x seqlen_knew x num_heads_k x head_size
-    v: Optional[torch.Tensor] = None,               # batch_size x seqlen_knew x num_heads_k x head_size
+    q: torch.Tensor,                                # batch_size   x seqlen_q    x num_heads   x head_size
+    k_cache: torch.Tensor,                          # batch_size_c x seqlen_k    x num_heads_k x head_size OR num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+    v_cache: torch.Tensor,                          # batch_size_c x seqlen_k    x num_heads_k x head_size OR num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+    k: Optional[torch.Tensor] = None,               # batch_size   x seqlen_knew x num_heads_k x head_size
+    v: Optional[torch.Tensor] = None,               # batch_size   x seqlen_knew x num_heads_k x head_size
     seqlens_k: Optional[torch.Tensor] = None,       # batch_size
     rotary_cos: Optional[torch.Tensor] = None,      # seqlen_ro x (rotary_dim / 2)
     rotary_sin: Optional[torch.Tensor] = None,      # seqlen_ro x (rotary_dim / 2)     
@@ -64,16 +58,14 @@ def mha_fwd_kvcache_torch(
     window_size_right: int = -1,
     softcap: float = 0.0,
     is_rotary_interleaved: bool = True,
-    num_splits: int = 0) -> torch.Tensor:
-    
+    num_splits: int = 0,
+) -> torch.Tensor:
     assert alibi_slopes is None, "alibi_slopes not supported"
-    
     if out is None:
         out = torch.empty_like(q)
     
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
-    
     if seqlens_k is not None and isinstance(seqlens_k, int):
         seqlens_k = torch.full(
             (k_cache.shape[0],), seqlens_k, dtype=torch.int32, device=k_cache.device
@@ -126,6 +118,7 @@ def mha_fwd_kvcache_torch(
     if block_table is not None:
         pass
     else:
+
         # For each batch item, we need to only attend up to its sequence length
         seqlen_total = seqlens_k + seqlen_knew if k is not None else seqlens_k
         # Create a mask for valid positions based on sequence lengths
@@ -139,10 +132,10 @@ def mha_fwd_kvcache_torch(
             q.transpose(1, 2) @ k_cache[cache_batch_idx].permute(0, 2, 3, 1)
         ) * softmax_scale
 
-        # if softcap > 0:
-        #     att = att / softcap
-        #     att = att.tanh()
-        #     att = att * softcap
+        if softcap > 0:
+            att = att / softcap
+            att = att.tanh()
+            att = att * softcap
 
         # Mask out padding tokens
         if seqlens_k is not None:
@@ -156,20 +149,20 @@ def mha_fwd_kvcache_torch(
             mask = mask.view(batch_size, 1, q.size(1), k_cache.shape[1])
             att = att.masked_fill(~mask, float('-inf'))
 
-        # # apply sliding window if specified
-        # if window_size_left != -1 or window_size_right != -1:
-        #     assert False, "sliding window not supported"
-        #     # This is Claude, NOT TESTED!
-        #     q_idx = torch.arange(q.size(1), device=q.device)
-        #     k_idx = torch.arange(seqlen_total, device=q.device)
+        # apply sliding window if specified
+        if window_size_left != -1 or window_size_right != -1:
+            assert False, "sliding window not supported"
+            # This is Claude, NOT TESTED!
+            q_idx = torch.arange(q.size(1), device=q.device)
+            k_idx = torch.arange(seqlen_total, device=q.device)
             
-        #     # Calculate relative positions
-        #     relative_pos = k_idx[None, :] - (q_idx[:, None] + (seqlen_total - q.size(1)))
+            # Calculate relative positions
+            relative_pos = k_idx[None, :] - (q_idx[:, None] + (seqlen_total - q.size(1)))
             
-        #     # Create window mask
-        #     window_mask = (relative_pos >= -window_size_left) & (relative_pos <= window_size_right)
-        #     window_mask = window_mask.view(1, 1, q.size(1), seqlen_total)
-        #     att = att.masked_fill(~window_mask, float('-inf'))
+            # Create window mask
+            window_mask = (relative_pos >= -window_size_left) & (relative_pos <= window_size_right)
+            window_mask = window_mask.view(1, 1, q.size(1), seqlen_total)
+            att = att.masked_fill(~window_mask, float('-inf'))
 
         # apply softmax
         att = torch.softmax(att, dim=-1)
@@ -184,20 +177,23 @@ def mha_fwd_kvcache_torch(
 
 #########
 
-out_torch = mha_fwd_kvcache_torch(q, k_cache, v_cache, k=k_new, v=v_new, 
-                                  seqlens_k=k_seqlens, is_causal=True)
+out_torch = mha_fwd_kvcache_torch(
+        q, 
+        k_cache, v_cache, 
+        k = k_new, v = v_new, 
+        seqlens_k = k_seqlens, 
+        is_causal=True
+    )
 
-fn = f'{TESTNAME}_{N}_{D}.txt'
+fn = f'{B}_{H}_{N}_{D}_cache_Q_{Q_LEN}_KV_{L_NEW}.txt'
 with open(fn, 'w') as f:
-    # inputs
+
     qf         = q.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy() 
     k_cachef   = k_cache.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy()
     v_cachef   = v_cache.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy()
-    
     k_newf     = k_new.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy()
     v_newf     = v_new.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy()
     k_seqlensf = k_seqlens.to(torch.float32).detach().cpu().numpy()
-    
     outf       = out_torch.transpose(1,2).to(torch.float32).flatten().detach().cpu().numpy()
     
     for i in trange(qf.shape[0]):

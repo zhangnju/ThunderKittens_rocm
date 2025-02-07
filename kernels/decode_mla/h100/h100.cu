@@ -2,7 +2,7 @@
 #include <cooperative_groups.h>
 #include <iostream>
 
-constexpr int CONSUMER_WARPGROUPS = (3); 
+constexpr int CONSUMER_WARPGROUPS = (1); 
 constexpr int PRODUCER_WARPGROUPS = (1); 
 constexpr int NUM_WARPGROUPS      = (CONSUMER_WARPGROUPS+PRODUCER_WARPGROUPS); 
 constexpr int NUM_WORKERS         = (NUM_WARPGROUPS*kittens::WARPGROUP_WARPS); 
@@ -10,14 +10,15 @@ constexpr int NUM_WORKERS         = (NUM_WARPGROUPS*kittens::WARPGROUP_WARPS);
 using namespace kittens;
 namespace cg = cooperative_groups;
 
-template<int D> struct fwd_attend_ker_tile_dims {};
-template<> struct fwd_attend_ker_tile_dims<128> {
-    constexpr static int tile_width = (128);
+template<int D> struct mla_decode_tile_dims {};
+template<> struct mla_decode_tile_dims<576> {
+    constexpr static int tile_width_dl = (512);
+    constexpr static int tile_width_dr = (64); 
 
     constexpr static int new_height   = (16);
     constexpr static int cache_height = (8*16);
 
-    constexpr static int stages     = (2);
+    constexpr static int stages     = (1);
 
     constexpr static int kv_blocks  = stages;
     constexpr static int kv_split   = cache_height * kv_blocks;
@@ -27,28 +28,22 @@ template<int D> struct fwd_globals {
     using q_tile         = st_bf<fwd_attend_ker_tile_dims<D>::new_height,   fwd_attend_ker_tile_dims<D>::tile_width>;
     using k_cache_tile   = st_bf<fwd_attend_ker_tile_dims<D>::cache_height, fwd_attend_ker_tile_dims<D>::tile_width>;
     using v_cache_tile   = st_bf<fwd_attend_ker_tile_dims<D>::cache_height, fwd_attend_ker_tile_dims<D>::tile_width>;
-    using k_new_tile     = st_bf<fwd_attend_ker_tile_dims<D>::new_height,   fwd_attend_ker_tile_dims<D>::tile_width>;
-    using v_new_tile     = st_bf<fwd_attend_ker_tile_dims<D>::new_height,   fwd_attend_ker_tile_dims<D>::tile_width>;
     using k_seqlens_tile = st_bf<fwd_attend_ker_tile_dims<D>::new_height,   fwd_attend_ker_tile_dims<D>::tile_width>;
     using o_tile         = st_bf<fwd_attend_ker_tile_dims<D>::new_height,   fwd_attend_ker_tile_dims<D>::tile_width>;
 
     using q_gl         = gl<bf16, -1, -1, -1, -1, q_tile>;
     using k_cache_gl   = gl<bf16, -1, -1, -1, -1, k_cache_tile>;
     using v_cache_gl   = gl<bf16, -1, -1, -1, -1, v_cache_tile>;
-    using k_new_gl     = gl<bf16, -1, -1, -1, -1, k_new_tile>;
-    using v_new_gl     = gl<bf16, -1, -1, -1, -1, v_new_tile>;
     using k_seqlens_gl = gl<bf16, -1, -1, -1, -1, k_seqlens_tile>;
     using o_gl         = gl<bf16, -1, -1, -1, -1, o_tile>;
 
     q_gl         q;
     k_cache_gl   k_cache;
     v_cache_gl   v_cache;
-    k_new_gl     k_new;
-    v_new_gl     v_new;
     k_seqlens_gl k_seqlens;
     o_gl         o;
 
-    const int N; 
+    const int N;
     const int hr;
 };
 
@@ -73,18 +68,18 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
     auto   (*o_smem)                      = reinterpret_cast<o_tile(*)>(q_smem);
 
     int kv_head_idx       = blockIdx.y / g.hr;
-    int global_kv_seq_idx = blockIdx.x * K::kv_blocks; 
+    int global_kv_seq_idx = blockIdx.x * K::kv_blocks;
 
     auto ZERO    = kittens::base_types::constants<bf16>::zero();
     auto NEG_INF = kittens::base_types::constants<bf16>::neg_infty();
 
     __shared__ kittens::semaphore qsmem_semaphore, k_smem_arrived[K::stages], v_smem_arrived[K::stages], compute_done[K::stages];
     if (threadIdx.x == 0) { 
-        init_semaphore(qsmem_semaphore, 0, 1); 
+        init_semaphore(qsmem_semaphore, 0, 1);
         for(int j = 0; j < K::stages; j++) {
-            init_semaphore(k_smem_arrived[j], 0, 1); 
-            init_semaphore(v_smem_arrived[j], 0, 1); 
-            init_semaphore(compute_done[j], CONSUMER_WARPGROUPS, 0); 
+            init_semaphore(k_smem_arrived[j], 0, 1);
+            init_semaphore(v_smem_arrived[j], 0, 1);
+            init_semaphore(compute_done[j], CONSUMER_WARPGROUPS, 0);
         }
 
         tma::expect_bytes(qsmem_semaphore, sizeof(q_smem));
@@ -105,10 +100,10 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
     }
     __syncthreads();
 
-    int pipe_idx = seq_idx + K::stages - 1; 
+    int pipe_idx = seq_idx + K::stages - 1;
     
     if(warpgroupid == NUM_WARPGROUPS-1) {
-        warpgroup::decrease_registers<32>(); 
+        warpgroup::decrease_registers<32>();
         
         int kv_iters; 
         if constexpr (is_causal) {

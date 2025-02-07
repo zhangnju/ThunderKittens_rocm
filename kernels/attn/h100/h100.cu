@@ -448,6 +448,7 @@ compute_bwd_loop(
     warpgroup::mma_AB(kg_reg, ds_block_t_mma, q_smem[tic]);
     warpgroup::mma_commit_group();
     warpgroup::mma_async_wait();
+    
     group<8>::sync(10); 
 }
 

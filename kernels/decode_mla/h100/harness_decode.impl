@@ -3,14 +3,34 @@
 #include <string>
 #include <fstream>
 
-constexpr int ATTN_B = 1;
-constexpr int ATTN_H = 1;
-constexpr int ATTN_N = 1024;
-constexpr int ATTN_D = 128; // hardcoded into this kernel
-constexpr int ITER   = 10;
+// constexpr int ATTN_B = 1;
+// constexpr int ATTN_H = 1;
+// constexpr int ATTN_N = 1024;
+// constexpr int ATTN_D = 128; // hardcoded into this kernel
+// constexpr int ITER   = 10;
 
-constexpr int Q_LEN = 1;
-constexpr int L_NEW = 1;
+// constexpr int Q_LEN = 1;
+// constexpr int L_NEW = 1;
+
+constexpr int ATTN_B = 4;
+constexpr int ATTN_R = 0; 
+constexpr int ATTN_H = 16; 
+
+constexpr int ATTN_Z  = 576;
+constexpr int ATTN_Zc = 512;
+constexpr int ATTN_Zr = 64;
+
+constexpr int L = ATTN_B * (ATTN_R + 1); 
+constexpr int D = 7168; 
+
+constexpr int ATTN_N = 128;
+constexpr int ATTN_K = 128;
+
+constexpr int ATTN_Sl = 128;
+constexpr int ATTN_Sh = 129;
+constexpr int T       = 32768 / ATTN_K;
+
+constexpr int ITER = 1; 
 
 #define BLOCK_SIZE (32*NUM_WORKERS)
 
@@ -35,135 +55,94 @@ inline void __cudaCheckError( const char *file, const int line ) {
 }
 
 
-
 int main(int argc, char **argv) {
     // TODO: consider doing sequential kernel launches to force batches dimension element to execute sequentially,
     // which may increase the probability of L2 cache hits on KV
-
     std::cout << "Entered main!" << std::endl;
 
-    // queries
-    constexpr int TOTAL_Q_ELEMENTS = ATTN_B*ATTN_H*Q_LEN*ATTN_D;
-    constexpr int TOTAL_Q_UNIQUE_ELEMENTS = ATTN_H*Q_LEN*ATTN_D;
-    float *q = new float[TOTAL_Q_UNIQUE_ELEMENTS];
+    // queries 
+    constexpr int TOTAL_Q_ELEMENTS = L*ATTN_H*ATTN_Z;
+    float *q   = new float[TOTAL_Q_ELEMENTS];
     bf16 *q_bf = new bf16[TOTAL_Q_ELEMENTS];
 
-    // keys and values cahces
-    constexpr int TOTAL_KV_CACHE_ELEMENTS = ATTN_B*ATTN_N*ATTN_H*ATTN_D;
-    constexpr int TOTAL_KV_CACHE_UNIQUE_ELEMENTS = ATTN_N*ATTN_H*ATTN_D;
-    float *k_cache = new float[TOTAL_KV_CACHE_UNIQUE_ELEMENTS];
-    float *v_cache = new float[TOTAL_KV_CACHE_UNIQUE_ELEMENTS];
-    bf16 *k_cache_bf = new bf16[TOTAL_KV_CACHE_ELEMENTS];
-    bf16 *v_cache_bf = new bf16[TOTAL_KV_CACHE_ELEMENTS];
+    // latent cache
+    constexpr int TOTAL_KV_CACHE_ELEMENTS = ATTN_N*ATTN_K*1*ATTN_Z;
+    float *latent_cache   = new float[TOTAL_KV_CACHE_ELEMENTS];
+    bf16 *latent_cache_bf = new bf16[TOTAL_KV_CACHE_ELEMENTS];
 
-    // keys and values new
-    constexpr int TOTAL_KV_NEW_ELEMENTS = ATTN_B*L_NEW*ATTN_H*ATTN_D;
-    constexpr int TOTAL_KV_NEW_UNIQUE_ELEMENTS = L_NEW*ATTN_H*ATTN_D;
-    float *k_new = new float[TOTAL_KV_NEW_UNIQUE_ELEMENTS];
-    float *v_new = new float[TOTAL_KV_NEW_UNIQUE_ELEMENTS];
-    bf16 *k_new_bf = new bf16[TOTAL_KV_NEW_ELEMENTS];
-    bf16 *v_new_bf = new bf16[TOTAL_KV_NEW_ELEMENTS];
+    // lengths
+    constexpr int TOTAL_LENGTHS_ELEMENTS = ATTN_B;
+    float *lengths = new float[TOTAL_LENGTHS_ELEMENTS];
+    bf16 *lengths_bf = new bf16[TOTAL_LENGTHS_ELEMENTS];
 
-    // keys and values seqlens
-    constexpr int TOTAL_KV_SEQLEN_ELEMENTS = ATTN_B;
-    float *k_seqlens = new float[TOTAL_KV_SEQLEN_ELEMENTS];
-    bf16 *k_seqlens_bf = new bf16[TOTAL_KV_SEQLEN_ELEMENTS];
+    // table
+    constexpr int TOTAL_TABLE_ELEMENTS = ATTN_B*T;
+    float *table = new float[TOTAL_TABLE_ELEMENTS];
+    bf16 *table_bf = new bf16[TOTAL_TABLE_ELEMENTS];
 
     // output
-    constexpr int TOTAL_OUT_ELEMENTS = ATTN_B*Q_LEN*ATTN_H*ATTN_D;
-    constexpr int TOTAL_OUT_UNIQUE_ELEMENTS = Q_LEN*ATTN_H*ATTN_D;
-    float *o_ref = new float[TOTAL_OUT_UNIQUE_ELEMENTS];
+    constexpr int TOTAL_OUT_ELEMENTS = L*ATTN_H*ATTN_Zc;
+    float *o = new float[TOTAL_OUT_ELEMENTS];
     bf16 *o_bf = new bf16[TOTAL_OUT_ELEMENTS];
 
-    float *o = new float[TOTAL_OUT_ELEMENTS];
+    // actual output 
+    float *o_actual = new float[TOTAL_OUT_ELEMENTS];
 
     std::ifstream infile(argv[1]);
 
     std::cout << "Starting to enter!" << std::endl;
 
-    for(int i = 0; i < TOTAL_Q_UNIQUE_ELEMENTS; i++) infile >> q[i];
-    std::cout << "Finished loading Q" << std::endl;
-    for(int i = 0; i < TOTAL_KV_CACHE_UNIQUE_ELEMENTS; i++) infile >> k[i];
-    std::cout << "Finished loading K CACHE" << std::endl;
-    for(int i = 0; i < TOTAL_KV_CACHE_UNIQUE_ELEMENTS; i++) infile >> v[i];
-    std::cout << "Finished loading V CACHE" << std::endl;
-    for(int i = 0; i < TOTAL_KV_NEW_UNIQUE_ELEMENTS; i++) infile >> k_new[i];
-    std::cout << "Finished loading K NEW" << std::endl;
-    for(int i = 0; i < TOTAL_KV_NEW_UNIQUE_ELEMENTS; i++) infile >> v_new[i];
-    std::cout << "Finished loading V NEW" << std::endl;
-    for(int i = 0; i < TOTAL_KV_SEQLEN_ELEMENTS; i++) infile >> k_seqlens[i];
-    std::cout << "Finished loading K SEQLENS" << std::endl;
-    for(int i = 0; i < TOTAL_OUT_UNIQUE_ELEMENTS; i++) infile >> o_ref[i];
-    std::cout << "Finished loading O REF" << std::endl;
+    for(int i = 0; i < TOTAL_Q_ELEMENTS; i++)        infile >> q[i];
+    for(int i = 0; i < TOTAL_KV_CACHE_ELEMENTS; i++) infile >> latent_cache[i];
+    for(int i = 0; i < TOTAL_LENGTHS_ELEMENTS; i++)  infile >> lengths[i];
+    for(int i = 0; i < TOTAL_TABLE_ELEMENTS; i++)    infile >> table[i];
+    for(int i = 0; i < TOTAL_OUT_ELEMENTS; i++)      infile >> o_actual[i];
 
     std::cout << "Finished loading file from " << argv[1] << "!" << std::endl;
 
-    // replicate into heads
-    for(int i = 0; i < TOTAL_Q_ELEMENTS; i++) {
-        q_bf[i] = __float2bfloat16(q[i % TOTAL_Q_UNIQUE_ELEMENTS]);
-    }
-    for(int i = 0; i < TOTAL_KV_CACHE_ELEMENTS; i++) {
-        k_cache_bf[i] = __float2bfloat16(k_cache[i % TOTAL_KV_CACHE_UNIQUE_ELEMENTS]);
-        v_cache_bf[i] = __float2bfloat16(v_cache[i % TOTAL_KV_CACHE_UNIQUE_ELEMENTS]);
-    }
-    for(int i = 0; i < TOTAL_KV_NEW_ELEMENTS; i++) {
-        k_new_bf[i] = __float2bfloat16(k_new[i % TOTAL_KV_NEW_UNIQUE_ELEMENTS]);
-        v_new_bf[i] = __float2bfloat16(v_new[i % TOTAL_KV_NEW_UNIQUE_ELEMENTS]);
-    }
-    for(int i = 0; i < TOTAL_KV_SEQLEN_ELEMENTS; i++) {
-        k_seqlens_bf[i] = __float2bfloat16(k_seqlens[i]);
-    }
+    bf16 *d_q, *d_latent_cache, *d_lengths, *d_table, *d_o;
+    cudaMalloc(&d_q,            TOTAL_Q_ELEMENTS        * sizeof(bf16));
+    cudaMalloc(&d_latent_cache, TOTAL_KV_CACHE_ELEMENTS * sizeof(bf16));
+    cudaMalloc(&d_lengths,      TOTAL_LENGTHS_ELEMENTS  * sizeof(bf16));
+    cudaMalloc(&d_table,        TOTAL_TABLE_ELEMENTS    * sizeof(bf16));
+    cudaMalloc(&d_o,            TOTAL_OUT_ELEMENTS      * sizeof(bf16));
 
-    bf16 *d_q, *d_k_cache, *d_v_cache, *d_k_new, *d_v_new, *d_k_seqlens, *d_o;
-    cudaMalloc(&d_q, TOTAL_Q_ELEMENTS * sizeof(bf16));
-    cudaMalloc(&d_k_cache, TOTAL_KV_CACHE_ELEMENTS * sizeof(bf16));
-    cudaMalloc(&d_v_cache, TOTAL_KV_CACHE_ELEMENTS * sizeof(bf16));
-    cudaMalloc(&d_k_new, TOTAL_KV_NEW_ELEMENTS * sizeof(bf16));
-    cudaMalloc(&d_v_new, TOTAL_KV_NEW_ELEMENTS * sizeof(bf16));
-    cudaMalloc(&d_k_seqlens, TOTAL_KV_SEQLEN_ELEMENTS * sizeof(bf16));
-    cudaMalloc(&d_o, TOTAL_OUT_ELEMENTS * sizeof(bf16));
-
-    cudaMemcpy(d_q, q_bf, TOTAL_Q_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k_cache, k_cache_bf, TOTAL_KV_CACHE_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_cache, v_cache_bf, TOTAL_KV_CACHE_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k_new, k_new_bf, TOTAL_KV_NEW_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_new, v_new_bf, TOTAL_KV_NEW_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k_seqlens, k_seqlens_bf, TOTAL_KV_SEQLEN_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_q,            q_bf,            TOTAL_Q_ELEMENTS        * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_latent_cache, latent_cache_bf, TOTAL_KV_CACHE_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_lengths,      lengths_bf,      TOTAL_LENGTHS_ELEMENTS  * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_table,        table_bf,        TOTAL_TABLE_ELEMENTS    * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_o,            o_bf,            TOTAL_OUT_ELEMENTS      * sizeof(bf16), cudaMemcpyHostToDevice);  
     
     /**********************************
      * CALL KERNEL
     ********************************* */
 
-    // global_layout<ATTN_D> Qg(d_q, ATTN_B, ATTN_N, ATTN_H, nullptr);
-    // global_layout<ATTN_D> Kg(d_k, ATTN_B, ATTN_N, ATTN_H, nullptr);
-    // global_layout<ATTN_D> Vg(d_v, ATTN_B, ATTN_N, ATTN_H, nullptr);
-    // global_layout<ATTN_D> Og(d_o, ATTN_B, ATTN_N, ATTN_H, nullptr);
-    // globals<ATTN_D> g(Qg, Kg, Vg, Og);
+    global_layout<ATTN_Zr> Qg(d_q,            ATTN_B, (ATTN_R + 1), ATTN_H, nullptr);
+    global_layout<ATTN_Zr> lc(d_latent_cache, ATTN_N, (ATTN_K),     1,      nullptr);
+    global_layout<ATTN_Zr> Og(d_o,            ATTN_B, (ATTN_R + 1), ATTN_H, nullptr);
 
-    global_layout<ATTN_D> Qg(d_q, ATTN_B, ATTN_H, ATTN_N, nullptr);
-    global_layout<ATTN_D> Kg(d_k, ATTN_B, ATTN_H, ATTN_N, nullptr);
-    global_layout<ATTN_D> Vg(d_v, ATTN_B, ATTN_H, ATTN_N, nullptr);
-    global_layout<ATTN_D> Og(d_o, ATTN_B, ATTN_H, ATTN_N, nullptr);
-    globals<ATTN_D> g(Qg, Kg, Vg, Og);
-    
-    unsigned long mem_size = (kittens::MAX_SHARED_MEMORY-1000) / 2; // have the flag tell us
+    globals<ATTN_Z> g(Qg, lc, Og, d_lengths, d_table, ATTN_R + 1, ATTN_K, softmax_scale);
+
+    unsigned long mem_size = (kittens::MAX_SHARED_MEMORY); 
     std::cout << "Max shared memory size: " << mem_size << std::endl;
     
     cudaFuncSetAttribute(
-        attend_ker<ATTN_D>,
+        decode_kernel<ATTN_Z>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         mem_size
     );
 
     cudaDeviceSynchronize();
+    
     std::cout << "Starting kernel\n";
-    dim3 grid((ATTN_N + qkvo_tile<ATTN_D>::rows*NUM_WORKERS - 1) / (qkvo_tile<ATTN_D>::rows*NUM_WORKERS), ATTN_H, ATTN_B);
-    std::cout << "Grid size: " << grid.x << " x " << grid.y << " x " << grid.z << std::endl;
+    dim3 grid(T, ATTN_H, ATTN_B);
+
     const auto start = std::chrono::high_resolution_clock::now();
     for(int i = 0; i < ITER; i++) {
-        attend_ker<ATTN_D><<<grid, BLOCK_SIZE, mem_size>>>(g);
+        decode_kernel<ATTN_Z><<<grid, BLOCK_SIZE, mem_size>>>(g);
     }
     cudaDeviceSynchronize();
+    
     const auto finish = std::chrono::high_resolution_clock::now();
     CudaCheckError();
     std::cout << "Finished kernel\n";
@@ -174,16 +153,19 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-
     /*******************************
      * CORRECTNESS 
     ********************************* */
     
     // check correctness
     cudaMemcpy(o_bf, d_o, TOTAL_OUT_ELEMENTS * sizeof(bf16), cudaMemcpyDeviceToHost);
-    for(int i = 0; i < TOTAL_OUT_UNIQUE_ELEMENTS; i++) {
+    for (int i = 0; i < TOTAL_OUT_ELEMENTS; i++) {
         o[i] = __bfloat162float(o_bf[i]);
     }
+    // cudaMemcpy(o_bf, d_o, TOTAL_OUT_ELEMENTS * sizeof(bf16), cudaMemcpyDeviceToHost);
+    // for(int i = 0; i < TOTAL_OUT_ELEMENTS; i++) {
+    //     o[i] = __bfloat162float(o_bf[i]);
+    // }
 
     bool good = true;
     std::ofstream o_ref_file("printouts/o_ref.txt");

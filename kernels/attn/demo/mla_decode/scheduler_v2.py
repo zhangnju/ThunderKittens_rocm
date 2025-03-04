@@ -224,8 +224,9 @@ def backward_schedule(processors: List[int], batch_id: int, seq_length: int, tok
             
     # Alright, now that the work has been allocated, we can go through and actually create the tasks.
     current_pos = 0
+    deps_to_delete = []
     for p, v in partial_info.items():
-        tasks[p].append(Task(
+        new_task = Task(
             uid=v[1],
             batch_id=batch_id,
             tok_ids=tok_ids, # all of them
@@ -236,15 +237,40 @@ def backward_schedule(processors: List[int], batch_id: int, seq_length: int, tok
             finish=v[0]+v[2]*PARTIAL_COST_PER_STEP,
             processor=p,
             args={"start": current_pos, "end": min(current_pos+v[2]*32, seq_length), "length": seq_length, "write_scratch": True}
-        ))
+        )
+        if new_task.args["end"] - new_task.args["start"] > 0:
+            tasks[p].append(new_task)
+        else:
+            deps_to_delete.append(new_task.uid)
         current_pos += v[2]*32
         # print(f'Processor {p}\'s partials run {v[2]} steps from seq {tasks[p][-1].args["start"]}-{tasks[p][-1].args["end"]}, with expected start time {round(tasks[p][-1].start, 2)} and finish time {round(tasks[p][-1].finish, 2)}.')
 
+    deps_to_delete_next = []
+    while len(deps_to_delete) > 0:
+        for i in range(len(deps_to_delete)):
+            task = deps_to_delete[i]
+            for p, p_tasks in tasks.items():
+                delete_tasks = []
+                for j in range(len(p_tasks)):
+                    t = p_tasks[j]
+                    if task in t.dependencies:
+                        t.dependencies.remove(task)
+                        if t.task_type == "reduction":
+                            if len(t.dependencies) == 0:
+                                deps_to_delete_next.append(t.uid)
+                                delete_tasks.append(j)
+                if len(delete_tasks) > 0:
+                    tasks[p] = [p_tasks[j] for j in range(len(p_tasks)) if j not in delete_tasks]
+        deps_to_delete = deps_to_delete_next
+        deps_to_delete_next = []
+        
+
     for p, p_tasks in tasks.items():
-        earliest_start = p_tasks[-1].start
-        for t in p_tasks:
-            t.start -= earliest_start
-            t.finish -= earliest_start
+        if len(p_tasks) > 0:
+            earliest_start = p_tasks[-1].start
+            for t in p_tasks:
+                t.start -= earliest_start
+                t.finish -= earliest_start
 
     return [t for tasks in tasks.values() for t in tasks], partial_uid, reduction_uid
 

@@ -55,6 +55,7 @@ def create_thundermla_arguments(seq_lengths, NEW_TOKENS):
             list(range(start_p, start_p + num_p)), batch_id, seq_l, list(range(NEW_TOKENS)), partial_uid, reduction_uid
         )
         scheduled_tasks.extend(new_tasks)
+    breakpoint()
     Instructions, O_scratch, Lvec_scratch, Semaphore, Timings = create_arguments_from_task_schedule(
         scheduled_tasks, NEW_TOKENS, num_processors=NUM_PROCESSORS
     )
@@ -91,7 +92,8 @@ def run_mla_sdpa(QRot, QV, K_cache, V_cache, Lengths, Table):
     pass
 
 def main():
-    seq_lengths=sorted([32768*2])
+    seq_lengths=sorted([256])
+    # seq_lengths=sorted([32768*2])
     # seq_lengths=sorted([4641,45118,1730,1696])
     NEW_TOKENS = 1
     QRot, QV, K_cache, V_cache, Lengths, Table = init_arguments(seq_lengths, NEW_TOKENS)

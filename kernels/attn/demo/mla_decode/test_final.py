@@ -61,6 +61,7 @@ def main(seq_lengths: List[int]):
         scheduled_tasks.extend(new_tasks)
 
     visualize_schedule(scheduled_tasks, num_processors=NUM_PROCESSORS)
+    breakpoint()
     Instructions, O_scratch, Lvec_scratch, Semaphore, Timings = create_arguments_from_task_schedule(
         scheduled_tasks, NEW_TOKENS, num_processors=NUM_PROCESSORS
     )

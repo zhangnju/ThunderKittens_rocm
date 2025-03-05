@@ -1,4 +1,4 @@
-import mla_decode
+import gqa_decode
 import torch
 import numpy as np
 import math
@@ -13,7 +13,7 @@ from timings import save_gantt_chart
 
 torch.manual_seed(0)
 
-D_Main, D_Rot = 512, 64
+D = 128
 PAGE_SIZE = 256
 H = 16                  # H heads
 NUM_PAGES = 1000        # number of pages in cache
@@ -25,15 +25,14 @@ def init_arguments(seq_lengths: List[int], NEW_TOKENS: int):
     B = len(seq_lengths)
 
     # Need to initialize QRot, QV, K_cache, V_cache, Lengths, Table    
-    QRot    = torch.randn(B, NEW_TOKENS, H, D_Rot, dtype=torch.bfloat16, device='cuda')
-    QV      = torch.randn(B, NEW_TOKENS, H, D_Main, dtype=torch.bfloat16, device='cuda')
-    K_cache = torch.randn(NUM_PAGES, PAGE_SIZE, D_Rot, dtype=torch.bfloat16, device='cuda')
-    V_cache = torch.randn(NUM_PAGES, PAGE_SIZE, D_Main, dtype=torch.bfloat16, device='cuda')
+    Q       = torch.randn(B, NEW_TOKENS, H, D, dtype=torch.bfloat16, device='cuda')
+    K_cache = torch.randn(NUM_PAGES, PAGE_SIZE, D, dtype=torch.bfloat16, device='cuda')
+    V_cache = torch.randn(NUM_PAGES, PAGE_SIZE, D, dtype=torch.bfloat16, device='cuda')
     Lengths = torch.tensor(seq_lengths, dtype=torch.int32, device='cuda')
     # Table = torch.arange(MAX_NUM_PAGES, dtype=torch.int32, device='cuda').reshape(1, -1).repeat(B, 1)
     Table = torch.randint(0, NUM_PAGES, (B, MAX_NUM_PAGES), dtype=torch.int32, device='cuda')
 
-    return QRot, QV, K_cache, V_cache, Lengths, Table
+    return Q, K_cache, V_cache, Lengths, Table
 
 def create_thundermla_arguments(seq_lengths, NEW_TOKENS):
     # Processor assignment heuristic: assign processors proportionally to sequence lengths.
@@ -61,21 +60,20 @@ def create_thundermla_arguments(seq_lengths, NEW_TOKENS):
     print('Finished generating schedule + arguments')
     return Instructions, O_scratch, Lvec_scratch, Semaphore, Timings
 
-def run_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_scratch, Lvec_scratch, Semaphore, Timings, tic=None):
+def run_thundermla(Q, K_cache, V_cache, Lengths, Table, Instructions, O_scratch, Lvec_scratch, Semaphore, Timings, tic=None):
     if tic is None:
         Semaphore.zero_()
         tic = 1
-    O = torch.zeros_like(QV)
-    softmax_scale = 1.0 / math.sqrt(D_Main+D_Rot)
-    mla_decode.mla_decode(Instructions,QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, tic, Timings)
+    O = torch.zeros_like(Q)
+    softmax_scale = 1.0 / math.sqrt(D)
+    gqa_decode.gqa_decode(Instructions, Q, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, tic, Timings)
     return O
 
-def run_mla_torch(QRot, QV, K_cache, V_cache, Lengths, Table):
-    Q = torch.concat([QRot, QV], dim=-1)
-    full_K = torch.cat([K_cache, V_cache], dim=-1)[Table].reshape(Q.shape[0], -1, Q.shape[-1])
-    full_V = V_cache[Table].reshape(Q.shape[0], -1, QV.shape[-1])
-    softmax_scale = 1.0 / math.sqrt(D_Main+D_Rot)
-    O = torch.zeros_like(QV)
+def run_mla_torch(Q, K_cache, V_cache, Lengths, Table):
+    full_K = K_cache[Table].reshape(Q.shape[0], -1, Q.shape[-1])
+    full_V = V_cache[Table].reshape(Q.shape[0], -1, Q.shape[-1])
+    softmax_scale = 1.0 / math.sqrt(D)
+    O = torch.zeros_like(Q)
     for b, l in enumerate(Lengths):
         assert Q.shape[1] == 1, "Q must have shape (B, 1, H, D) for the time being."
         O[b:b+1] = torch.nn.functional.scaled_dot_product_attention(
@@ -91,14 +89,13 @@ def run_mla_sdpa(QRot, QV, K_cache, V_cache, Lengths, Table):
     pass
 
 def main():
-    # seq_lengths=sorted([32768*2])
+    seq_lengths=sorted([32768*2])
     # seq_lengths=sorted([4641,45118,1730,1696])
-    seq_lengths=sorted([256])
     NEW_TOKENS = 1
-    QRot, QV, K_cache, V_cache, Lengths, Table = init_arguments(seq_lengths, NEW_TOKENS)
-    ref = run_mla_torch(QRot, QV, K_cache, V_cache, Lengths, Table)
+    Q, K_cache, V_cache, Lengths, Table = init_arguments(seq_lengths, NEW_TOKENS)
+    ref = run_mla_torch(Q, K_cache, V_cache, Lengths, Table)
     Instructions, O_scratch, Lvec_scratch, Semaphore, Timings = create_thundermla_arguments(seq_lengths, NEW_TOKENS)
-    O = run_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_scratch, Lvec_scratch, Semaphore, Timings)
+    O = run_thundermla(Q, K_cache, V_cache, Lengths, Table, Instructions, O_scratch, Lvec_scratch, Semaphore, Timings)
     print('O', O)
     print('Ref', ref)
     for b in range(len(seq_lengths)):

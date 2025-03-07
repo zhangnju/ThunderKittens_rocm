@@ -11,3 +11,4 @@
 #include "lcf/lcf.cuh"
 #include "lcsf/lcsf.cuh"
 #include "interpreter/interpreter.cuh"
+#include "vm/vm.cuh"

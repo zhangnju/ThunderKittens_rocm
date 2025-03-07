@@ -64,4 +64,22 @@ template<int NCWG> __device__ static inline void consumer_registers() { increase
 
 using warpgroup = group<4>; // special scope commonly used by SM_90 and later.
 
+namespace grid {
+static __device__ uint32_t __grid_barrier__[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+// Note that unlike cooperative groups, this does NOT mask the threads, nor do intra-block syncs.
+// To achieve the full effect, place barriers on either side, and mask to thread 0 before calling this.
+static __device__ inline void sync(int grid_barrier=0) {
+    if(laneid() == 0) {
+        uint32_t arrival = 1, initial_value, new_value;
+        if(blockIdx.x + blockIdx.y + blockIdx.z == 0) {
+            arrival = 0x80000000 - (gridDim.x * gridDim.y * gridDim.z - 1);
+        }
+        asm volatile("atom.add.release.gpu.u32 %0, [%1], %2;" : "=r"(initial_value) : "l"((uint64_t)(&__grid_barrier__[0] + grid_barrier)), "r"(arrival) : "memory");
+        do {
+            asm volatile("ld.acquire.gpu.u32 %0,[%1];" : "=r"(new_value) : "l"((uint64_t)(&__grid_barrier__[0] + grid_barrier)) : "memory");
+        } while (((initial_value^new_value) & 0x80000000) == 0);
+    }
 }
+
+} // namespace grid
+} // namespace kittens

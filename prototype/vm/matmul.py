@@ -9,7 +9,7 @@ def make_test_args(M, K, N, instruction_width=32, timing_width=128, num_processo
     assert K % 64 == 0
     a = torch.randn(M, K, dtype=torch.bfloat16, device=0).contiguous()
     b = torch.randn(K, N, dtype=torch.bfloat16, device=0).contiguous()
-    c = torch.zeros(M, N, dtype=torch.bfloat16, device=0)
+    c = torch.zeros(M, N, dtype=torch.bfloat16, device=0).contiguous()
 
     tasks = []
     for i in range(M//128):
@@ -29,12 +29,17 @@ def time_op(func, *args, **kwargs):
     for _ in range(kwargs.get('warmup', 5)):
         func(*args)
     # time
-    torch.cuda.synchronize()
-    start = time.time()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    start_event.record()
     for _ in range(iters):
         func(*args)
-    torch.cuda.synchronize()
-    return (time.time() - start) / iters
+    end_event.record()
+    
+    end_event.synchronize()
+    elapsed_time = start_event.elapsed_time(end_event) / 1000.0  # convert ms to seconds
+    return elapsed_time / iters
 
 def flops(M,N,K):
     return 2*M*N*K
@@ -43,14 +48,18 @@ if __name__ == "__main__":
     # M,N,K = 256, 256, 256
     M,N,K = 2048, 2048, 2048
     instructions, timing, semaphore, a, b, c = make_test_args(M, K, N)
-    print(instructions[:4])
 
+    print('Shapes:', a.shape, b.shape, c.shape)
+    print(hex(b.data_ptr())) # hex
+    print('Launching kernel...')
     matmul(instructions, timing, semaphore, a, b, c)
     torch.cuda.synchronize()
     c_ref = a @ b
+    print(c_ref[:4])
+    print(c[:4])
     print(f'all close? {torch.allclose(c, c_ref)}')
 
-    save_gantt_chart(timing, instructions, 'matmul')
+    # save_gantt_chart(timing, instructions, 'matmul')
 
     total_flops = flops(M, N, K)
 

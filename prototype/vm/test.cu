@@ -7,7 +7,7 @@ using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::vm;
 
-template<typename _config=default_config> struct MatmulOp_layout {
+template<typename _config=default_config> struct TestOp_layout {
     using config = _config;
     using a_tile = st_bf<64, 64>;
     using b_tile = st_bf<64, 256>;
@@ -43,9 +43,9 @@ template<typename _config=default_config> struct MatmulOp_layout {
         st_bf<64, 256> c[2];
     };
 };
-struct MatmulOp {
+struct TestOp {
     static constexpr int opcode = 1; // Whatever opcode you want.
-    using layout = MatmulOp_layout<>;
+    using layout = TestOp_layout<>;
     using config = layout::config;
     using globals = layout::globals;
     using kvms_t = kittens_virtual_machine_state<config>;
@@ -150,16 +150,16 @@ struct MatmulOp {
 };
 
 
-PYBIND11_MODULE(matmul, m) {
-    m.doc() = "matmul vm python module";
-    kittens::py::bind_kernel<vm::kernel<default_config, typename MatmulOp::globals, MatmulOp>>(m, "matmul",
-        &MatmulOp::globals::instructions,
+PYBIND11_MODULE(test, m) {
+    m.doc() = "test vm test python module";
+    kittens::py::bind_kernel<vm::kernel<default_config, typename TestOp::globals, TestOp>>(m, "matmul",
+        &TestOp::globals::instructions,
 #ifdef KITTENS_TIMINGS
-        &MatmulOp::globals::timings,
+        &TestOp::globals::timings,
 #endif
-        &MatmulOp::globals::semaphore,
-        &MatmulOp::globals::a,
-        &MatmulOp::globals::b,
-        &MatmulOp::globals::c
+        &TestOp::globals::semaphore,
+        &TestOp::globals::a,
+        &TestOp::globals::b,
+        &TestOp::globals::c
     );
 }

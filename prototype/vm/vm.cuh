@@ -110,6 +110,7 @@ template<typename config, typename globals, bool is_producer, typename op> __dev
         op::producer::setup(g, kvms, control, state);
         while(op::controller::run(g, kvms, control)) {
             op::producer::run(g, kvms, control, state);
+            op::controller::advance(g, kvms, control);
         }
         op::controller::finish(g, kvms, control);
         op::producer::finish(g, kvms, control, state);
@@ -120,6 +121,7 @@ template<typename config, typename globals, bool is_producer, typename op> __dev
         op::consumer::setup(g, kvms, control, state);
         while(op::controller::run(g, kvms, control)) {
             op::consumer::run(g, kvms, control, state);
+            op::controller::advance(g, kvms, control);
         }
         op::controller::finish(g, kvms, control);
         op::consumer::finish(g, kvms, control, state);

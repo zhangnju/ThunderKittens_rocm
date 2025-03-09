@@ -13,7 +13,7 @@ struct default_config {
     static constexpr int NUM_CONSUMER_WARPS = 8;
     static constexpr int NUM_WARPS = NUM_PRODUCER_WARPS + NUM_CONSUMER_WARPS;
     static constexpr int NUM_BLOCKS = 1;
-    static constexpr int CLUSTER_BLOCKS = 4;
+    static constexpr int CLUSTER_BLOCKS = 1;
 
     static constexpr int MAX_SHARED_MEMORY = kittens::MAX_SHARED_MEMORY;
     static constexpr int STATIC_SHARED_MEMORY = 1720;
@@ -170,6 +170,7 @@ template<typename config, typename globals> __device__ void inline write_timings
 }
 
 template<is_kvms KVMS, is_base_controller_state controller_state> __device__ inline void wait(KVMS &kvms, const controller_state &control, int phase) {
+    // if(laneid() == 0) printf("swting for global semaphore ready\n"); __syncwarp();
     #pragma unroll
     for(int i = 0; i < control.pages.num; i++) {
         kittens::wait(kvms.pages.semaphore[control.pages.start+i], phase);
@@ -178,6 +179,7 @@ template<is_kvms KVMS, is_base_controller_state controller_state> __device__ inl
     for(int i = 0; i < control.mini_pages.num; i++) {
         kittens::wait(kvms.mini_pages.semaphore[control.mini_pages.start+i], phase);
     }
+    // if(laneid() == 0) printf("fwting for global semaphore ready\n"); __syncwarp();
 }
 template<is_kvms KVMS, is_base_controller_state controller_state> __device__ inline void wait_arrived(KVMS &kvms, const controller_state &control) {
     wait<KVMS, controller_state>(kvms, control, 0);
@@ -285,11 +287,12 @@ __global__ void kernel(const __grid_constant__ globals g) {
     
     if(config::CLUSTER_BLOCKS == 1) group<config::NUM_WARPS>::sync(15); // all warps must arrive here, confirming semaphore initialization is visible to all threads.
     else tma::cluster::sync();
-    grid::sync();
+    // grid::sync();
     group<config::NUM_WARPS>::sync(15); // all warps must arrive here, confirming semaphore initialization is visible to all threads.
 
     if(warpid() < config::NUM_CONSUMER_WARPS) {
         warpgroup::increase_registers<224>();
+        // if(laneid() == 0) printf("%d %d Consumer started\n", blockIdx.x, threadIdx.x); __syncwarp();
         for(kvms.instruction_index = 0; kvms.instruction_index < g.instructions.rows(); kvms.instruction_index++) {
             int instruction_stage = kvms.instruction_index%config::INSTRUCTION_PIPELINE_STAGES;
             kvms.instruction = &instructions[instruction_stage][0];
@@ -301,13 +304,18 @@ __global__ void kernel(const __grid_constant__ globals g) {
             kittens::wait(instruction_semaphore[instruction_stage], 0);
             // if(laneid() == 0) printf("warp %d finished waiting for instruction semaphore %d\n", warpid(), kvms.instruction_index); __syncwarp();
             int opcode = kvms.instruction[0];
-            if(opcode == 0) return; // Stop Op
+            if(opcode == 0) break; // Stop Op
+            // if(laneid() == 0) printf("%d %d Consumer started 0\n", blockIdx.x, threadIdx.x); __syncwarp();
             dispatch_ops<config, globals, false, ops...>::run(opcode, g, kvms);
             // if(laneid() == 0) printf("warp %d finished dispatching\n", warpid()); __syncwarp();
+            // if(laneid() == 0) printf("%d %d Consumer started 1\n", blockIdx.x, threadIdx.x); __syncwarp();
             if(laneid() == 0) kittens::arrive(instruction_semaphore[instruction_stage]);
+            // if(laneid() == 0) printf("%d %d Consumer started 2\n", blockIdx.x, threadIdx.x); __syncwarp();
         }
+        // if(laneid() == 0) printf("%d %d Consumer finished\n", blockIdx.x, threadIdx.x); __syncwarp();
     }
     else {
+        // if(laneid() == 0) printf("%d %d Producer began\n", blockIdx.x, threadIdx.x); __syncwarp();
         warpgroup::decrease_registers<40>();
         for(kvms.instruction_index = 0; kvms.instruction_index < g.instructions.rows(); kvms.instruction_index++) {
             if(warpgroup::warpid() == 3 && kvms.instruction_index+1 < g.instructions.rows()) {
@@ -326,14 +334,16 @@ __global__ void kernel(const __grid_constant__ globals g) {
             kittens::wait(instruction_semaphore[instruction_stage], 0);
             // if(laneid() == 0) printf("warp %d finished waiting for instruction semaphore %d\n", warpid(), kvms.instruction_index); __syncwarp();
             int opcode = kvms.instruction[0];
-            if(opcode == 0) return; // Stop Op
+            if(opcode == 0) break; // Stop Op
             dispatch_ops<config, globals, true, ops...>::run(opcode, g, kvms);
             // if(laneid() == 0) printf("warp %d finished dispatching\n", warpid()); __syncwarp();
+            // if(laneid() == 0) printf("%d %d Producer 0\n", blockIdx.x, threadIdx.x); __syncwarp();
             if(laneid() == 0) kittens::arrive(instruction_semaphore[instruction_stage]);
+            // if(laneid() == 0) printf("%d %d Producer 1\n", blockIdx.x, threadIdx.x); __syncwarp();
             if(warpgroup::warpid() == 3) {
-                // if(laneid() == 0) printf("waiting for global semaphore ready\n"); __syncwarp();
+                // if(laneid() == 0) printf("%d %d waiting for global semaphore ready\n", blockIdx.x, threadIdx.x); __syncwarp();
                 kittens::wait(global_semaphore_ready[instruction_stage], 0);
-                // if(laneid() == 0) printf("finished waiting for global semaphore ready\n"); __syncwarp();
+                // if(laneid() == 0) printf("%d %d finished waiting for global semaphore ready\n", blockIdx.x, threadIdx.x); __syncwarp();
                 if(laneid() == 0) {
                     kittens::arrive(global_semaphore_ready[instruction_stage], config::NUM_WARPS); // Send it back to phase 1.
                     *(volatile int*)&g.semaphore[kittens::coord<>{(int)(blockIdx.x), kvms.instruction_index}] = global_semaphore_writeout_buffer[instruction_stage];
@@ -356,7 +366,11 @@ __global__ void kernel(const __grid_constant__ globals g) {
                 // if(laneid() == 0) printf("finished arriving at instruction semaphore\n"); __syncwarp();
             }
         }
+        // if(laneid() == 0) printf("%d %d Producer finished\n", blockIdx.x, threadIdx.x); __syncwarp();
     }
+
+    if(config::CLUSTER_BLOCKS > 1) tma::cluster::sync();
+
 }
 
 

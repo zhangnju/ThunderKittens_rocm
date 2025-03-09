@@ -46,7 +46,11 @@ constexpr int WARPGROUP_WARPS{4};
  * @brief Get the warp ID of the current thread.
  * @return The warp ID.
  */
-__device__ __forceinline__ int warpid() { return threadIdx.x >> 5; } 
+__device__ __forceinline__ int warpid() {
+    int ret;
+    asm volatile ("mov.s32 %0, %warpid;" : "=r"(ret));
+    return ret;
+} 
 /**
  * @brief Get the warpgroup ID of the current thread.
  * @return The warpgroup ID.
@@ -56,7 +60,11 @@ __device__ __forceinline__ int warpgroupid() { return threadIdx.x >> 7; }
  * @brief Get the lane ID of the current thread within its warp.
  * @return The lane ID.
  */
-__device__ __forceinline__ int laneid() { return threadIdx.x & 0x1f; }
+__device__ __forceinline__ int laneid() {
+    int ret;
+    asm volatile ("mov.s32 %0, %laneid;" : "=r"(ret));
+    return ret;
+}
 
 #if defined(KITTENS_HOPPER)
 constexpr int MAX_SHARED_MEMORY = 227000;

@@ -72,17 +72,19 @@ struct Matmul {
         __device__ static inline void setup(const globals &g, kvms_t &kvms, typename layout::controller_state &control, typename layout::producer_state &state) {}
         __device__ static inline void run(const globals &g, kvms_t &kvms, typename layout::controller_state &control, typename layout::producer_state &state) {
             typename layout::input_block *input = (typename layout::input_block*)kvms.page_addr(control.pages.start);
-            wait_finished(kvms, control);
+            vm::wait_finished(kvms, control);
             if(warpgroup::laneid() == 0) {
-                semaphore &sem = vm::expect(kvms, control, 32, *input);
-                if(control.iter < 56) kvms.record(64+control.iter);
-                tma::load_async<axis::ROW, cache_policy::EVICT_LAST>(input->a[0], g.a, {control.row*2 + 0, control.iter}, sem);
-                tma::load_async<axis::ROW, cache_policy::EVICT_LAST>(input->a[1], g.a, {control.row*2 + 1, control.iter}, sem);
-                tma::load_async<axis::ROW, cache_policy::EVICT_LAST>(input->b, g.b, {control.iter, control.col}, sem);
+                // semaphore &sem = vm::expect(kvms, control, 32, *input);
+                // if(control.iter < 56) kvms.record(64+control.iter);
+                // tma::load_async<axis::ROW, cache_policy::EVICT_LAST>(input->a[0], g.a, {control.row*2 + 0, control.iter}, sem);
+                // tma::load_async<axis::ROW, cache_policy::EVICT_LAST>(input->a[1], g.a, {control.row*2 + 1, control.iter}, sem);
+                // tma::load_async<axis::ROW, cache_policy::EVICT_LAST>(input->b, g.b, {control.iter, control.col}, sem);
+                vm::arrive(kvms, control, 32);
             }
             warpgroup::sync(warpgroup::groupid());
         }
         __device__ static inline void finish(const globals &g, kvms_t &kvms, typename layout::controller_state &control, typename layout::producer_state &state) {
+            vm::arrive(kvms, control, 32);
             if(laneid() == 0) arrive(*kvms.global_semaphore_ready);
         }
     };
@@ -93,23 +95,32 @@ struct Matmul {
             if(threadIdx.x == 0) kvms.record(2);
         }
         __device__ static inline void run(const globals &g, kvms_t &kvms, typename layout::controller_state &control, typename layout::consumer_state &state) {
+            // if(laneid() == 0) printf("%d %d Consumer run 0\n", blockIdx.x, threadIdx.x); __syncwarp();
             auto *input = kvms.page_addr<typename layout::input_block>(control.pages.start);
-            wait_arrived(kvms, control);
+            // if(laneid() == 0) printf("%d %d Consumer run 1\n", blockIdx.x, threadIdx.x); __syncwarp();
+            vm::wait_arrived(kvms, control);
+            // if(laneid() == 0) printf("%d %d Consumer run 2\n", blockIdx.x, threadIdx.x); __syncwarp();
             warpgroup::mma_AB(state.c, input->a[warpgroup::groupid()], input->b);
+            // if(laneid() == 0) printf("%d %d Consumer run 3\n", blockIdx.x, threadIdx.x); __syncwarp();
             if(threadIdx.x == 0 && control.iter < 56) kvms.record(8+control.iter);
+            // if(laneid() == 0) printf("%d %d Consumer run 4\n", blockIdx.x, threadIdx.x); __syncwarp();
             warpgroup::mma_async_wait<1>();
+            // if(laneid() == 0) printf("%d %d Consumer run 4\n", blockIdx.x, threadIdx.x); __syncwarp();
+            // if(laneid() == 0) printf("%d %d Consumer run 5\n", blockIdx.x, threadIdx.x); __syncwarp();
             if(warpgroup::laneid() == 0 && control.iter > 0) {
                 #pragma unroll
                 for(int i = 0; i < state.prev_pages.num; i++) {
                     kittens::arrive(kvms.pages.semaphore[state.prev_pages.start+i], 16);
                 }
             }
+            // if(laneid() == 0) printf("%d %d Consumer run 6\n", blockIdx.x, threadIdx.x); __syncwarp();
             state.prev_pages = control.pages;
         }
         __device__ static inline void finish(const globals &g, kvms_t &kvms, typename layout::controller_state &control, typename layout::consumer_state &state) {
             warpgroup::mma_async_wait();
             if(threadIdx.x == 0) kvms.record(126);
             auto *output = kvms.page_addr<typename layout::output_block>(control.pages.start);
+            vm::wait_finished(kvms, control);
             warpgroup::store(output->c[warpgroup::groupid()], state.c);
             warpgroup::sync(warpgroup::groupid());
             if(warpgroup::laneid() == 0) {
@@ -121,6 +132,7 @@ struct Matmul {
                 }
                 tma::store_async_read_wait();
                 if(warpgroup::laneid() == 0) arrive(*kvms.global_semaphore_ready, 4);
+                vm::arrive(kvms, control, 16);
             }
             if(threadIdx.x == 0) kvms.record(127);
         }

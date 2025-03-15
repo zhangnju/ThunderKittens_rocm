@@ -8,7 +8,7 @@ batch = 1
 heads = 16
 new_seq = 8
 
-L = 128
+L = 8192
 
 instructions = torch.zeros((batch,1,32), dtype=torch.int32, device='cuda')
 

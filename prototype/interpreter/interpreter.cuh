@@ -406,7 +406,9 @@ __global__ void kernel(const __grid_constant__ typename config::globals globals)
             int opcode = ps.instruction[0];
             if(opcode == 0) break; // Stop Op
             dispatch_producer<config, ops...>::run(opcode, globals, ps);
+            if(laneid() == 0) printf("producer %d arriving task iter %d\n", warpgroup::warpid(), ps.task_iter); __syncwarp();
             if(laneid() == 0) arrive(instruction_finished[ps.task_iter%2]);
+            if(laneid() == 0) printf("producer %d done with task iter %d\n", warpgroup::warpid(), ps.task_iter); __syncwarp();
         }
     }
     if(detail::CLUSTER_BLOCKS_v<config> > 1) tma::cluster::sync();

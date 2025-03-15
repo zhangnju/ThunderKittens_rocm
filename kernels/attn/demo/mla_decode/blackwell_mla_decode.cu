@@ -68,7 +68,7 @@ struct partial_layout {
     };
     struct v_input_block { v_tile v; };
     static_assert(sizeof(input_block) == sizeof(v_input_block), "input_block and v_input_block must be the same size");
-    struct scratch_block { att_tile att_block; sv_fl<128> max_vec, norm_vec; semaphore mma_sem; };
+    struct scratch_block { att_tile att_block; semaphore mma_sem; };
     struct finish_block { st_fl<16, 128> o[8][2]; sv_fl<16> lvec[8][2][2]; }; // Last 2 on Lvec is padding for 128-byte alignments
     struct common_state {
         int uid;
@@ -79,7 +79,7 @@ struct partial_layout {
         int end_pos; // One past the last position to load
         int length; // the length of the overall sequence in question
 
-        int true_warpid; // Used by consumers to prevent permutations
+        int true_warpid; // Used by consumers to prevent permutations; for producers is an alias for warpgroup::warpid()
     };
     // struct producer_state {
     //     int iter_idx, intra_idx; // / 13, % 13
@@ -97,7 +97,7 @@ struct partial_template {
     using config = config<Q_HEADS>;
     using layout = partial_layout<Q_HEADS>;
     static constexpr int opcode = 1;
-    static constexpr int INPUT_PIPE_STAGES = 5;
+    static constexpr int INPUT_PIPE_STAGES = 1;
     using consumer_group = group<8>;
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         #ifdef KITTENS_TIMINGS
@@ -157,8 +157,9 @@ struct partial_template {
                     tma::load_async<dim::ROW, cache_policy::NORMAL>(v_input.v, args.globals.KV_cache, {next_page_id, within_page_idx, intra_idx-9}, args.inputs_arrived);
                 }
             }
+            else if(laneid() == 0) arrive(args.inputs_arrived);
+            if(laneid() == 0) printf("producers finishing iter (%d, %d)\n", args.iter/13, args.iter%13); __syncwarp();
             warpgroup::sync(5);
-            if(warpgroup::laneid() == 0) arrive(args.inputs_arrived, 3);
         }
     };
     struct consumer {
@@ -205,7 +206,6 @@ struct partial_template {
                 // mm_ABt(args.state.att_block_tt, args.input.q, args.input.k, args.scratch.mma_sem);
             }
             else if(laneid() == 0) arrive(args.inputs_finished);
-            consumer_group::sync(10);
             // wait(args.scratch.mma_sem, 0);
             // if(consumer_group::laneid() == 0) arrive(args.inputs_finished);
             // if(consumer_group::laneid() == 0) arrive(args.scratch.mma_sem);
@@ -223,7 +223,6 @@ struct partial_template {
                 mma_ABt(args.state.att_block_tt, args.input.q, args.input.k, args.inputs_finished);
             }
             else if(laneid() == 0) arrive(args.inputs_finished);
-            consumer_group::sync(10);
         }
         __device__ static inline void final_qk_softmax(consumer_compute_args<layout> args) { // intra_idx == 8
             const float SOFTMAX_TEMPERATURE = args.globals.Softmax_scale * 1.44269504089f;
@@ -320,10 +319,11 @@ struct partial_template {
             tm_store_wait();
             consumer_group::sync(10); // tensor memory ready, shared memory ready, we can now rip av matmuls!
 
-            if(warpid() == 0) {
-                printf("Att block, post store to scratch memory\n");
-                print(args.scratch.att_block);
-            }
+            // if(warpid() == 0) {
+            //     printf("Att block, post store to scratch memory\n");
+            //     print(args.scratch.att_block);
+            // }
+            // consumer_group::sync(10);
         }
         __device__ static inline void av(consumer_compute_args<layout> args) { // intra_idx in 9...12
             int intra_idx = args.iter % 13;
@@ -334,24 +334,24 @@ struct partial_template {
                     mma_AB(ot, args.scratch.att_block, v_input.v, args.inputs_finished);
                 }
                 else if(laneid() == 0) arrive(args.inputs_finished);
-                consumer_group::sync(10);
             }
             else {
                 if(consumer_group::warpid() == 0) {
                     mma_AB(ot, args.scratch.att_block, v_input.v, args.scratch.mma_sem);
                 }
-                consumer_group::sync(10);
                 wait(args.scratch.mma_sem, 1);
                 if(laneid() == 0) arrive(args.inputs_finished);
                 consumer_group::load_async(args.state.o_chunk, get_o(args.tensor_alloc, 0));
                 tm_load_wait();
-                consumer_group::sync(10);
             }
+            consumer_group::sync(10);
         }
         __device__ static inline void compute(consumer_compute_args<layout> args) {
 #ifdef KITTENS_TIMINGS
             if(group<8>::laneid() == 0 && args.iter < 24) args.timings[8+args.iter] = clock64();
 #endif
+            if(consumer_group::laneid() == 0) printf("starting iter (%d, %d)\n", args.iter/13, args.iter%13);
+            consumer_group::sync(10);
             int intra_idx = args.iter % 13;
             if(intra_idx == 0) initial_qk(args);
             else if(intra_idx > 0 && intra_idx < 8) main_qk(args);
@@ -359,6 +359,8 @@ struct partial_template {
             else av(args);
         }
         __device__ static inline void finish(consumer_finish_args<layout> args) {
+            if(consumer_group::laneid() == 0) printf("starting finish\n");
+            consumer_group::sync(10);
             col_vec<rt_fl<16, k_tile::rows>> local_max_vec, local_norm_vec;
 
             copy(local_norm_vec, args.state.norm_vec);
@@ -394,14 +396,14 @@ struct partial_template {
                 consumer_group::sync(10);
                 // tma::store_async_read_wait<1>();
             }
-            if(consumer_group::warpid() == 0) invalidate_semaphore(args.scratch.mma_sem); // invalidate the semaphore for the next iteration.
+            if(warpid() == 0) invalidate_semaphore(args.scratch.mma_sem); // invalidate the semaphore for the next iteration.
              // if(consumer_group::laneid() == 0) printf("post invalidate semaphore\n");
             tma::store_async_wait(); // not just read wait
              // if(consumer_group::laneid() == 0) printf("post store_async_wait\n");
             asm volatile("fence.sc.cta;\n"); // Can't reorder across this boundary
             group<8>::sync(10);
             if(args.common.dst.batch_idx < 0) {
-                if(group<8>::laneid() < 4 && args.common.dst.seq_idx + group<8>::laneid() < args.globals.O_scratch.depth()) {
+                if(group<8>::laneid() < 8 && args.common.dst.seq_idx + group<8>::laneid() < args.globals.O_scratch.depth()) {
                     // Todo: this can probably replaced by a st.async, which may prevent an expensive wait on the final finish barrier.
                     args.globals.semaphore[{-args.common.dst.batch_idx-1, args.common.dst.seq_idx + group<8>::laneid()}] = args.globals.tic;
                     // For blackwell

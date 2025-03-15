@@ -78,6 +78,8 @@ struct partial_layout {
         int start_pos; // MUST BE A MULTIPLE OF PAGE_SIZE
         int end_pos; // One past the last position to load
         int length; // the length of the overall sequence in question
+
+        int true_warpid; // Used by consumers to prevent permutations
     };
     // struct producer_state {
     //     int iter_idx, intra_idx; // / 13, % 13
@@ -110,7 +112,8 @@ struct partial_template {
         args.common.end_pos     =  args.instruction[7];
         args.common.length      =  args.instruction[8];
         args.num_iters          = ((args.common.end_pos - args.common.start_pos + NUM_ROWS - 1) / NUM_ROWS) * 13; // 9 iters x 64 headdim for K, 4 iters x 128 headdim for V
-        args.common.length    -= (args.globals.Q.depth() - (args.common.q_seq_idx + consumer_group::warpid()) - 1); // adjust for the causal mask
+        args.common.true_warpid        = (warpgroup::groupid() == 2) ? warpgroup::warpid() : 2*(warpid() % 4)+warpid()/4;
+        args.common.length     -= (args.globals.Q.depth() - (args.common.q_seq_idx + args.common.true_warpid) - 1); // adjust for the causal mask
     }
     struct producer {
         __device__ static inline void setup(producer_setup_args<layout> args) {}
@@ -269,7 +272,8 @@ struct partial_template {
             sub(max_vec_last_scaled, max_vec_last_scaled, max_vec_scaled);
             exp2(max_vec_last_scaled, max_vec_last_scaled);
 
-            consumer_group::store(args.scratch.att_block, att_block_fp32); // store to shared memory
+            auto att_subtile = subtile_inplace<16, 128>(args.scratch.att_block, {args.common.true_warpid, 0});
+            store(att_subtile, att_block_fp32); // store to shared memory
                 
             mul(local_norm_vec, local_norm_vec, max_vec_last_scaled);
             row_sum(local_norm_vec, att_block_fp32, local_norm_vec);
@@ -316,10 +320,10 @@ struct partial_template {
             tm_store_wait();
             consumer_group::sync(10); // tensor memory ready, shared memory ready, we can now rip av matmuls!
 
-            // if(warpid() == 0) {
-            //     printf("Att block, post store to scratch memory\n");
-            //     print(args.scratch.att_block);
-            // }
+            if(warpid() == 0) {
+                printf("Att block, post store to scratch memory\n");
+                print(args.scratch.att_block);
+            }
         }
         __device__ static inline void av(consumer_compute_args<layout> args) { // intra_idx in 9...12
             int intra_idx = args.iter % 13;
@@ -330,6 +334,7 @@ struct partial_template {
                     mma_AB(ot, args.scratch.att_block, v_input.v, args.inputs_finished);
                 }
                 else if(laneid() == 0) arrive(args.inputs_finished);
+                consumer_group::sync(10);
             }
             else {
                 if(consumer_group::warpid() == 0) {
@@ -369,28 +374,30 @@ struct partial_template {
                 div_row(args.state.o_chunk, args.state.o_chunk, local_norm_vec);
 
                 if(args.common.dst.batch_idx >= 0) { // batch is meaningful
-                    auto &o_smem = reinterpret_cast<st_bf<16, 128>&>(args.finish.o[consumer_group::warpid()][i%2]);
+                    auto &o_smem = reinterpret_cast<st_bf<16, 128>&>(args.finish.o[args.common.true_warpid][i%2]);
                     store(o_smem, args.state.o_chunk);
                     __syncwarp();
-                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(args.globals.O, o_smem, {args.common.dst.batch_idx, args.common.dst.seq_idx+consumer_group::warpid(), 0, i});
+                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(args.globals.O, o_smem, {args.common.dst.batch_idx, args.common.dst.seq_idx+args.common.true_warpid, 0, i});
                 }
                 else { // write out directly to O scratch, without going through smem
                     mul(local_max_vec, local_max_vec, args.globals.Softmax_scale * 1.44269504089f);
                     log2(local_norm_vec, local_norm_vec);
                     add(local_norm_vec, local_norm_vec, local_max_vec); // l_vec = log2(norm_vec) + max_vec
-                    store(args.finish.lvec[consumer_group::warpid()][i%2][0], local_norm_vec);
+                    store(args.finish.lvec[args.common.true_warpid][i%2][0], local_norm_vec);
                     __syncwarp();
-                    tma::store_async<cache_policy::EVICT_LAST>(args.globals.Lvec_scratch, args.finish.lvec[consumer_group::warpid()][i%2][0], {-args.common.dst.batch_idx-1, args.common.dst.seq_idx+consumer_group::warpid(), 0});
-                    store(args.finish.o[warpid()][i%2], args.state.o_chunk);
+                    tma::store_async<cache_policy::EVICT_LAST>(args.globals.Lvec_scratch, args.finish.lvec[args.common.true_warpid][i%2][0], {-args.common.dst.batch_idx-1, args.common.dst.seq_idx+args.common.true_warpid, 0});
+                    store(args.finish.o[args.common.true_warpid][i%2], args.state.o_chunk);
                     __syncwarp();
-                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(args.globals.O_scratch, args.finish.o[warpid()][i%2], {-args.common.dst.batch_idx-1, args.common.dst.seq_idx+warpid(), 0, i});
+                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(args.globals.O_scratch, args.finish.o[args.common.true_warpid][i%2], {-args.common.dst.batch_idx-1, args.common.dst.seq_idx+args.common.true_warpid, 0, i});
                 }
                 tma::store_async_wait();
                 consumer_group::sync(10);
                 // tma::store_async_read_wait<1>();
             }
             if(consumer_group::warpid() == 0) invalidate_semaphore(args.scratch.mma_sem); // invalidate the semaphore for the next iteration.
+             // if(consumer_group::laneid() == 0) printf("post invalidate semaphore\n");
             tma::store_async_wait(); // not just read wait
+             // if(consumer_group::laneid() == 0) printf("post store_async_wait\n");
             asm volatile("fence.sc.cta;\n"); // Can't reorder across this boundary
             group<8>::sync(10);
             if(args.common.dst.batch_idx < 0) {

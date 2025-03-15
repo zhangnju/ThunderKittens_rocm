@@ -6,13 +6,13 @@ torch.manual_seed(0)
 
 batch = 1
 heads = 16
-new_seq = 4
+new_seq = 8
 
-L = 2048
+L = 128
 
 instructions = torch.zeros((batch,1,32), dtype=torch.int32, device='cuda')
 
-q = torch.ones((batch, new_seq, heads, 512), dtype=torch.bfloat16, device='cuda')
+q = torch.randn((batch, new_seq, heads, 512), dtype=torch.bfloat16, device='cuda')
 q_rot = torch.ones((batch, new_seq, heads, 64), dtype=torch.bfloat16, device='cuda')
 
 kv_cache = torch.randn((256*batch, 256, 512), dtype=torch.bfloat16, device='cuda')
@@ -54,7 +54,7 @@ def compute_ref(q, q_rot, k_rot_cache, kv_cache, L):
     # probs = torch.nn.functional.softmax(logits * Softmax_scale, dim=-1)
     logits -= logits.max(dim=-1, keepdim=True)[0]
     logits = torch.exp(logits)
-    # print(logits.to(torch.bfloat16))
+    print(logits.to(torch.bfloat16))
     probs = logits / logits.sum(dim=-1, keepdim=True)
     # print(probs)
     v   = kv_cache.reshape((-1,512))[:L]

@@ -245,6 +245,8 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
         all_barrier bar(15);
         
         softmax_registers<D> sr;
+        static constexpr int local_rows = fwd_attend_ker_tile_dims<D>::qo_height/(WARPGROUPS_PER_CONSUMER*WARPGROUP_WARPS), local_cols = fwd_attend_ker_tile_dims<D>::kv_height;
+        col_vec<rt_fl<local_rows, local_cols>> local_norm_vec;
         rt_fl<K::qo_height/(WARPGROUPS_PER_CONSUMER*WARPGROUP_WARPS), K::tile_width> o_reg;
         int k_input_ring = 0, v_input_ring = 0;
 
@@ -315,8 +317,10 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
 
             if constexpr (D == 64) { mul(sr.norm_vec, sr.norm_vec, -8.0f); }
             else                   { mul(sr.norm_vec, sr.norm_vec, -11.313708499f); }
+            
+            copy(local_norm_vec, sr.norm_vec);
 
-            consumer::store(l_smem[consumerid], sr.norm_vec);
+            consumer::store(l_smem[consumerid], local_norm_vec);
             consumer::sync(consumerid);
 
             if(consumer::warpid() == 0) {

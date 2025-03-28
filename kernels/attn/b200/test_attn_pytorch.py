@@ -1,6 +1,7 @@
 import torch
 import b200_attn
 import time
+import sys
 print('Finished importing')
 
 torch.manual_seed(42)
@@ -15,7 +16,7 @@ def ref_attn(q, k, v):
 
 B = 16
 H = 16
-N = 8192
+N = 8192 if len(sys.argv) < 2 else int(sys.argv[1])
 D = 128
 
 print('Starting making tensors')
@@ -36,7 +37,7 @@ b200_attn.fwd_attend_ker_128_noncausal(q, k, v, l, o)
 torch.cuda.synchronize()
 print('Finished warmup')
 t0 = time.time()
-ITERS = 5
+ITERS = 10
 for _ in range(ITERS):
     b200_attn.fwd_attend_ker_128_noncausal(q, k, v, l, o)
 torch.cuda.synchronize()
@@ -79,7 +80,6 @@ def custom_backward(q, k, v, l, o, o_grad):
     # Create d vector tensor
     d_vec = torch.empty((B, H, 1, N), dtype=torch.float, device='cuda')
     b200_attn.bwd_attend_prep_ker_128(o_grad, o, d_vec)
-    print(d_vec)
     b200_attn.bwd_attend_ker_128_noncausal(q, k, v, o_grad, qg, kg, vg, l, d_vec, q.shape[-2], 1)
     torch.cuda.synchronize()
 
@@ -109,7 +109,7 @@ b200_attn.bwd_attend_ker_128_noncausal(q, k, v, o_grad, qg, kg, vg, l, d_vec, q.
 torch.cuda.synchronize()
 print('Finished warmup backwards')
 t0 = time.time()
-ITERS = 5
+ITERS = 10
 for _ in range(ITERS):
     b200_attn.bwd_attend_prep_ker_128(o_grad, o, d_vec)
     b200_attn.bwd_attend_ker_128_noncausal(q, k, v, o_grad, qg, kg, vg, l, d_vec, q.shape[-2], 1)
@@ -121,4 +121,3 @@ print(f'Time taken: {avg_us} us/iter')
 print(f'Total FLOPs: {flops}')
 print(f'TFLOPS: {(flops / (avg_us*1e-6))*10**-12} TFLOPS')
 
-breakpoint()

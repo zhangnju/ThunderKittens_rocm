@@ -5,10 +5,10 @@
 #include "prototype.cuh"
 #include <cuda_bf16.h>
 
-constexpr size_t N = 16384;
+constexpr size_t N = 65536;
 constexpr int NUM_WARMUPS = 0; // number of warpups
 constexpr int NUM_ITERS = 1; // number of iterations for benchmarking
-constexpr int NUM_DEVICES = 3; // number of GPUs
+constexpr int NUM_DEVICES = 8; // number of GPUs
 
 constexpr bool CHECK = NUM_ITERS == 1 && NUM_WARMUPS == 0;
 

@@ -86,7 +86,7 @@ namespace kittens::prototype::vm
                 kittens::warp::sync(); // done, now we can proceed to other things.
                 if (kittens::laneid() < 4)
                 {
-                    s.wait_page_ready(get_weight_page(s, kittens::laneid()));
+                    // s.wait_page_ready(get_weight_page(s, kittens::laneid()));
                     s.record(16 + kittens::laneid());
                     auto &weight_chunk = reinterpret_cast<kittens::st_bf<16, 512> &>(s.pages[get_weight_page(s, kittens::laneid())]);
                     kittens::tma::expect(inputs_arrived(s, kittens::laneid()), weight_chunk);
@@ -100,7 +100,7 @@ namespace kittens::prototype::vm
                 else if (kittens::laneid() == 31)
                 {
                     int activation_page = get_activation_page(s);
-                    s.wait_page_ready(activation_page);
+                    // s.wait_page_ready(activation_page);
                     while (*(volatile int *)&g.Bar[{inst.layer, prev_opcode - 1, 0}] < EXPECTED_ARRIVAL_COUNT)
                         __nanosleep(20);
                     s.record(24);
@@ -113,8 +113,8 @@ namespace kittens::prototype::vm
                 else if (kittens::laneid() >= 5 && kittens::laneid() <= 12)
                 {
                     int unused_page = s.pid(kittens::laneid());
-                    s.wait_page_ready(unused_page);
-                    kittens::arrive(s.page_finished[unused_page], Config::NUM_CONSUMER_WARPS); // Release the unused pages immediately.
+                    // s.wait_page_ready(unused_page);
+                    // kittens::arrive(s.page_finished[unused_page], Config::NUM_CONSUMER_WARPS); // Release the unused pages immediately.
                 }
             }
         };
@@ -145,7 +145,7 @@ namespace kittens::prototype::vm
                 st_bf<16, 128>(&weights_smem)[4] = reinterpret_cast<st_bf<16, 128>(&)[4]>(s.pages[weight_page]);
                 kittens::warp::load(weights, weights_smem[warp_id]);
                 kittens::warp::sync();
-                kittens::warp::arrive(s.page_finished[weight_page], Config::NUM_CONSUMER_WARPS / 4); // this is called by each warp in the warpgroup
+                // kittens::warp::arrive(s.page_finished[weight_page], Config::NUM_CONSUMER_WARPS / 4); // this is called by each warp in the warpgroup
                 // Next we need to load the activations
                 wait(activations_arrived(s), 0);
                 if (laneid() == 0)
@@ -155,7 +155,7 @@ namespace kittens::prototype::vm
                 kittens::sv_bf<128>(&activations_smem)[16] = reinterpret_cast<kittens::sv_bf<128>(&)[16]>(s.pages[activation_page]);
                 kittens::warp::load(activations_vec, activations_smem[kittens::warpid()]);
                 kittens::warp::sync();
-                kittens::warp::arrive(s.page_finished[activation_page]); // just 1 is sufficient
+                // kittens::warp::arrive(s.page_finished[activation_page]); // just 1 is sufficient
                 // broadcast this into a tile
                 kittens::warp::broadcast_col(broadcast_activations, activations_vec);
                 kittens::warp::mul(broadcast_activations, broadcast_activations, weights);

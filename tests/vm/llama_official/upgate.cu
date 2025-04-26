@@ -102,7 +102,7 @@ namespace kittens::prototype::vm
                 if (laneid() < UP_PAGES)
                 {
                     int pg = get_up_page(s, laneid());
-                    s.wait_page_ready(pg);
+                    // s.wait_page_ready(pg);
                     s.record(16 + laneid());
                     auto &chunk = reinterpret_cast<st_bf<Globals::matvec_block_size, 512> &>(s.pages[pg]);
                     tma::expect(up_arrived(s, laneid()), chunk);
@@ -116,7 +116,7 @@ namespace kittens::prototype::vm
                 {
                     int idx = laneid() - UP_PAGES;
                     int pg = get_gate_page(s, idx);
-                    s.wait_page_ready(pg);
+                    // s.wait_page_ready(pg);
                     s.record(16 + laneid());
                     auto &chunk = reinterpret_cast<st_bf<Globals::matvec_block_size, 512> &>(s.pages[pg]);
                     tma::expect(gate_arrived(s, idx), chunk);
@@ -129,7 +129,7 @@ namespace kittens::prototype::vm
                 else if (laneid() == PAGE_INPUT)
                 {
                     int pg = get_input_page(s);
-                    s.wait_page_ready(pg);
+                    // s.wait_page_ready(pg);
                     s.record(16 + laneid());
                     // wait on barrier from previous op
                     while (*(volatile int *)&g.Bar[{inst.layer, prev_opcode - 1, 0}] < EXPECTED_ARRIVAL_COUNT)
@@ -143,7 +143,7 @@ namespace kittens::prototype::vm
                 else if (laneid() == PAGE_RMS_SCALE)
                 {
                     int rms_scale_page = get_rms_scale_page(s);
-                    s.wait_page_ready(rms_scale_page);
+                    // s.wait_page_ready(rms_scale_page);
                     s.record(16 + laneid());
                     auto &rms_scale = reinterpret_cast<sv_bf<2048> &>(s.pages[rms_scale_page]);
                     tma::expect(rms_scale_arrived(s), rms_scale);
@@ -155,8 +155,8 @@ namespace kittens::prototype::vm
                 else if (laneid() < config::NUM_PAGES)
                 {
                     int pg = s.pid(laneid());
-                    s.wait_page_ready(pg);
-                    arrive(s.page_finished[pg], Config::NUM_CONSUMER_WARPS);
+                    // s.wait_page_ready(pg);
+                    // arrive(s.page_finished[pg], Config::NUM_CONSUMER_WARPS);
                 }
             }
         };
@@ -211,7 +211,7 @@ namespace kittens::prototype::vm
                 warp::load(activations_vec, activations_smem[warpid()]);
                 warp::load(rms_scale_vec, rms_scale_smem[warpid()]); // no idea why yet but we must load this here, otherwise deadlock
                 warp::sync();
-                warp::arrive(s.page_finished[activation_page]); // just 1 is sufficient
+                // warp::arrive(s.page_finished[activation_page]); // just 1 is sufficient
 
                 //---------------------------------------------------
                 // RMS NORM
@@ -239,7 +239,7 @@ namespace kittens::prototype::vm
                 warp::copy(activations_vec, float_activations); // back to bf16
 
                 // multiply by rms scale
-                warp::arrive(s.page_finished[rms_scale_page]);
+                // warp::arrive(s.page_finished[rms_scale_page]);
                 warp::mul(activations_vec, activations_vec, rms_scale_vec);
 
                 //--------------------------------------------------
@@ -252,7 +252,7 @@ namespace kittens::prototype::vm
                 block_st(&weights_smem)[4] = reinterpret_cast<block_st(&)[4]>(s.pages[weight_page]);
                 warp::load(weights, weights_smem[warp_id]);
                 warp::sync();
-                warp::arrive(s.page_finished[weight_page], Config::NUM_CONSUMER_WARPS / 4); // this is called by each warp in the warpgroup
+                // warp::arrive(s.page_finished[weight_page], Config::NUM_CONSUMER_WARPS / 4); // this is called by each warp in the warpgroup
 
                 // broadcast this into a tile
                 warp::broadcast_col(broadcast_activations, activations_vec);
@@ -271,7 +271,7 @@ namespace kittens::prototype::vm
                 block_st(&gate_weights_smem)[4] = reinterpret_cast<block_st(&)[4]>(s.pages[gate_weight_page]);
                 warp::load(gate_weights, gate_weights_smem[warp_id]);
                 warp::sync();
-                warp::arrive(s.page_finished[gate_weight_page], Config::NUM_CONSUMER_WARPS / 4); // called by each warp in the warpgroup
+                // warp::arrive(s.page_finished[gate_weight_page], Config::NUM_CONSUMER_WARPS / 4); // called by each warp in the warpgroup
 
                 // broadcast this into a tile
                 warp::broadcast_col(gate_broadcast_activations, activations_vec);

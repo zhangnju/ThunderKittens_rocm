@@ -118,14 +118,14 @@ template<typename config> struct state {
     using page_array_t = page<config>[config::NUM_PAGES];
     page_array_t &pages;
 
-    using page_semaphore_array_t = kittens::semaphore[config::NUM_PAGES];
-    page_semaphore_array_t &page_finished;
+    // using page_semaphore_array_t = kittens::semaphore[config::NUM_PAGES];
+    // page_semaphore_array_t &page_finished;
 
     __device__ inline int pid(int lid) {
         return reg_pid_order[lid];
     }
     __device__ inline void wait_page_ready(int pid) {
-        wait(page_finished[pid], instruction_index%2);
+        // wait(page_finished[pid], instruction_index%2);
     }
 
     semaphore &tensor_finished;

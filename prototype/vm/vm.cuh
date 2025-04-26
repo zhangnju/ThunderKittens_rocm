@@ -23,8 +23,7 @@ __device__ inline void kvm_internal(const globals &g) {
     if(threadIdx.x == 0) printf("Thread %d: Kernel launched\n", threadIdx.x); group<config::NUM_WARPS>::sync(15);
 #endif
     __shared__ alignas(128) instruction_state_t<config> instruction_state[config::INSTRUCTION_PIPELINE_STAGES];
-    __shared__ kittens::semaphore page_finished[config::NUM_PAGES],
-                                  instruction_arrived[config::INSTRUCTION_PIPELINE_STAGES],
+    __shared__ kittens::semaphore instruction_arrived[config::INSTRUCTION_PIPELINE_STAGES],
                                   instruction_finished[config::INSTRUCTION_PIPELINE_STAGES],
                                   tensor_finished,
                                   semaphores_ready;
@@ -42,7 +41,7 @@ __device__ inline void kvm_internal(const globals &g) {
         0, 0,
         { /* ... */ },
         pages,
-        page_finished,
+        // page_finished,
         tensor_finished,
         semaphores_ready,
         start_time,
@@ -66,8 +65,8 @@ __device__ inline void kvm_internal(const globals &g) {
         init_semaphore(instruction_finished[threadIdx.x], config::NUM_WARPS); // All warps but the controller warp arrive here, and the semaphore initializer thread also arrives here.
     }
     if(threadIdx.x < config::NUM_PAGES) {
-        init_semaphore(page_finished[threadIdx.x], config::NUM_CONSUMER_WARPS);
-        arrive(page_finished[threadIdx.x], config::NUM_CONSUMER_WARPS); // Flip to state 0, to mark that it starts as available.
+        // init_semaphore(page_finished[threadIdx.x], config::NUM_CONSUMER_WARPS);
+        // arrive(page_finished[threadIdx.x], config::NUM_CONSUMER_WARPS); // Flip to state 0, to mark that it starts as available.
     }
     if(threadIdx.x == 0) {
         init_semaphore(tensor_finished, config::NUM_CONSUMER_WARPS);

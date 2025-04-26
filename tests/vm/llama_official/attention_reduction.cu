@@ -79,14 +79,14 @@ namespace kittens::prototype::vm
         {
             if (warp::laneid() == 0)
             {
-                s.wait_page_ready(s.pid(SHARED_DATA_PAGE));
+                // s.wait_page_ready(s.pid(SHARED_DATA_PAGE));
             }
         }
         __device__ static inline void finish_shared_page(state<Config> &s)
         {
             if (warp::laneid() == 0)
             {
-                arrive(s.page_finished[s.pid(SHARED_DATA_PAGE)], Config::NUM_CONSUMER_WARPS);
+                // arrive(s.page_finished[s.pid(SHARED_DATA_PAGE)], Config::NUM_CONSUMER_WARPS);
             }
         }
 
@@ -157,8 +157,8 @@ namespace kittens::prototype::vm
                     wait_shared_page(s);
                 } else if (laneid < Config::NUM_PAGES)
                 {
-                    s.wait_page_ready(s.pid(laneid));
-                    arrive(s.page_finished[s.pid(laneid)], Config::NUM_CONSUMER_WARPS);
+                    // s.wait_page_ready(s.pid(laneid));
+                    // arrive(s.page_finished[s.pid(laneid)], Config::NUM_CONSUMER_WARPS);
                 }
                 warp::sync(); // Have to make sure lane 0 finished waiting
                 s.record(16);

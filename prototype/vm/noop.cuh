@@ -21,8 +21,8 @@ template<typename config> struct NoOp {
     struct loader {
         template<typename globals> static __device__ void run(const globals &g, state<config> &s) {
             if(laneid() < config::NUM_PAGES) { // Release all pages, ASAP.
-                s.wait_page_ready(s.pid(laneid()));
-                arrive(s.page_finished[s.pid(laneid())], config::NUM_CONSUMER_WARPS); // Release the unused pages immediately.
+                // s.wait_page_ready(s.pid(laneid()));
+                // arrive(s.page_finished[s.pid(laneid())], config::NUM_CONSUMER_WARPS); // Release the unused pages immediately.
             }
         }
     };

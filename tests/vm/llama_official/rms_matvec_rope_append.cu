@@ -66,14 +66,14 @@ namespace kittens::prototype::vm {
             
                 if (laneid() < 4) {
                     // QKV projection weights
-                    s.wait_page_ready(get_weight_page(s, laneid()));
+                    // s.wait_page_ready(get_weight_page(s, laneid()));
                     s.record(16 + laneid());
                     auto &weight_chunk = reinterpret_cast<st_bf<16, 512> &>(s.pages[get_weight_page(s, laneid())]);
                     tma::expect(weights_arrived(s, laneid()), weight_chunk);
                     tma::load_async(weight_chunk, g.qkv_weights, {inst.layer_idx, inst.qkv_block_idx, laneid()}, weights_arrived(s, laneid()));
                 } else if (laneid() == 4) {
                     // Activation
-                    s.wait_page_ready(get_activation_page(s));
+                    // s.wait_page_ready(get_activation_page(s));
                     s.record(23);
                     while (inst.layer_idx > 0 && *(volatile int *)&g.Bar[{inst.layer_idx - 1, OPCODE_DownProjResidual - 1, 0}] != 512) __nanosleep(20);
                     s.record(24);
@@ -82,29 +82,29 @@ namespace kittens::prototype::vm {
                     tma::load_async(activations, g.hidden_states, {}, activations_arrived(s));
                 } else if (laneid() == 5) {
                     // RMS scale
-                    s.wait_page_ready(get_rms_scale_page(s));
+                    // s.wait_page_ready(get_rms_scale_page(s));
                     s.record(26);
                     auto &rms_scale = reinterpret_cast<sv_bf<2048> &>(s.pages[get_rms_scale_page(s)]);
                     tma::expect(rms_scale_arrived(s), rms_scale);
                     tma::load_async(rms_scale, g.attn_norm_weights, {inst.layer_idx, 0}, rms_scale_arrived(s));
                 } else if (laneid() == 6) {
                     // Rope cos
-                    s.wait_page_ready(get_rope_cos_page(s));
+                    // s.wait_page_ready(get_rope_cos_page(s));
                     s.record(28);
                     auto &rope_cos = reinterpret_cast<sv_fl<16> &>(s.pages[get_rope_cos_page(s)]);
                     tma::expect(rope_cos_arrived(s), rope_cos);
                     tma::load_async(rope_cos, g.rope_cos, {0, 0, static_cast<int>(g.pos_id), inst.qkv_block_idx % 4}, rope_cos_arrived(s));
                 } else if (laneid() == 7) {
                     // Rope sin
-                    s.wait_page_ready(get_rope_sin_page(s));
+                    // s.wait_page_ready(get_rope_sin_page(s));
                     s.record(30);
                     auto &rope_sin = reinterpret_cast<sv_fl<16> &>(s.pages[get_rope_sin_page(s)]);
                     tma::expect(rope_sin_arrived(s), rope_sin);
                     tma::load_async(rope_sin, g.rope_sin, {0, 0, static_cast<int>(g.pos_id), inst.qkv_block_idx % 4}, rope_sin_arrived(s));
                 } else if (laneid() >= 8 && laneid() <= 12) {
                     // Unused pages
-                    s.wait_page_ready(s.pid(laneid()));
-                    arrive(s.page_finished[s.pid(laneid())], Config::NUM_CONSUMER_WARPS);
+                    // s.wait_page_ready(s.pid(laneid()));
+                    // arrive(s.page_finished[s.pid(laneid())], Config::NUM_CONSUMER_WARPS);
                 }
             }
         };
@@ -288,8 +288,8 @@ namespace kittens::prototype::vm {
                 // Currently, the way we do it in consumer is incorrect. I have moved them here 
                 // so I can get the entire thing running first
                 if (laneid() < 8) {
-                    s.wait_page_ready(s.pid(laneid()));
-                    arrive(s.page_finished[s.pid(laneid())], Config::NUM_CONSUMER_WARPS);
+                    // s.wait_page_ready(s.pid(laneid()));
+                    // arrive(s.page_finished[s.pid(laneid())], Config::NUM_CONSUMER_WARPS);
                 }
                 if (laneid() == 0)
                     s.record(127);

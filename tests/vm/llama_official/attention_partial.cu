@@ -80,17 +80,21 @@ namespace kittens::prototype::vm
             return s.semaphores()[3 + NUM_STAGES * 2 + stage * 2 + 1];
         }
 
-        __device__ static inline void wait_QOL_page(state<config> &s) { s.wait_page_ready(s.pid(QOL_PAGE)); }
-        __device__ static inline void wait_KV_page(state<config> &s) { s.wait_page_ready(s.pid(KV_PAGE)); }
+        __device__ static inline void wait_QOL_page(state<config> &s) { 
+            // s.wait_page_ready(s.pid(QOL_PAGE)); 
+        }
+        __device__ static inline void wait_KV_page(state<config> &s) { 
+            // s.wait_page_ready(s.pid(KV_PAGE)); 
+        }
         __device__ static inline void finish_QOL_page(state<config> &s)
         {
-            if (warp::laneid() == 0)
-                arrive(s.page_finished[s.pid(QOL_PAGE)], config::NUM_CONSUMER_WARPS);
+            // if (warp::laneid() == 0)
+            //     arrive(s.page_finished[s.pid(QOL_PAGE)], config::NUM_CONSUMER_WARPS);
         }
         __device__ static inline void finish_KV_page(state<config> &s)
         {
-            if (warp::laneid() == 0)
-                arrive(s.page_finished[s.pid(KV_PAGE)], config::NUM_CONSUMER_WARPS);
+            // if (warp::laneid() == 0)
+            //     arrive(s.page_finished[s.pid(KV_PAGE)], config::NUM_CONSUMER_WARPS);
         }
         __device__ static inline q_st &get_Q_smem(state<config> &s)
         {
@@ -336,8 +340,8 @@ namespace kittens::prototype::vm
                 else if (laneid >= 2 && laneid < config::NUM_PAGES)
                 {
                     int unused_page = s.pid(laneid);
-                    s.wait_page_ready(unused_page);
-                    arrive(s.page_finished[unused_page], config::NUM_CONSUMER_WARPS);
+                    // s.wait_page_ready(unused_page);
+                    // arrive(s.page_finished[unused_page], config::NUM_CONSUMER_WARPS);
                 }
             }
         };

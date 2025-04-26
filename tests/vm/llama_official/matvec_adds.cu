@@ -86,35 +86,43 @@ namespace kittens::prototype::vm
                 kittens::warp::sync(); // done, now we can proceed to other things.
                 if (kittens::laneid() < 4)
                 {
-                    s.wait_page_ready(get_weight_page(s, kittens::laneid()));
+                    // s.wait_page_ready(get_weight_page(s, kittens::laneid()));
                     s.record(16 + kittens::laneid());
                     auto &weight_chunk = reinterpret_cast<kittens::st_bf<16, 512> &>(s.pages[get_weight_page(s, kittens::laneid())]);
-                    kittens::tma::expect(inputs_arrived(s, kittens::laneid()), weight_chunk);
+                    // kittens::tma::expect(inputs_arrived(s, kittens::laneid()), weight_chunk);
 
                     auto &weights_global = g.*WeightsPtr; // object in global memory
-                    kittens::tma::load_async(weight_chunk, weights_global, coord<>{inst.layer, inst.start_output_col, inst.start_reduction_col + 512 * laneid()}, inputs_arrived(s, laneid()));
+                    // kittens::tma::load_async(weight_chunk, weights_global, coord<>{inst.layer, inst.start_output_col, inst.start_reduction_col + 512 * laneid()}, inputs_arrived(s, laneid()));
 
                     // auto& weights_global = g.*WeightsPtr;      // object in global memory
                     // kittens::tma::load_async(weight_chunk, weights_global, coord<>{inst.layer, inst.start_output_col, inst.start_reduction_col + 512 * laneid()}, inputs_arrived(s, laneid()));
+                    // arrive(s.page_finished[get_weight_page(s, kittens::laneid())], Config::NUM_CONSUMER_WARPS);
                 }
                 else if (kittens::laneid() == 31)
                 {
                     int activation_page = get_activation_page(s);
-                    s.wait_page_ready(activation_page);
+                    // s.wait_page_ready(activation_page);
                     while (*(volatile int *)&g.Bar[{inst.layer, prev_opcode - 1, 0}] < EXPECTED_ARRIVAL_COUNT)
                         __nanosleep(20);
                     s.record(24);
                     auto &activations = reinterpret_cast<sv_bf<2048> &>(s.pages[activation_page]);
-                    kittens::tma::expect(activations_arrived(s), activations);
+                    // kittens::tma::expect(activations_arrived(s), activations);
 
                     auto &InputActivations = g.*InputActivationsPtr; // object in global memory
-                    kittens::tma::load_async(activations, InputActivations, coord<>{inst.start_reduction_col}, activations_arrived(s));
+                    // kittens::tma::load_async(activations, InputActivations, coord<>{inst.start_reduction_col}, activations_arrived(s));
+                    // arrive(s.page_finished[activation_page], Config::NUM_CONSUMER_WARPS);
                 }
-                else if (kittens::laneid() >= 5 && kittens::laneid() <= 12)
-                {
-                    int unused_page = s.pid(kittens::laneid());
+                // else if (kittens::laneid() >= 5 && kittens::laneid() <= 12)
+                // {
+                //     int unused_page = s.pid(kittens::laneid());
+                //     s.wait_page_ready(unused_page);
+                //     kittens::arrive(s.page_finished[unused_page], Config::NUM_CONSUMER_WARPS); // Release the unused pages immediately.
+                // }
+
+                if (warp::laneid() < config::NUM_PAGES) {
+                    int unused_page = s.pid(warp::laneid());
                     s.wait_page_ready(unused_page);
-                    kittens::arrive(s.page_finished[unused_page], Config::NUM_CONSUMER_WARPS); // Release the unused pages immediately.
+                    arrive(s.page_finished[unused_page], config::NUM_CONSUMER_WARPS);
                 }
             }
         };
@@ -137,7 +145,7 @@ namespace kittens::prototype::vm
                 kittens::rv_fl<16> output;
                 int group_id = kittens::warpgroup::groupid();
                 int warp_id = kittens::warpgroup::warpid(); // id within the warpgroup
-                wait(inputs_arrived(s, group_id), 0);
+                // wait(inputs_arrived(s, group_id), 0);
                 if (laneid() == 0)
                     s.record(32 + warpid());
                 // Reinterpret the page as a st_bf<16, 128>[4], which turns out to be a valid recast of the layout.
@@ -145,9 +153,8 @@ namespace kittens::prototype::vm
                 st_bf<16, 128>(&weights_smem)[4] = reinterpret_cast<st_bf<16, 128>(&)[4]>(s.pages[weight_page]);
                 kittens::warp::load(weights, weights_smem[warp_id]);
                 kittens::warp::sync();
-                kittens::warp::arrive(s.page_finished[weight_page], Config::NUM_CONSUMER_WARPS / 4); // this is called by each warp in the warpgroup
                 // Next we need to load the activations
-                wait(activations_arrived(s), 0);
+                // wait(activations_arrived(s), 0);
                 if (laneid() == 0)
                     s.record(64 + warpid());
                 // reinterpret the activations page as sv_bf<128>[16]
@@ -155,7 +162,6 @@ namespace kittens::prototype::vm
                 kittens::sv_bf<128>(&activations_smem)[16] = reinterpret_cast<kittens::sv_bf<128>(&)[16]>(s.pages[activation_page]);
                 kittens::warp::load(activations_vec, activations_smem[kittens::warpid()]);
                 kittens::warp::sync();
-                kittens::warp::arrive(s.page_finished[activation_page]); // just 1 is sufficient
                 // broadcast this into a tile
                 kittens::warp::broadcast_col(broadcast_activations, activations_vec);
                 kittens::warp::mul(broadcast_activations, broadcast_activations, weights);
@@ -202,8 +208,8 @@ namespace kittens::prototype::vm
                     s.record(125);
 
                     auto &OutputActivations = g.*OutputActivationsPtr; // object in global memory
-                    kittens::tma::store_add_async(OutputActivations, output_bf, {inst.output_block_idx});
-                    kittens::tma::store_async_wait(); // not just read wait! full wait! must be visible in global!
+                    // kittens::tma::store_add_async(OutputActivations, output_bf, {inst.output_block_idx});
+                    // kittens::tma::store_async_wait(); // not just read wait! full wait! must be visible in global!
                     s.record(126);
                 }
                 kittens::warp::sync();

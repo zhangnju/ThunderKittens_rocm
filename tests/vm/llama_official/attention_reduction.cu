@@ -79,15 +79,15 @@ namespace kittens::prototype::vm
         {
             if (warp::laneid() == 0)
             {
-                s.wait_page_ready(s.pid(SHARED_DATA_PAGE));
+                // s.wait_page_ready(s.pid(SHARED_DATA_PAGE));
             }
         }
         __device__ static inline void finish_shared_page(state<Config> &s)
         {
-            if (warp::laneid() == 0)
-            {
-                arrive(s.page_finished[s.pid(SHARED_DATA_PAGE)], Config::NUM_CONSUMER_WARPS);
-            }
+            // if (warp::laneid() == 0)
+            // {
+            //     arrive(s.page_finished[s.pid(SHARED_DATA_PAGE)], Config::NUM_CONSUMER_WARPS);
+            // }
         }
 
         // --- Shared Memory Layout and Access Helpers (Single Page) ---
@@ -153,13 +153,13 @@ namespace kittens::prototype::vm
             {
                 auto laneid = warp::laneid();
 
-                if (laneid == 0) {
-                    wait_shared_page(s);
-                } else if (laneid < Config::NUM_PAGES)
-                {
-                    s.wait_page_ready(s.pid(laneid));
-                    arrive(s.page_finished[s.pid(laneid)], Config::NUM_CONSUMER_WARPS);
-                }
+                // if (laneid == 0) {
+                //     wait_shared_page(s);
+                // } else if (laneid < Config::NUM_PAGES)
+                // {
+                //     s.wait_page_ready(s.pid(laneid));
+                //     arrive(s.page_finished[s.pid(laneid)], Config::NUM_CONSUMER_WARPS);
+                // }
                 warp::sync(); // Have to make sure lane 0 finished waiting
                 s.record(16);
 
@@ -175,9 +175,9 @@ namespace kittens::prototype::vm
                     s.record(17 + laneid);
 
                     l_partial_sv &L_smem = get_L_partial_smem(s, local_q_head);
-                    tma::expect(L_partial_all_arrived(s, local_q_head), L_smem);
-                    tma::load_async<cache_policy::EVICT_FIRST>(
-                        L_smem, g.attn_lse_intermediates, {0, 0, inst.q_head_start_idx + local_q_head, 0}, L_partial_all_arrived(s, local_q_head));
+                    // tma::expect(L_partial_all_arrived(s, local_q_head), L_smem);
+                    // tma::load_async<cache_policy::EVICT_FIRST>(
+                    //     L_smem, g.attn_lse_intermediates, {0, 0, inst.q_head_start_idx + local_q_head, 0}, L_partial_all_arrived(s, local_q_head));
 
                     for (int i = 0; i < inst.num_partials; ++i)
                     {
@@ -187,16 +187,22 @@ namespace kittens::prototype::vm
                         if (i >= NUM_STAGES)
                         {
                             int prev_phase = (i / NUM_STAGES - 1) % 2;
-                            wait(O_partial_finished(s, local_q_head, stage), prev_phase);
+                            // wait(O_partial_finished(s, local_q_head, stage), prev_phase);
                         }
                         s.record(21 + (laneid * inst.num_partials) + i);
 
-                        tma::expect(O_partial_arrived(s, local_q_head, stage), O_smem);
-                        tma::load_async<cache_policy::EVICT_FIRST>(
-                            O_smem, g.attn_out_intermediates, {0, inst.q_head_start_idx + local_q_head, i, 0}, O_partial_arrived(s, local_q_head, stage));
+                        // tma::expect(O_partial_arrived(s, local_q_head, stage), O_smem);
+                        // tma::load_async<cache_policy::EVICT_FIRST>(
+                        //     O_smem, g.attn_out_intermediates, {0, inst.q_head_start_idx + local_q_head, i, 0}, O_partial_arrived(s, local_q_head, stage));
                     }
                 }
                 warp::sync();
+
+                if (warp::laneid() < config::NUM_PAGES) {
+                    int unused_page = s.pid(warp::laneid());
+                    s.wait_page_ready(unused_page);
+                    arrive(s.page_finished[unused_page], config::NUM_CONSUMER_WARPS);
+                }
             }
         };
 
@@ -229,7 +235,7 @@ namespace kittens::prototype::vm
 
                     warp::zero(accumulated_out);
 
-                    warp::wait(L_partial_all_arrived(s, q_head_local_idx), 0);
+                    // warp::wait(L_partial_all_arrived(s, q_head_local_idx), 0);
                     if (laneid() == 0) s.record(40 + q_head_local_idx);
                     l_partial_sv &L_smem = get_L_partial_smem(s, q_head_local_idx);
 
@@ -237,7 +243,7 @@ namespace kittens::prototype::vm
                     for (int i = 0; i < inst.num_partials; ++i)
                     {
                         int stage = i % NUM_STAGES;
-                        warp::wait(O_partial_arrived(s, q_head_local_idx, stage), (i / NUM_STAGES) % 2);
+                        // warp::wait(O_partial_arrived(s, q_head_local_idx, stage), (i / NUM_STAGES) % 2);
                         if (laneid() == 0) s.record(44 + (q_head_local_idx * inst.num_partials) + i);
 
                         o_sv &O_smem = get_O_partial_smem(s, q_head_local_idx, stage);
@@ -267,7 +273,7 @@ namespace kittens::prototype::vm
 
                         warp::arrive(O_partial_finished(s, q_head_local_idx, stage));
                     }
-                    warp::arrive(L_partial_all_finished(s, q_head_local_idx));
+                    // warp::arrive(L_partial_all_finished(s, q_head_local_idx)); // TODO remove this line and push
 
                     o_final_sv &O_final_smem = get_O_final_smem(s, q_head_local_idx);
                     warp::store(O_final_smem, accumulated_out);
@@ -292,8 +298,8 @@ namespace kittens::prototype::vm
                     wait(final_O_ready(s, q_head_local_idx), 0);
                     if (laneid() == 0) s.record(123 + q_head_local_idx);
 
-                    tma::store_async<cache_policy::NORMAL>(g.attn_out, O_final_smem, {0, 0, 0, inst.q_head_start_idx + q_head_local_idx});
-                    tma::store_async_wait();
+                    // tma::store_async<cache_policy::NORMAL>(g.attn_out, O_final_smem, {0, 0, 0, inst.q_head_start_idx + q_head_local_idx});
+                    // tma::store_async_wait();
                     finish_shared_page(s);
 
                     // atomicAdd(&g.Bar[{inst.layer_idx, opcode - 1, inst.q_head_start_idx + q_head_local_idx}], 1);

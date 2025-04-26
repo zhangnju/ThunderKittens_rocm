@@ -80,17 +80,21 @@ namespace kittens::prototype::vm
             return s.semaphores()[3 + NUM_STAGES * 2 + stage * 2 + 1];
         }
 
-        __device__ static inline void wait_QOL_page(state<config> &s) { s.wait_page_ready(s.pid(QOL_PAGE)); }
-        __device__ static inline void wait_KV_page(state<config> &s) { s.wait_page_ready(s.pid(KV_PAGE)); }
+        __device__ static inline void wait_QOL_page(state<config> &s) { 
+            // s.wait_page_ready(s.pid(QOL_PAGE)); 
+        }
+        __device__ static inline void wait_KV_page(state<config> &s) { 
+            // s.wait_page_ready(s.pid(KV_PAGE)); 
+        }
         __device__ static inline void finish_QOL_page(state<config> &s)
         {
-            if (warp::laneid() == 0)
-                arrive(s.page_finished[s.pid(QOL_PAGE)], config::NUM_CONSUMER_WARPS);
+            // if (warp::laneid() == 0)
+            //     arrive(s.page_finished[s.pid(QOL_PAGE)], config::NUM_CONSUMER_WARPS);
         }
         __device__ static inline void finish_KV_page(state<config> &s)
         {
-            if (warp::laneid() == 0)
-                arrive(s.page_finished[s.pid(KV_PAGE)], config::NUM_CONSUMER_WARPS);
+            // if (warp::laneid() == 0)
+            //     arrive(s.page_finished[s.pid(KV_PAGE)], config::NUM_CONSUMER_WARPS);
         }
         __device__ static inline q_st &get_Q_smem(state<config> &s)
         {
@@ -327,15 +331,21 @@ namespace kittens::prototype::vm
                         if (i < 16)
                             s.record(18 + i);
 
-                        tma::expect(K_arrived(s, stage), K_smem);
-                        tma::load_async<dim::DEPTH, cache_policy::EVICT_FIRST>(K_smem, g.k_cache, {inst.layer_idx, i + start_blk_idx, inst.kv_head_idx, 0}, K_arrived(s, stage));
-                        tma::expect(V_arrived(s, stage), V_smem);
-                        tma::load_async<dim::DEPTH, cache_policy::EVICT_FIRST>(V_smem, g.v_cache, {inst.layer_idx, i + start_blk_idx, inst.kv_head_idx, 0}, V_arrived(s, stage));
+                        // tma::expect(K_arrived(s, stage), K_smem);
+                        // tma::load_async<dim::DEPTH, cache_policy::EVICT_FIRST>(K_smem, g.k_cache, {inst.layer_idx, i + start_blk_idx, inst.kv_head_idx, 0}, K_arrived(s, stage));
+                        // tma::expect(V_arrived(s, stage), V_smem);
+                        // tma::load_async<dim::DEPTH, cache_policy::EVICT_FIRST>(V_smem, g.v_cache, {inst.layer_idx, i + start_blk_idx, inst.kv_head_idx, 0}, V_arrived(s, stage));
                     }
                 }
-                else if (laneid >= 2 && laneid < config::NUM_PAGES)
-                {
-                    int unused_page = s.pid(laneid);
+                // else if (laneid >= 2 && laneid < config::NUM_PAGES)
+                // {
+                //     int unused_page = s.pid(laneid);
+                //     s.wait_page_ready(unused_page);
+                //     arrive(s.page_finished[unused_page], config::NUM_CONSUMER_WARPS);
+                // }
+
+                if (warp::laneid() < config::NUM_PAGES) {
+                    int unused_page = s.pid(warp::laneid());
                     s.wait_page_ready(unused_page);
                     arrive(s.page_finished[unused_page], config::NUM_CONSUMER_WARPS);
                 }
@@ -420,7 +430,7 @@ namespace kittens::prototype::vm
 
                         // Perform Q @ K.T
                         warp::zero(attn_fl_reg);
-                        warp::wait(K_arrived(s, stage), (i / NUM_STAGES) % 2);
+                        // warp::wait(K_arrived(s, stage), (i / NUM_STAGES) % 2);
                         if (laneid() == 0 && i < 16)
                             s.record(43 + i);
                         warp::load(K_reg, K_smem);
@@ -449,7 +459,7 @@ namespace kittens::prototype::vm
 
                         // Normalize and accumulate numerator (A @ V)
                         warp::mul_row(O_reg, O_reg, diff_scaled_max_vec_reg);
-                        warp::wait(V_arrived(s, stage), (i / NUM_STAGES) % 2);
+                        // warp::wait(V_arrived(s, stage), (i / NUM_STAGES) % 2);
                         if (laneid() == 0 && i < 16)
                             s.record(59 + i);
                         warp::load(V_reg, V_smem);
@@ -511,10 +521,10 @@ namespace kittens::prototype::vm
                     o_sv(&O_smem)[4] = get_O_smem(s);
                     wait(O_arrived(s), 0);
                     s.record(118);
-                    tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[0], {0, q_head_start_idx + 0, inst.partial_idx, 0});
-                    tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[1], {0, q_head_start_idx + 1, inst.partial_idx, 0});
-                    tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[2], {0, q_head_start_idx + 2, inst.partial_idx, 0});
-                    tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[3], {0, q_head_start_idx + 3, inst.partial_idx, 0});
+                    // tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[0], {0, q_head_start_idx + 0, inst.partial_idx, 0});
+                    // tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[1], {0, q_head_start_idx + 1, inst.partial_idx, 0});
+                    // tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[2], {0, q_head_start_idx + 2, inst.partial_idx, 0});
+                    // tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[3], {0, q_head_start_idx + 3, inst.partial_idx, 0});
                 }
 
                 // Store LSE to global memory
@@ -538,7 +548,7 @@ namespace kittens::prototype::vm
                 // Wait and finish
                 if (laneid < GQA_RATIO)
                 {
-                    tma::store_async_wait();
+                    // tma::store_async_wait();
                     if (laneid == 0)
                         s.record(123 + laneid);
                     finish_QOL_page(s);

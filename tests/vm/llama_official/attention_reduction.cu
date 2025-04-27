@@ -166,34 +166,40 @@ namespace kittens::prototype::vm
                 if (laneid < Q_HEADS_PER_INSTRUCTION)
                 {
                     parsed_instruction inst{s};
-                    int local_q_head = laneid;
 
-                    while (*(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1, inst.q_head_start_idx + local_q_head}] < inst.num_partials)
+                    while (*(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1, inst.q_head_start_idx + 0}] < inst.num_partials &&
+                           *(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1, inst.q_head_start_idx + 1}] < inst.num_partials &&
+                           *(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1, inst.q_head_start_idx + 2}] < inst.num_partials &&
+                           *(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1, inst.q_head_start_idx + 3}] < inst.num_partials)
                     {
                         __nanosleep(20);
                     }
-                    s.record(17 + laneid);
+                    s.record(17);
 
-                    l_partial_sv &L_smem = get_L_partial_smem(s, local_q_head);
-                    tma::expect(L_partial_all_arrived(s, local_q_head), L_smem);
-                    tma::load_async<cache_policy::EVICT_FIRST>(
-                        L_smem, g.attn_lse_intermediates, {0, 0, inst.q_head_start_idx + local_q_head, 0}, L_partial_all_arrived(s, local_q_head));
+                    for (int i = 0; i < 4; ++i) {
+                        l_partial_sv &L_smem = get_L_partial_smem(s, i);
+                        tma::expect(L_partial_all_arrived(s, i), L_smem);
+                        tma::load_async<cache_policy::EVICT_FIRST>(
+                            L_smem, g.attn_lse_intermediates, {0, 0, inst.q_head_start_idx + i, 0}, L_partial_all_arrived(s, i));
+                    }
 
                     for (int i = 0; i < inst.num_partials; ++i)
                     {
                         int stage = i % NUM_STAGES;
-                        o_sv &O_smem = get_O_partial_smem(s, local_q_head, stage);
-
-                        if (i >= NUM_STAGES)
-                        {
-                            int prev_phase = (i / NUM_STAGES - 1) % 2;
-                            wait(O_partial_finished(s, local_q_head, stage), prev_phase);
+                        for (int j = 0; j < 4; ++j) {
+                            o_sv &O_smem = get_O_partial_smem(s, j, stage);
+    
+                            if (i >= NUM_STAGES)
+                            {
+                                int prev_phase = (i / NUM_STAGES - 1) % 2;
+                                wait(O_partial_finished(s, j, stage), prev_phase);
+                            }
+                            s.record(21 + i);
+    
+                            tma::expect(O_partial_arrived(s, j, stage), O_smem);
+                            tma::load_async<cache_policy::EVICT_FIRST>(
+                                O_smem, g.attn_out_intermediates, {0, inst.q_head_start_idx + j, i, 0}, O_partial_arrived(s, j, stage));
                         }
-                        s.record(21 + (laneid * inst.num_partials) + i);
-
-                        tma::expect(O_partial_arrived(s, local_q_head, stage), O_smem);
-                        tma::load_async<cache_policy::EVICT_FIRST>(
-                            O_smem, g.attn_out_intermediates, {0, inst.q_head_start_idx + local_q_head, i, 0}, O_partial_arrived(s, local_q_head, stage));
                     }
                 }
                 warp::sync();

@@ -118,10 +118,10 @@ namespace kittens::prototype::vm
                     for (int i = UP_PAGES; i < UP_PAGES + GATE_PAGES; i++)
                     {
 
-                        int idx = laneid() - UP_PAGES;
+                        int idx = i - UP_PAGES;
                         int pg = get_gate_page(s, idx);
                         s.wait_page_ready(pg);
-                        s.record(16 + laneid());
+                        s.record(16 + idx);
                         auto &chunk = reinterpret_cast<st_bf<Globals::matvec_block_size, 512> &>(s.pages[pg]);
                         tma::expect(gate_arrived(s, idx), chunk);
                         tma::load_async(chunk, g.gate_weights,
@@ -131,7 +131,7 @@ namespace kittens::prototype::vm
 
                     int pg = get_input_page(s);
                     s.wait_page_ready(pg);
-                    s.record(16 + laneid());
+                    s.record(16 + PAGE_INPUT);
                     // wait on barrier from previous op
                     while (*(volatile int *)&g.Bar[{inst.layer, prev_opcode - 1, 0}] < EXPECTED_ARRIVAL_COUNT)
                         __nanosleep(20);
@@ -141,7 +141,7 @@ namespace kittens::prototype::vm
 
                     int rms_scale_page = get_rms_scale_page(s);
                     s.wait_page_ready(rms_scale_page);
-                    s.record(16 + laneid());
+                    s.record(16 + PAGE_RMS_SCALE);
                     auto &rms_scale = reinterpret_cast<sv_bf<2048> &>(s.pages[rms_scale_page]);
                     tma::expect(rms_scale_arrived(s), rms_scale);
                     tma::load_async(rms_scale, g.mlp_norm_weights, {inst.layer, 0}, rms_scale_arrived(s));

@@ -73,7 +73,6 @@ namespace kittens::prototype::vm
                 kittens::init_semaphore(outputs_arrived(s), 16); // outputs arrived.
                 kittens::init_semaphore(activations_arrived(s), 1);
                 s.record(1);
-                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                 return 6;
             }
         };

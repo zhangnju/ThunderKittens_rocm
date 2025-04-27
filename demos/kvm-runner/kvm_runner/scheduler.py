@@ -98,6 +98,13 @@ def schedule_layer(
     num_attention_partitions = 2
     add_print_instructions = print_info is not None
 
+    enable_qkv = False
+    enable_partial_attn = False
+    enable_attn_reduction = False
+    enable_o_proj = True
+    enable_up_gate = False
+    enable_down_proj = False
+
     instructions: list[Instruction] = []
 
     qkv_outdim = (
@@ -128,100 +135,106 @@ def schedule_layer(
     #         ]
     #     )
 
-    for qkv_block_idx in range(num_qkv_blocks):
-        instructions.append(
-            LayerNorm_QKV_MatVecRopeAppend(
-                layer_idx=layer_idx,
-                output_block_idx=qkv_block_idx,
-            )
-        )
-
-    maybe_add_print(layer_idx, "qkv")
-
-    if stop_after_op == "qkv":
-        return instructions
-
-    for kv_head_idx in range(globals.num_kv_heads):
-        for partial_idx in range(num_attention_partitions):
+    if enable_qkv:
+        for qkv_block_idx in range(num_qkv_blocks):
             instructions.append(
-                PartialAttention(
+                LayerNorm_QKV_MatVecRopeAppend(
                     layer_idx=layer_idx,
-                    kv_head_idx=kv_head_idx,
+                    output_block_idx=qkv_block_idx,
+                )
+            )
+
+        maybe_add_print(layer_idx, "qkv")
+
+        if stop_after_op == "qkv":
+            return instructions
+
+    if enable_partial_attn:
+        for kv_head_idx in range(globals.num_kv_heads):
+            for partial_idx in range(num_attention_partitions):
+                instructions.append(
+                    PartialAttention(
+                        layer_idx=layer_idx,
+                        kv_head_idx=kv_head_idx,
+                        num_partials=num_attention_partitions,
+                        partial_idx=partial_idx,
+                    )
+                )
+
+        maybe_add_print(layer_idx, "partial_attn")
+
+        if stop_after_op == "partial_attn":
+            return instructions
+
+    if enable_attn_reduction:
+        # TODO: harcoding one reduction stage, not seqlen dependent
+        for head_start_idx in range(
+            0, globals.num_attention_heads, globals.attn_reduction_size
+        ):
+            instructions.append(
+                AttentionReduction(
+                    layer_idx=layer_idx,
+                    head_start_idx=head_start_idx,
+                    is_terminal=True,
                     num_partials=num_attention_partitions,
-                    partial_idx=partial_idx,
-                )
+                    reduction_list=list(range(num_attention_partitions)),
+                ),
             )
 
-    maybe_add_print(layer_idx, "partial_attn")
+        maybe_add_print(layer_idx, "attn_reduction")
 
-    if stop_after_op == "partial_attn":
-        return instructions
+        if stop_after_op == "attn_reduction":
+            return instructions
 
-    # TODO: harcoding one reduction stage, not seqlen dependent
-    for head_start_idx in range(
-        0, globals.num_attention_heads, globals.attn_reduction_size
-    ):
-        instructions.append(
-            AttentionReduction(
-                layer_idx=layer_idx,
-                head_start_idx=head_start_idx,
-                is_terminal=True,
-                num_partials=num_attention_partitions,
-                reduction_list=list(range(num_attention_partitions)),
-            ),
-        )
-
-    maybe_add_print(layer_idx, "attn_reduction")
-
-    if stop_after_op == "attn_reduction":
-        return instructions
-
-    num_o_blocks = assert_div(globals.hidden_size, globals.o_proj_block_size)
-    for o_block_idx in range(num_o_blocks):
-        instructions.append(
-            O_ProjResidual(
-                layer_idx=layer_idx,
-                output_block_idx=o_block_idx,
-                reduction_block_idx=0,
-            )
-        )
-
-    maybe_add_print(layer_idx, "o_proj")
-
-    if stop_after_op == "o_proj":
-        return instructions
-
-    num_up_gate_blocks = assert_div(
-        globals.intermediate_size, globals.up_gate_proj_block_size
-    )
-    for up_gate_block_idx in range(num_up_gate_blocks):
-        instructions.append(
-            LayerNormDoubleMatVecSiLU(
-                layer_idx=layer_idx,
-                output_block_idx=up_gate_block_idx,
-            )
-        )
-
-    maybe_add_print(layer_idx, "up_gate")
-
-    if stop_after_op == "up_gate":
-        return instructions
-
-    num_down_blocks = assert_div(globals.hidden_size, globals.down_proj_block_size)
-    for down_block_idx in range(num_down_blocks):
-        for reduction_idx in range(4):  # 2048 columns per op
+    if enable_o_proj:
+        num_o_blocks = assert_div(globals.hidden_size, globals.o_proj_block_size)
+        for o_block_idx in range(num_o_blocks):
             instructions.append(
-                DownProjResidual(
+                O_ProjResidual(
                     layer_idx=layer_idx,
-                    output_block_idx=down_block_idx,
-                    reduction_block_idx=reduction_idx,
+                    output_block_idx=o_block_idx,
+                    reduction_block_idx=0,
                 )
             )
 
-    maybe_add_print(layer_idx, "down_proj")
+        maybe_add_print(layer_idx, "o_proj")
 
-    if stop_after_op == "down_proj":
-        return instructions
+        if stop_after_op == "o_proj":
+            return instructions
+
+    if enable_up_gate:
+        num_up_gate_blocks = assert_div(
+            globals.intermediate_size, globals.up_gate_proj_block_size
+        )
+        for up_gate_block_idx in range(num_up_gate_blocks):
+            instructions.append(
+                LayerNormDoubleMatVecSiLU(
+                    layer_idx=layer_idx,
+                    output_block_idx=up_gate_block_idx,
+                )
+            )
+
+        maybe_add_print(layer_idx, "up_gate")
+
+        if stop_after_op == "up_gate":
+            return instructions
+
+    if enable_down_proj:
+        num_down_blocks = assert_div(globals.hidden_size, globals.down_proj_block_size)
+        for down_block_idx in range(num_down_blocks):
+            for reduction_idx in range(4):  # 2048 columns per op
+                instructions.append(
+                    DownProjResidual(
+                        layer_idx=layer_idx,
+                        output_block_idx=down_block_idx,
+                        reduction_block_idx=reduction_idx,
+                    )
+                )
+
+        maybe_add_print(layer_idx, "down_proj")
+
+        if stop_after_op == "down_proj":
+            return instructions
 
     return instructions
 

@@ -134,7 +134,7 @@ def schedule_layer(
     #     )
 
     if enable_qkv:
-        for qkv_block_idx in range(num_qkv_blocks):
+        for qkv_block_idx in range(globals.qkv_block_size):
             instructions.append(
                 LayerNorm_QKV_MatVecRopeAppend(
                     layer_idx=layer_idx,

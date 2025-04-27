@@ -268,18 +268,9 @@ namespace kittens::prototype::vm
             }
             static __device__ int init_semaphores(const globals &g, state<config> &s)
             {
-                init_semaphore(Q_arrived(s), 0, 1);
-                init_semaphore(O_arrived(s), 0, 1);
-                init_semaphore(L_arrived(s), 0, 1);
-                for (int i = 0; i < NUM_STAGES; i++)
-                {
-                    init_semaphore(K_arrived(s, i), 0, 1);
-                    init_semaphore(V_arrived(s, i), 0, 1);
-                    init_semaphore(K_finished(s, i), 0, 1);
-                    init_semaphore(V_finished(s, i), 0, 1);
-                }
                 s.record(1);
-                return 3 + 4 * NUM_STAGES;
+                init_semaphore(s.semaphores()[31], 0, 1);
+                return 0;
             }
         };
         struct loader
@@ -289,6 +280,22 @@ namespace kittens::prototype::vm
                 auto laneid = warp::laneid();
                 if (laneid == 0)
                 {
+                    printf("loader began\n");
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    init_semaphore(Q_arrived(s), 0, 1);
+                    init_semaphore(O_arrived(s), 0, 1);
+                    init_semaphore(L_arrived(s), 0, 1);
+                    for (int i = 0; i < NUM_STAGES; i++)
+                    {
+                        init_semaphore(K_arrived(s, i), 0, 1);
+                        init_semaphore(V_arrived(s, i), 0, 1);
+                        init_semaphore(K_finished(s, i), 0, 1);
+                        init_semaphore(V_finished(s, i), 0, 1);
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    warp::arrive(s.semaphores()[31]);
+                    printf("loader finished waiting\n");
+                    
                     // Setup
                     parsed_instruction inst{s};
                     int seq_len = g.pos_id + 1;
@@ -355,7 +362,12 @@ namespace kittens::prototype::vm
         struct consumer
         {
             static __device__ void run(const globals &g, state<config> &s)
-            {
+            {   
+                if (warp::laneid() == 0) printf("consumer began\n");
+                wait(s.semaphores()[31], 0);
+                warp::sync();
+                if (warp::laneid() == 0) printf("consumer finished waiting\n");
+
                 if (warpid() == 0)
                 {
                     // Wait for the previous ops to finish1
@@ -500,6 +512,11 @@ namespace kittens::prototype::vm
         {
             static __device__ void run(const globals &g, state<config> &s)
             {
+                if (warp::laneid() == 0) printf("storer began\n");
+                wait(s.semaphores()[31], 0);
+                warp::sync();
+                if (warp::laneid() == 0) printf("storer finished waiting\n");
+                
                 parsed_instruction inst{s};
                 int laneid = warp::laneid();
                 int q_head_start_idx = inst.kv_head_idx * GQA_RATIO; // 0, 4, 8, 12, 16, 20, 24, 28
@@ -546,8 +563,24 @@ namespace kittens::prototype::vm
                     atomicAdd(&g.Bar[{inst.layer_idx, OPCODE_PartialAttention - 1, q_head_start_idx + laneid}], 1);
                 }
                 warp::sync();
-                if (laneid == 0)
+                if (laneid == 0) 
                     s.record(127);
+
+                if (warp::laneid() == 0) {
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    invalidate_semaphore(Q_arrived(s));
+                    invalidate_semaphore(O_arrived(s));
+                    invalidate_semaphore(L_arrived(s));
+                    for (int i = 0; i < NUM_STAGES; i++)
+                    {
+                        invalidate_semaphore(K_arrived(s, i));
+                        invalidate_semaphore(V_arrived(s, i));
+                        invalidate_semaphore(K_finished(s, i));
+                        invalidate_semaphore(V_finished(s, i));
+                    }
+                    invalidate_semaphore(s.semaphores()[31]);
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                }
             }
         };
     };

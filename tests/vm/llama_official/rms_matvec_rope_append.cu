@@ -47,14 +47,9 @@ namespace kittens::prototype::vm {
                 return ret_order[query];
             }
             static __device__ int init_semaphores(const Globals &g, state<Config> &s) {
-                for (int i = 0; i < 4; i++) init_semaphore(weights_arrived(s, i), 1);
-                init_semaphore(activations_arrived(s), 1);
-                init_semaphore(rms_scale_arrived(s), 1);
-                init_semaphore(rope_cos_arrived(s), 1);
-                init_semaphore(rope_sin_arrived(s), 1);
-                init_semaphore(outputs_arrived(s), 1);
                 s.record(1);
-                return 9;
+                init_semaphore(s.semaphores()[31], 0, 1);
+                return 0;
             }
         };
         struct loader {
@@ -65,6 +60,17 @@ namespace kittens::prototype::vm {
                 warp::sync(); // done, now we can proceed to other things.
 
                 if (laneid() == 0) {
+
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    for (int i = 0; i < 4; i++) init_semaphore(weights_arrived(s, i), 1);
+                    init_semaphore(activations_arrived(s), 1);
+                    init_semaphore(rms_scale_arrived(s), 1);
+                    init_semaphore(rope_cos_arrived(s), 1);
+                    init_semaphore(rope_sin_arrived(s), 1);
+                    init_semaphore(outputs_arrived(s), 1);
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    warp::arrive(s.semaphores()[31]);
+
                     for (int i = 0; i < 4; ++i) {
                         // QKV projection weights
                         s.wait_page_ready(get_weight_page(s, i));
@@ -122,6 +128,9 @@ namespace kittens::prototype::vm {
         };
         struct consumer {
             static __device__ void run(const Globals &g, state<Config> &s) {
+                wait(s.semaphores()[31], 0);
+                warp::sync();
+
                 // Setup
                 parsed_instruction inst{s};
                 rt_fl<16, 128> weights, broadcast_activations;
@@ -255,6 +264,9 @@ namespace kittens::prototype::vm {
         struct storer {
             // Uses 4 full pages for outputs.
             static __device__ void run(const Globals &g, state<Config> &s) {
+                wait(s.semaphores()[31], 0);
+                warp::sync();
+                
                 parsed_instruction inst{s};
 
                 if (warp::laneid() == 0) {
@@ -296,6 +308,18 @@ namespace kittens::prototype::vm {
                 }
                 if (laneid() == 0)
                     s.record(127);
+
+                if (warp::laneid() == 0) {  
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    for (int i = 0; i < 4; i++) invalidate_semaphore(weights_arrived(s, i));
+                    invalidate_semaphore(activations_arrived(s));
+                    invalidate_semaphore(rms_scale_arrived(s));
+                    invalidate_semaphore(rope_cos_arrived(s));
+                    invalidate_semaphore(rope_sin_arrived(s));
+                    invalidate_semaphore(outputs_arrived(s));
+                    invalidate_semaphore(s.semaphores()[31]);
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                }
             }
         };
     };

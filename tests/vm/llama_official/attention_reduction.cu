@@ -130,20 +130,9 @@ namespace kittens::prototype::vm
             }
             static __device__ int init_semaphores(const Globals &g, state<Config> &s)
             {
-                for (int q_head = 0; q_head < Q_HEADS_PER_INSTRUCTION; ++q_head)
-                {
-                    for (int stage = 0; stage < NUM_STAGES; stage++)
-                    {
-                        init_semaphore(O_partial_arrived(s, q_head, stage), 0, 1);
-                        init_semaphore(O_partial_finished(s, q_head, stage), 0, 1);
-                    }
-                    init_semaphore(L_partial_all_arrived(s, q_head), 0, 1);
-                    init_semaphore(L_partial_all_finished(s, q_head), 0, 1);
-
-                    init_semaphore(final_O_ready(s, q_head), 0, 1);
-                }
                 s.record(1);
-                return 4 * ((NUM_STAGES * 2) + 3);
+                init_semaphore(s.semaphores()[31], 0, 1);
+                return 0;
             }
         };
 
@@ -167,6 +156,21 @@ namespace kittens::prototype::vm
 
                 if (laneid == 0)
                 {
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    for (int q_head = 0; q_head < Q_HEADS_PER_INSTRUCTION; ++q_head)
+                    {
+                        for (int stage = 0; stage < NUM_STAGES; stage++)
+                        {
+                            init_semaphore(O_partial_arrived(s, q_head, stage), 0, 1);
+                            init_semaphore(O_partial_finished(s, q_head, stage), 0, 1);
+                        }
+                        init_semaphore(L_partial_all_arrived(s, q_head), 0, 1);
+                        init_semaphore(L_partial_all_finished(s, q_head), 0, 1);
+                        init_semaphore(final_O_ready(s, q_head), 0, 1);
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    warp::arrive(s.semaphores()[31]);
+
                     parsed_instruction inst{s};
                     for (int local_q_head = 0; local_q_head < Q_HEADS_PER_INSTRUCTION; local_q_head++)
                     {
@@ -219,6 +223,9 @@ namespace kittens::prototype::vm
         {
             static __device__ void run(const Globals &g, state<Config> &s)
             {
+                wait(s.semaphores()[31], 0);
+                warp::sync();
+
                 if (warpid() < Q_HEADS_PER_INSTRUCTION)
                 {
                     parsed_instruction inst{s};
@@ -288,6 +295,9 @@ namespace kittens::prototype::vm
         {
             static __device__ void run(const Globals &g, state<Config> &s)
             {
+                wait(s.semaphores()[31], 0);
+                warp::sync();
+                
                 parsed_instruction inst{s};
                 if (warp::laneid() < Q_HEADS_PER_INSTRUCTION)
                 {
@@ -317,6 +327,23 @@ namespace kittens::prototype::vm
                 warp::sync();
                 if (laneid() == 0)
                     s.record(127);
+
+                if (warp::laneid() == 0) {
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    for (int q_head = 0; q_head < Q_HEADS_PER_INSTRUCTION; ++q_head)
+                    {
+                        for (int stage = 0; stage < NUM_STAGES; stage++)
+                        {
+                            invalidate_semaphore(O_partial_arrived(s, q_head, stage));
+                            invalidate_semaphore(O_partial_finished(s, q_head, stage));
+                        }
+                        invalidate_semaphore(L_partial_all_arrived(s, q_head));
+                        invalidate_semaphore(L_partial_all_finished(s, q_head));
+                        invalidate_semaphore(final_O_ready(s, q_head));
+                    }
+                    invalidate_semaphore(s.semaphores()[31]);
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                }
             }
         };
     };

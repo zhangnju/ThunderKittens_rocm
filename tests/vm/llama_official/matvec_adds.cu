@@ -66,14 +66,9 @@ namespace kittens::prototype::vm
             }
             static __device__ int init_semaphores(const globals &g, state<Config> &s)
             {
-                for (int i = 0; i < 4; i++)
-                {
-                    kittens::init_semaphore(inputs_arrived(s, i), 1); // Inputs arrived.
-                }
-                kittens::init_semaphore(outputs_arrived(s), 16); // outputs arrived.
-                kittens::init_semaphore(activations_arrived(s), 1);
                 s.record(1);
-                return 6;
+                init_semaphore(s.semaphores()[31], 0, 1);
+                return 0;
             }
         };
         struct loader
@@ -87,6 +82,16 @@ namespace kittens::prototype::vm
 
                 if (kittens::laneid() == 0)
                 {
+
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    for (int i = 0; i < 4; i++)
+                    {
+                        kittens::init_semaphore(inputs_arrived(s, i), 1); // Inputs arrived.
+                    }
+                    kittens::init_semaphore(outputs_arrived(s), 16); // outputs arrived.
+                    kittens::init_semaphore(activations_arrived(s), 1);
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    warp::arrive(s.semaphores()[31]);
 
                     for (int i = 0; i < 4; i++)
                     {
@@ -168,6 +173,9 @@ namespace kittens::prototype::vm
         {
             static __device__ void run(const globals &g, state<Config> &s)
             {
+                wait(s.semaphores()[31], 0);
+                warp::sync();
+
                 kittens::rt_fl<16, 128> weights, broadcast_activations;
                 typename kittens::rt_fl<16, 128>::row_vec activations_vec;
                 typename kittens::rt_fl<16, 128>::col_vec output_col_format;
@@ -215,6 +223,9 @@ namespace kittens::prototype::vm
             // Uses 4 full pages for outputs.
             static __device__ void run(const globals &g, state<Config> &s)
             {
+                wait(s.semaphores()[31], 0);
+                warp::sync();
+                
                 parsed_instruction inst{s};
 
                 void *scratch = s.scratch();
@@ -253,6 +264,19 @@ namespace kittens::prototype::vm
                 }
                 if (laneid() == 0)
                     s.record(127);
+
+                if (warp::laneid() == 0)
+                {
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    for (int i = 0; i < 4; i++)
+                    {
+                        kittens::invalidate_semaphore(inputs_arrived(s, i)); // Inputs arrived.
+                    }
+                    kittens::invalidate_semaphore(outputs_arrived(s)); // outputs arrived.
+                    kittens::invalidate_semaphore(activations_arrived(s));
+                    invalidate_semaphore(s.semaphores()[31]);
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                }
             }
         };
     };

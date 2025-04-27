@@ -72,19 +72,10 @@ namespace kittens::prototype::vm
             static __device__ int init_semaphores(const Globals &g, state<Config> &s)
             {
 
-                // each weight page and the input page needs exactly 1 “ready” signal
-                for (int i = 0; i < UP_PAGES; i++)
-                    init_semaphore(up_arrived(s, i), 1);
-                for (int i = 0; i < GATE_PAGES; i++)
-                    init_semaphore(gate_arrived(s, i), 1);
-
-                init_semaphore(in_arrived(s), 1);
-                // output must wait for all 4 consumer warps
-                init_semaphore(out_arrived(s), 16);
-                init_semaphore(rms_scale_arrived(s), 1);
+                init_semaphore(s.semaphores()[31], 0, 1);
                 s.record(1);
 
-                return SEM_COUNT;
+                return 0;
             }
         };
 
@@ -101,6 +92,20 @@ namespace kittens::prototype::vm
                 // 1) UP projections
                 if (laneid() == 0)
                 {
+
+                    // each weight page and the input page needs exactly 1 “ready” signal
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    for (int i = 0; i < UP_PAGES; i++)
+                    init_semaphore(up_arrived(s, i), 1);
+                    for (int i = 0; i < GATE_PAGES; i++)
+                        init_semaphore(gate_arrived(s, i), 1);
+
+                    init_semaphore(in_arrived(s), 1);
+                    // output must wait for all 4 consumer warps
+                    init_semaphore(out_arrived(s), 16);
+                    init_semaphore(rms_scale_arrived(s), 1);
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    warp::arrive(s.semaphores()[31]);
 
                     for (int i = 0; i < UP_PAGES; i++)
                     {
@@ -173,6 +178,9 @@ namespace kittens::prototype::vm
         {
             static __device__ void run(const Globals &g, state<Config> &s)
             {
+                wait(s.semaphores()[31], 0);
+                warp::sync();
+
 
                 //--------------------------------------------------
                 // LOAD INPUT ACTIVATIONS
@@ -292,9 +300,11 @@ namespace kittens::prototype::vm
 
         struct storer
         {
-
             static __device__ void run(const Globals &g, state<Config> &s)
             {
+                wait(s.semaphores()[31], 0);
+                warp::sync();
+    
                 parsed_instruction inst{s};
 
                 if (laneid() == 0)
@@ -333,6 +343,21 @@ namespace kittens::prototype::vm
                     // else
                     //     atomicAdd(&g.Bar[{inst.layer, opcode + 1, 0}], 1);
                     s.record(127);
+                }
+
+                if (warp::laneid() == 0) {
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    for (int i = 0; i < UP_PAGES; i++)
+                    invalidate_semaphore(up_arrived(s, i));
+                    for (int i = 0; i < GATE_PAGES; i++)
+                        invalidate_semaphore(gate_arrived(s, i));
+
+                    invalidate_semaphore(in_arrived(s));
+                    // output must wait for all 4 consumer warps
+                    invalidate_semaphore(out_arrived(s));
+                    invalidate_semaphore(rms_scale_arrived(s));
+                    invalidate_semaphore(s.semaphores()[31]);
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
                 }
             }
         };

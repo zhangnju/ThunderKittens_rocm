@@ -33,6 +33,7 @@ class ScriptConfig(pydra.Config):
     exec_reps: int = 1
     skip_starting_instructions: bool = False
     barrier_init_val: int = 0
+    diff_tensors: bool = True
 
 
 def main(config: ScriptConfig):
@@ -149,47 +150,50 @@ def main(config: ScriptConfig):
         end = time.time()
         print(f"kvm time: {end - start}")
 
-        print("done! diffing tensors:")
+        if config.diff_tensors:
+            print("done! diffing tensors:")
 
-        def test_tensors(a: Tensor, b: Tensor, name: str):
-            diff = a - b
-            adiff = diff.abs()
-            rdiff = 2 * adiff / (a.abs() + b.abs() + 1e-6)
-            print(f"{name}: max adiff: {adiff.max()}, mean rdiff: {rdiff.mean()}")
+            def test_tensors(a: Tensor, b: Tensor, name: str):
+                diff = a - b
+                adiff = diff.abs()
+                rdiff = 2 * adiff / (a.abs() + b.abs() + 1e-6)
+                print(f"{name}: max adiff: {adiff.max()}, mean rdiff: {rdiff.mean()}")
 
-        test_tensors(
-            globs_for_pyvm.hidden_states, globs_for_kvm.hidden_states, "hidden_states"
-        )
-        test_tensors(
-            globs_for_pyvm.post_ln_rope_q,
-            globs_for_kvm.post_ln_rope_q,
-            "post_ln_rope_q",
-        )
-        test_tensors(
-            globs_for_pyvm.attn_lse_intermediates,
-            globs_for_kvm.attn_lse_intermediates,
-            "attn_lse_intermediates",
-        )
-        test_tensors(
-            globs_for_pyvm.attn_out_intermediates,
-            globs_for_kvm.attn_out_intermediates,
-            "attn_out_intermediates",
-        )
-        test_tensors(globs_for_pyvm.attn_out, globs_for_kvm.attn_out, "attn_out")
-        test_tensors(globs_for_pyvm.silu_out, globs_for_kvm.silu_out, "silu_out")
-        test_tensors(globs_for_pyvm.barriers, globs_for_kvm.barriers, "barriers")
+            test_tensors(
+                globs_for_pyvm.hidden_states,
+                globs_for_kvm.hidden_states,
+                "hidden_states",
+            )
+            test_tensors(
+                globs_for_pyvm.post_ln_rope_q,
+                globs_for_kvm.post_ln_rope_q,
+                "post_ln_rope_q",
+            )
+            test_tensors(
+                globs_for_pyvm.attn_lse_intermediates,
+                globs_for_kvm.attn_lse_intermediates,
+                "attn_lse_intermediates",
+            )
+            test_tensors(
+                globs_for_pyvm.attn_out_intermediates,
+                globs_for_kvm.attn_out_intermediates,
+                "attn_out_intermediates",
+            )
+            test_tensors(globs_for_pyvm.attn_out, globs_for_kvm.attn_out, "attn_out")
+            test_tensors(globs_for_pyvm.silu_out, globs_for_kvm.silu_out, "silu_out")
+            test_tensors(globs_for_pyvm.barriers, globs_for_kvm.barriers, "barriers")
 
-        # test_tensors(globs_for_pyvm.k_cache, globs_for_kvm.k_cache, "k_cache")
-        # test_tensors(globs_for_pyvm.v_cache, globs_for_kvm.v_cache, "v_cache")
+            # test_tensors(globs_for_pyvm.k_cache, globs_for_kvm.k_cache, "k_cache")
+            # test_tensors(globs_for_pyvm.v_cache, globs_for_kvm.v_cache, "v_cache")
 
-        print("kvm hidden states sum:", globs_for_kvm.hidden_states.float().sum())
-        print("pyvm hidden states sum:", globs_for_pyvm.hidden_states.float().sum())
+            print("kvm hidden states sum:", globs_for_kvm.hidden_states.float().sum())
+            print("pyvm hidden states sum:", globs_for_pyvm.hidden_states.float().sum())
 
-        # print("pyvm", globs_for_pyvm.attn_out_intermediates[0].view(-1)[:128])
-        # print("kvm", globs_for_kvm.attn_out_intermediates[0].view(-1)[:128])
+            # print("pyvm", globs_for_pyvm.attn_out_intermediates[0].view(-1)[:128])
+            # print("kvm", globs_for_kvm.attn_out_intermediates[0].view(-1)[:128])
 
-        # summarize_caches(globs_for_pyvm, "pyvm")
-        # summarize_caches(globs_for_kvm, "kvm")
+            # summarize_caches(globs_for_pyvm, "pyvm")
+            # summarize_caches(globs_for_kvm, "kvm")
 
 
 if __name__ == "__main__":

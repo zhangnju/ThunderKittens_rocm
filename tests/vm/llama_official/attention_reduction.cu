@@ -167,9 +167,9 @@ namespace kittens::prototype::vm
                 {
                     parsed_instruction inst{s};
 
-                    while (*(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1, inst.q_head_start_idx + 0}] < inst.num_partials &&
-                           *(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1, inst.q_head_start_idx + 1}] < inst.num_partials &&
-                           *(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1, inst.q_head_start_idx + 2}] < inst.num_partials &&
+                    while (*(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1, inst.q_head_start_idx + 0}] < inst.num_partials ||
+                           *(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1, inst.q_head_start_idx + 1}] < inst.num_partials ||
+                           *(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1, inst.q_head_start_idx + 2}] < inst.num_partials ||
                            *(volatile int *)&g.Bar[{inst.layer_idx, prev_opcode - 1, inst.q_head_start_idx + 3}] < inst.num_partials)
                     {
                         __nanosleep(20);

@@ -98,12 +98,12 @@ def schedule_layer(
     num_attention_partitions = 2
     add_print_instructions = print_info is not None
 
-    enable_qkv = False
-    enable_partial_attn = False
-    enable_attn_reduction = False
+    enable_qkv = True
+    enable_partial_attn = True
+    enable_attn_reduction = True
     enable_o_proj = True
-    enable_up_gate = False
-    enable_down_proj = False
+    enable_up_gate = True
+    enable_down_proj = True
 
     instructions: list[Instruction] = []
 
@@ -120,8 +120,6 @@ def schedule_layer(
                     print_info=print_info,
                 )
             )
-
-    num_qkv_blocks = assert_div(qkv_outdim, globals.qkv_block_size)
 
     # # order the blocks so that entire heads finish together
     # # (so we can start partial attention with them)
@@ -180,6 +178,9 @@ def schedule_layer(
                     reduction_list=list(range(num_attention_partitions)),
                 ),
             )
+        maybe_add_print(layer_idx, "qkv")
+        if stop_after_op == "qkv":
+            return instructions
 
         maybe_add_print(layer_idx, "attn_reduction")
 
@@ -196,6 +197,9 @@ def schedule_layer(
                     reduction_block_idx=0,
                 )
             )
+        maybe_add_print(layer_idx, "o_proj")
+        if stop_after_op == "o_proj":
+            return instructions
 
         maybe_add_print(layer_idx, "o_proj")
 

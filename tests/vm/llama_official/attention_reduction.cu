@@ -163,7 +163,7 @@ namespace kittens::prototype::vm
                 warp::sync(); // Have to make sure lane 0 finished waiting
                 s.record(16);
 
-                if (laneid < Q_HEADS_PER_INSTRUCTION)
+                if (laneid == 0)
                 {
                     parsed_instruction inst{s};
 

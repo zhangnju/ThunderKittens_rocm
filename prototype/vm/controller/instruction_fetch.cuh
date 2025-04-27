@@ -28,7 +28,7 @@ template<typename config, typename globals> __device__ void inline instruction_f
     int num_iters = g.instructions.rows();
     uint32_t semaphore_bitfield = 0xFFFF0000;
     for(kvms.instruction_index = 0, kvms.instruction_ring = 0; kvms.instruction_index < num_iters; kvms.instruction_index++, kvms.instruction_ring = ring_advance<config::INSTRUCTION_PIPELINE_STAGES>(kvms.instruction_ring)) {
-        wait(kvms.instruction_finished[kvms.instruction_ring], get_phasebit<1>(semaphore_bitfield, kvms.instruction_ring));
+        if (kvms.instruction_index > 0) wait(kvms.instruction_finished[kvms.instruction_ring], get_phasebit<1>(semaphore_bitfield, kvms.instruction_ring));
         update_phasebit<1>(semaphore_bitfield, kvms.instruction_ring);
         load_instructions<config, globals>(&kvms.instruction()[0], kvms.instruction_index, g, kvms.instruction_arrived[kvms.instruction_ring]);
         if(kvms.instruction_index < config::INSTRUCTION_PIPELINE_STAGES) {

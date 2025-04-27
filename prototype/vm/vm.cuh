@@ -27,6 +27,7 @@ __device__ inline void kvm_internal(const globals &g) {
                                   instruction_arrived[config::INSTRUCTION_PIPELINE_STAGES],
                                   instruction_finished[config::INSTRUCTION_PIPELINE_STAGES],
                                   tensor_finished,
+                                  _semaphores[148][config::DYNAMIC_SEMAPHORES],
                                   semaphores_ready;
     extern __shared__ int __shm[];
     void *aligned_shm_addr = (void*)((1023 + (uint64_t)&__shm[0]) & ~(uint64_t)1023);
@@ -41,6 +42,7 @@ __device__ inline void kvm_internal(const globals &g) {
         instruction_arrived, instruction_finished,
         0, 0,
         { /* ... */ },
+        _semaphores,
         pages,
         page_finished,
         tensor_finished,

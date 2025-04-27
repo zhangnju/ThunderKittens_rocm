@@ -28,6 +28,7 @@ template<typename config, typename globals, typename... ops> __device__ void inl
          kvms.instruction_index < num_iters;
          kvms.instruction_index++, kvms.instruction_ring=ring_advance<config::INSTRUCTION_PIPELINE_STAGES>(kvms.instruction_ring), tic=1-tic) {
         wait(kvms.instruction_arrived[kvms.instruction_ring], get_phasebit<0>(semaphore_bitfield, kvms.instruction_ring));
+        // printf("Instruction index: %d, Ring: %d\n", kvms.instruction_index, kvms.instruction_ring);
         int opcode = kvms.instruction()[0];
         int next_num_semaphores;
         if(opcode == 0) {
@@ -43,7 +44,7 @@ template<typename config, typename globals, typename... ops> __device__ void inl
             int last_ring = ring_retreat<config::INSTRUCTION_PIPELINE_STAGES>(kvms.instruction_ring);
             wait(kvms.instruction_finished[last_ring], get_phasebit<0>(semaphore_bitfield, last_ring));
             for(int i = 0; i < last_num_semaphores; i++) {
-                invalidate_semaphore(kvms.all_instructions[last_ring].semaphores[i]);
+                invalidate_semaphore(kvms._semaphores[kvms.instruction_index][i]); // not really even needed now
             }
             update_phasebit<0>(semaphore_bitfield, last_ring);
         }
@@ -54,7 +55,7 @@ template<typename config, typename globals, typename... ops> __device__ void inl
         int last_ring = ring_retreat<config::INSTRUCTION_PIPELINE_STAGES>(kvms.instruction_ring);
         wait(kvms.instruction_finished[last_ring], get_phasebit<0>(semaphore_bitfield, last_ring));
         for(int i = 0; i < last_num_semaphores; i++) {
-            invalidate_semaphore(kvms.all_instructions[last_ring].semaphores[i]);
+            invalidate_semaphore(kvms._semaphores[kvms.instruction_index][i]); // not really even needed now
         }
     }
 }

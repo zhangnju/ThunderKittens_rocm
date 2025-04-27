@@ -17,7 +17,6 @@ template<typename config> struct __align__(128) instruction_state_t {
     config::timing_t timings;
     int pid_order[config::NUM_PAGES];
     int padding[((config::NUM_PAGES + 31) & ~31) - config::NUM_PAGES]; // Round up to multiple of 32
-    kittens::semaphore semaphores[config::DYNAMIC_SEMAPHORES];
     int scratch[config::SCRATCH_BYTES/4];
 };
 
@@ -67,6 +66,8 @@ template<typename config> struct state {
     instruction_semaphore_array_t &instruction_arrived, &instruction_finished;
     int instruction_index, instruction_ring;
     int reg_pid_order[config::NUM_PAGES];
+    using semaphore_array_t = kittens::semaphore[148][config::DYNAMIC_SEMAPHORES];
+    semaphore_array_t &_semaphores;
 
     __device__ inline int (&instruction())[config::INSTRUCTION_WIDTH] {
         return all_instructions[instruction_ring].instructions;
@@ -90,10 +91,10 @@ template<typename config> struct state {
         return (void*)&all_instructions[instruction_ring].scratch[0];
     }
     __device__ inline kittens::semaphore (&semaphores())[config::DYNAMIC_SEMAPHORES] {
-        return all_instructions[instruction_ring].semaphores;
+        return _semaphores[instruction_index];
     }
     __device__ inline const kittens::semaphore (&semaphores() const)[config::DYNAMIC_SEMAPHORES] {
-        return all_instructions[instruction_ring].semaphores;
+        return _semaphores[instruction_index];
     }
     __device__ inline void await_instruction() {
         wait(instruction_arrived[instruction_ring], (instruction_index/config::INSTRUCTION_PIPELINE_STAGES)&1);

@@ -13,18 +13,18 @@ namespace kittens::prototype::vm
         rv_t copy_activations_vec;
         rv_t rms_scale_vec;
 
-        wait(activations_arrived, 0);
-
-        // TODO 
-        // if (warpid() == 0 && laneid() == 0)
-        // {
-        //     s.record(TEVENT_TRIPLES_END + 7);
-        // }
-
         constexpr int REDUCTION_DIM_PER_WARP = Globals::hidden_dim / Config::NUM_CONSUMER_WARPS;
 
         using sv_slice_t = sv_bf<REDUCTION_DIM_PER_WARP>;
         sv_slice_t(&activations_smem)[Config::NUM_CONSUMER_WARPS] = reinterpret_cast<sv_slice_t(&)[Config::NUM_CONSUMER_WARPS]>(s.pages[activation_page]);
+
+        wait(activations_arrived, 0);
+
+        // TODO
+        // if (warpid() == 0 && laneid() == 0)
+        // {
+        //     s.record(TEVENT_TRIPLES_END + 7);
+        // }
 
         warp::load(activations_vec, activations_smem[warpid()]);
         warp::sync();

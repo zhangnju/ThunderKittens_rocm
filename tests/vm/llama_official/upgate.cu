@@ -136,21 +136,6 @@ namespace kittens::prototype::vm
                                         {0, inst.layer, inst.output_block_idx, idx},
                                         gate_arrived(s, idx));
                     }
-
-                    // activations last, since there's a data dependency
-                    int pg = get_input_page(s);
-                    s.wait_page_ready(pg);
-
-                    // wait on barrier from previous op
-                    s.record(TEVENT_AT_GMEM_WAIT);
-                    while (*(volatile int *)&g.Bar[{inst.layer, prev_opcode - 1, 0}] < EXPECTED_ARRIVAL_COUNT)
-                        __nanosleep(20);
-                    s.record(TEVENT_DONE_GMEM_WAIT);
-
-                    auto &buf = reinterpret_cast<sv_bf<2048> &>(s.pages[pg]);
-                    s.record(TEVENT_TRIPLES_START + 9);
-                    tma::expect(in_arrived(s), buf);
-                    tma::load_async(buf, g.hidden_states, {}, in_arrived(s)); // TODO: SA check
                 }
 
                 // 5) UNUSED pages: release them immediately so consumer warps can retire
@@ -176,8 +161,36 @@ namespace kittens::prototype::vm
             static __device__ void run(const Globals &g, state<Config> &s)
             {
                 s.wait_tensor_ready();
+                warp::arrive(s.tensor_finished, Config::NUM_CONSUMER_WARPS);
+
+                int pg = get_input_page(s);
+                auto &buf = reinterpret_cast<sv_bf<2048> &>(s.pages[pg]);
+
                 if (laneid() == 0)
-                    arrive(s.tensor_finished, Config::NUM_CONSUMER_WARPS);
+                {
+
+                    parsed_instruction inst{s};
+                    // activations last, since there's a data dependency
+                    s.wait_page_ready(pg);
+
+                    // wait on barrier from previous op
+                    s.record(TEVENT_AT_GMEM_WAIT);
+                    while (*(volatile int *)&g.Bar[{inst.layer, prev_opcode - 1, 0}] < EXPECTED_ARRIVAL_COUNT)
+                    {
+                        __nanosleep(Config::nanosleep_time);
+                    }
+                    s.record(TEVENT_DONE_GMEM_WAIT);
+                    s.record(TEVENT_TRIPLES_START + 9);
+
+                    // auto &buf = reinterpret_cast<sv_bf<2048> &>(s.pages[pg]);
+                    // tma::expect(in_arrived(s), buf);
+                    // tma::load_async(buf, g.hidden_states, {}, in_arrived(s)); // TODO: SA check
+                }
+
+                warp::sync();
+                warp::load(buf, g.hidden_states, {});
+                warp::sync();
+                warp::arrive(in_arrived(s));
             }
         };
 

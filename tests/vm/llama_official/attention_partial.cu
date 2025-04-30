@@ -268,15 +268,15 @@ namespace kittens::prototype::vm
             }
             static __device__ int init_semaphores(const globals &g, state<config> &s)
             {
-                init_semaphore(Q_arrived(s), 0, 1);
-                init_semaphore(O_arrived(s), 0, 1);
-                init_semaphore(L_arrived(s), 0, 1);
+                init_semaphore(Q_arrived(s), 1);
+                init_semaphore(O_arrived(s), 1);
+                init_semaphore(L_arrived(s), 1);
                 for (int i = 0; i < NUM_STAGES; i++)
                 {
-                    init_semaphore(K_arrived(s, i), 0, 1);
-                    init_semaphore(V_arrived(s, i), 0, 1);
-                    init_semaphore(K_finished(s, i), 0, 1);
-                    init_semaphore(V_finished(s, i), 0, 1);
+                    init_semaphore(K_arrived(s, i), 1);
+                    init_semaphore(V_arrived(s, i), 1);
+                    init_semaphore(K_finished(s, i), 1);
+                    init_semaphore(V_finished(s, i), 1);
                 }
                 return 3 + 4 * NUM_STAGES;
             }
@@ -355,11 +355,35 @@ namespace kittens::prototype::vm
         {
             static __device__ void run(const globals &g, state<config> &s)
             {
+                s.wait_tensor_ready();
+                warp::arrive(s.tensor_finished, config::NUM_CONSUMER_WARPS);
+
+                parsed_instruction inst{s};
+                int q_head_start_idx = inst.kv_head_idx * GQA_RATIO;
+
+                // Initiate the load on Q
+                wait_QOL_page(s);
+
                 if (warp::laneid() == 0)
                 {
-                    s.wait_tensor_ready();
-                    arrive(s.tensor_finished, config::NUM_CONSUMER_WARPS);
+                    while (*(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 0}] < 4 ||
+                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 1}] < 4 ||
+                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 2}] < 4 ||
+                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 3}] < 4)
+                    {
+                        __nanosleep(config::nanosleep_time);
+                    }
                 }
+
+                warp::sync();
+
+                q_st &Q_smem = get_Q_smem(s);
+                load_Q_async(Q_smem, g.q_post_rope, q_head_start_idx);
+
+                // Wait for Q to arrive
+                warp::load_async_wait();
+                warp::sync(); // TODO I think unnecessary
+                warp::arrive(Q_arrived(s));
             }
         };
         struct consumer
@@ -374,23 +398,11 @@ namespace kittens::prototype::vm
 
                 if (warpid() == 0)
                 {
-                    // Wait for the previous ops to finish1
                     parsed_instruction inst{s};
                     int q_head_start_idx = inst.kv_head_idx * GQA_RATIO;
-                    while (*(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 0}] < 4 ||
-                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 1}] < 4 ||
-                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 2}] < 4 ||
-                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 3}] < 4)
-                    {
-                        __nanosleep(20);
-                    }
-                    warp::sync();
-
-                    // Initiate the load on Q
-                    wait_QOL_page(s);
 
                     q_st &Q_smem = get_Q_smem(s);
-                    load_Q_async(Q_smem, g.q_post_rope, q_head_start_idx);
+                    wait(Q_arrived(s), 0);
 
                     // Setup
                     int q_head_local_idx = (q_head_start_idx % q_rt::tile_size_row) / 4;
@@ -418,9 +430,6 @@ namespace kittens::prototype::vm
                     warp::zero(O_reg);
                     o_sv(&O_smem)[4] = get_O_smem(s);
                     l_sv &L_smem = get_L_smem(s);
-
-                    // Wait for Q to arrive
-                    warp::load_async_wait();
 
                     if (laneid() == 0)
                     {

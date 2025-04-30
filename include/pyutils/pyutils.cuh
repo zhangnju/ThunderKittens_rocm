@@ -8,11 +8,10 @@ namespace kittens {
 namespace py {
 
 template<typename T> struct from_object {
-    static T make(pybind11::object obj) {
+    static inline T make(pybind11::object obj) {
         return obj.cast<T>();
     }
-    static T make(pybind11::object obj, int dev_idx) {
-        printf("from_object<T>::make: dev_idx = %d\n", dev_idx);
+    static inline T make(pybind11::object obj, int dev_idx) {
         if (!pybind11::isinstance<pybind11::list>(obj))
             throw std::runtime_error("Expected a Python list.");
         pybind11::list lst = pybind11::cast<pybind11::list>(obj);
@@ -22,7 +21,7 @@ template<typename T> struct from_object {
     }
 };
 template<ducks::gl::all GL> struct from_object<GL> {
-    static GL make(pybind11::object &obj) {
+    static inline GL make(pybind11::object obj) {
 
         // Check if argument is a torch.Tensor
         if (pybind11::hasattr(obj, "__class__") && 
@@ -56,7 +55,7 @@ template<ducks::gl::all GL> struct from_object<GL> {
         }
         throw std::runtime_error("Expected a torch.Tensor");
     }
-    static GL make(pybind11::object obj, int dev_idx) {
+    static inline GL make(pybind11::object obj, int dev_idx) {
         if (!pybind11::isinstance<pybind11::list>(obj))
             throw std::runtime_error("Expected a Python list.");
         pybind11::list lst = pybind11::cast<pybind11::list>(obj);
@@ -66,7 +65,7 @@ template<ducks::gl::all GL> struct from_object<GL> {
     }
 };
 template<ducks::gl_array::all GL_ARRAY> struct from_object<GL_ARRAY> {
-    static GL_ARRAY make(pybind11::object obj) {
+    static inline GL_ARRAY make(pybind11::object obj) {
         if (!pybind11::isinstance<pybind11::list>(obj))
             throw std::runtime_error("Expected a Python list.");
         pybind11::list lst = pybind11::cast<pybind11::list>(obj);
@@ -121,7 +120,7 @@ template<ducks::gl_array::all GL_ARRAY> struct from_object<GL_ARRAY> {
         // Create gl_array object
         return GL_ARRAY(data_ptrs, shape_ref[0], shape_ref[1], shape_ref[2], shape_ref[3]);
     }
-    static GL_ARRAY make(pybind11::object obj, int dev_idx) {
+    static inline GL_ARRAY make(pybind11::object obj, int dev_idx) {
         return make(obj);
     }
 };
@@ -139,8 +138,7 @@ template<auto kernel, typename TGlobal, size_t... I>
 static inline void bind_multigpu_kernel(std::index_sequence<I...>, auto m, auto name, auto TGlobal::*... member_ptrs) {
     static_assert(is_multi_gpu<TGlobal>, "Globals must be a multi-GPU-compatible type");
     m.def(name, [](object<decltype(member_ptrs)>... args, pybind11::kwargs kwargs) {
-        std::thread workers[TGlobal::num_devices] = { std::thread([&](int dev_idx) {
-            if (dev_idx > 0) return;
+        for (int dev_idx = 0; dev_idx < TGlobal::num_devices; ++dev_idx) {
             cudaSetDevice(dev_idx);
             // Just use the default cuda stream for now
             TGlobal __g__ {from_object<typename trait<decltype(member_ptrs)>::member_type>::make(args, dev_idx)...};
@@ -151,8 +149,7 @@ static inline void bind_multigpu_kernel(std::index_sequence<I...>, auto m, auto 
             } else {
                 kernel<<<__g__.grid(), __g__.block(), 0>>>(__g__);
             }
-        }, I)... };
-        for (int i = 0; i < TGlobal::num_devices; ++i) workers[i].join();
+        }
     });
 }
 template<auto kernel, typename TGlobal> static void bind_kernel(auto m, auto name, auto TGlobal::*... member_ptrs) {

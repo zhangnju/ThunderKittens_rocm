@@ -29,6 +29,9 @@ endif
 # Default target
 all: $(TARGET)
 
+run: $(TARGET)
+	python unit_test.py
+
 $(TARGET): $(SRC)
 	$(NVCC) $(SRC) $(NVCCFLAGS) -o $(TARGET)$(shell python3-config --extension-suffix)
 

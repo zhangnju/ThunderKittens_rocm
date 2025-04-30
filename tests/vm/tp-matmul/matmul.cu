@@ -6,15 +6,21 @@ using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::vm;
 
+constexpr int SM_COUNT = 148;
+
 using config = default_config;
 struct globals {
+    constexpr static int num_devices = 8;
     using instruction_layout = ::kittens::prototype::vm::instruction_layout<config>;
     using timing_layout = ::kittens::prototype::vm::timing_layout<config>;
     using fp8_matrix = gl<fp8e4m3, 1, 1, -1, -1, st_fp8e4m3<128, 128>>;
     instruction_layout instructions;
     timing_layout timings;
-    fp8_matrix A, B, C;
-    dim3 grid() { return dim3(148); }
+    gl_array<fp8_matrix, num_devices> As;
+    gl_array<fp8_matrix, num_devices> Bs;
+    gl_array<fp8_matrix, num_devices> Cs;
+    int dev_idx;
+    dim3 grid() { return dim3(SM_COUNT); }
     dim3 block() { return dim3(config::NUM_THREADS); }
     int dynamic_shared_memory() { return config::DYNAMIC_SHARED_MEMORY; }
 };
@@ -91,7 +97,7 @@ template<typename config=config> struct MatmulOp {
                         s.wait_page_ready(a_page);
                     }
                     st_fp8e4m3<128, 128> &a = s.pages[a_page].template as_st<fp8e4m3>();
-                    tma::load_async(a, g.A, {inst.row + laneid(), i}, inputs_arrived(s, stage));
+                    // tma::load_async(a, g.A, {inst.row + laneid(), i}, inputs_arrived(s, stage));
                 }
                 if(laneid() < 2) {
                     int b_page = get_b_page(s, stage, laneid());
@@ -99,7 +105,7 @@ template<typename config=config> struct MatmulOp {
                         s.wait_page_ready(b_page);
                     }
                     st_fp8e4m3<128, 128> &b = s.pages[b_page].template as_st<fp8e4m3>();
-                    tma::load_async(b, g.B, {inst.col + laneid(), i}, inputs_arrived(s, stage));
+                    // tma::load_async(b, g.B, {inst.col + laneid(), i}, inputs_arrived(s, stage));
                 }
                 update_phasebit<1>(semaphore_bitfield, stage);
             }
@@ -183,7 +189,7 @@ template<typename config=config> struct MatmulOp {
 
                 int store_page = get_store_page(s, inst, laneid());
                 st_fp8e4m3<128, 128> &output = s.pages[store_page].template as_st<fp8e4m3>();
-                tma::store_async(g.C, output, {inst.row+laneid()/2, inst.col+laneid()%2});
+                // tma::store_async(g.C, output, {inst.row+laneid()/2, inst.col+laneid()%2});
                 tma::store_async_read_wait();
                 arrive(s.page_finished[store_page], config::NUM_CONSUMER_WARPS);
             }
@@ -199,8 +205,9 @@ PYBIND11_MODULE(matmul, m) {
     kittens::py::bind_kernel<kvm<config, globals, MatmulOp<config>>>(m, "matmul",
         &globals::instructions,
         &globals::timings,
-        &globals::A,
-        &globals::B,
-        &globals::C
+        &globals::As,
+        &globals::Bs,
+        &globals::Cs,
+        &globals::dev_idx
     );
 }

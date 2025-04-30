@@ -128,18 +128,6 @@ namespace kittens::prototype::vm
                     s.record(TEVENT_TRIPLES_START + 6);
                     tma::expect(rope_sin_arrived(s), rope_sin);
                     tma::load_async(rope_sin, g.rope_sin, {0, 0, static_cast<int>(g.pos_id), inst.qkv_block_idx % 4}, rope_sin_arrived(s));
-
-                    // Activation
-                    auto act_page_id = get_activation_page(s);
-                    s.wait_page_ready(act_page_id);
-                    s.record(TEVENT_AT_GMEM_WAIT);
-                    while (inst.layer_idx > 0 && *(volatile int *)&g.Bar[{inst.layer_idx - 1, OPCODE_DownProjResidual - 1, 0}] < 512)
-                        __nanosleep(20);
-                    s.record(TEVENT_DONE_GMEM_WAIT);
-                    auto &activations = reinterpret_cast<sv_bf<2048> &>(s.pages[act_page_id]);
-                    s.record(TEVENT_TRIPLES_START + 7);
-                    tma::expect(activations_arrived(s), activations);
-                    tma::load_async(activations, g.hidden_states, {}, activations_arrived(s));
                 }
 
                 else if (laneid() >= 8 && laneid() <= 12)
@@ -160,11 +148,34 @@ namespace kittens::prototype::vm
         {
             static __device__ void run(const Globals &g, state<Config> &s)
             {
+                s.wait_tensor_ready();
+                warp::arrive(s.tensor_finished, Config::NUM_CONSUMER_WARPS);
+
+                parsed_instruction inst{s};
+
+                // Activation
+                auto act_page_id = get_activation_page(s);
+                auto &activations = reinterpret_cast<sv_bf<2048> &>(s.pages[act_page_id]);
+
                 if (warp::laneid() == 0)
                 {
-                    s.wait_tensor_ready();
-                    arrive(s.tensor_finished, Config::NUM_CONSUMER_WARPS);
+                    s.wait_page_ready(act_page_id);
+                    s.record(TEVENT_AT_GMEM_WAIT);
+                    while (inst.layer_idx > 0 && *(volatile int *)&g.Bar[{inst.layer_idx - 1, OPCODE_DownProjResidual - 1, 0}] < 512)
+                    {
+                        __nanosleep(Config::nanosleep_time);
+                    }
+                    s.record(TEVENT_DONE_GMEM_WAIT);
+                    s.record(TEVENT_TRIPLES_START + 7);
+
+                    // tma::expect(activations_arrived(s), activations);
+                    // tma::load_async(activations, g.hidden_states, {}, activations_arrived(s));
                 }
+
+                warp::sync();
+                warp::load(activations, g.hidden_states, {});
+                warp::sync();
+                warp::arrive(activations_arrived(s));
             }
         };
         struct consumer
@@ -189,11 +200,9 @@ namespace kittens::prototype::vm
 
                 int page_index = warpid() / WARPS_PER_PAGE;
 
-
                 rms_norm(g, s, activations_vec, get_activation_page(s), get_rms_scale_page(s), activations_arrived(s), rms_scale_arrived(s), 16);
 
                 matvec<float_rt_t, WARPS_PER_PAGE>(g, s, activations_vec, weights_arrived(s, page_index), get_weight_page(s, page_index), 0);
-
 
                 group<Config::NUM_CONSUMER_WARPS>::sync(1); // must wait for all warps to finish atomic add
 

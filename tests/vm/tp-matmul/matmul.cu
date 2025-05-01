@@ -29,12 +29,13 @@ template<typename config=config> struct MatmulOp {
     static constexpr int PIPELINE_STAGES = 3;
 
     struct parsed_instruction {
-        int row_dev_idx, row, col, num_iters;
+        int row_dev_idx, row_local_idx, row, col, iters;
         __device__ inline parsed_instruction(typename config::instruction_t &instruction) {
             row_dev_idx = instruction[1];
-            row = instruction[2];
-            col = instruction[3];
-            num_iters = instruction[4];
+            row_local_idx = instruction[2];
+            row = instruction[3];
+            col = instruction[4];
+            iters = instruction[5];
         }
         __device__ inline parsed_instruction(state<config> &s): parsed_instruction(s.instruction()) {}
     };
@@ -58,14 +59,14 @@ template<typename config=config> struct MatmulOp {
         return s.pid(stage*4 + offset + 2);
     }
     __device__ static inline int get_store_page(state<config> &s, parsed_instruction &inst, int offset) {
-        return s.pid(((inst.num_iters+2)%PIPELINE_STAGES)*4 + offset);
+        return s.pid(((inst.iters+2)%PIPELINE_STAGES)*4 + offset);
     }
     
     struct controller {
         static __device__ int release_lid(const globals &g, typename config::instruction_t &instruction, int &query) {
             parsed_instruction inst{instruction};
             if(query == 0) return 12;
-            else return ((query-1)+(inst.num_iters%PIPELINE_STAGES)*4)%12;
+            else return ((query-1)+(inst.iters%PIPELINE_STAGES)*4)%12;
         }
         static __device__ int init_semaphores(const globals &g, state<config> &s) {
             for(int i = 0; i < PIPELINE_STAGES; i++) {
@@ -83,38 +84,38 @@ template<typename config=config> struct MatmulOp {
     struct loader {
         static __device__ void run(const globals &g, state<config> &s) {
             warp::arrive(s.page_finished[s.pid(12)], config::NUM_CONSUMER_WARPS); // Release the unused page immediately.
-            
+
             parsed_instruction inst{s};
             uint32_t semaphore_bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
-            
-            int stage = 0;
-            for(int i = 0; i < inst.num_iters; i++, stage = (stage + 1) % PIPELINE_STAGES) {
-                wait(inputs_finished(s, stage), get_phasebit<1>(semaphore_bitfield, stage));
-                warp::tma::expect_bytes(inputs_arrived(s, stage), 128*128*4);
+
+            int pipeline_stage = 0;
+            for(int i = 0; i < inst.iters; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
+                wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
+                warp::tma::expect_bytes(inputs_arrived(s, pipeline_stage), 128*128*4);
                 if(laneid() < 2) {
-                    int a_page = get_a_page(s, stage, laneid());
+                    int a_page = get_a_page(s, pipeline_stage, laneid());
                     if(i < PIPELINE_STAGES) {
                         s.wait_page_ready(a_page);
                     }
                     st_fp8e4m3<128, 128> &a = s.pages[a_page].template as_st<fp8e4m3>();
-                    tma::load_async(a, g.As[inst.row_dev_idx], {inst.row + laneid(), i}, inputs_arrived(s, stage));
+                    tma::load_async(a, g.As[inst.row_dev_idx], {inst.row_local_idx+laneid(), i}, inputs_arrived(s, pipeline_stage));
                 }
                 if(laneid() < 2) {
-                    int b_page = get_b_page(s, stage, laneid());
+                    int b_page = get_b_page(s, pipeline_stage, laneid());
                     if(i < PIPELINE_STAGES) {
                         s.wait_page_ready(b_page);
                     }
                     st_fp8e4m3<128, 128> &b = s.pages[b_page].template as_st<fp8e4m3>();
-                    tma::load_async(b, g.B, {inst.col + laneid(), i}, inputs_arrived(s, stage));
+                    tma::load_async(b, g.B, {inst.col+laneid(), i}, inputs_arrived(s, pipeline_stage));
                 }
-                update_phasebit<1>(semaphore_bitfield, stage);
+                update_phasebit<1>(semaphore_bitfield, pipeline_stage);
             }
             warp::sync();
 
             if(laneid() >= 28) {
-                for(int i = 0; i < PIPELINE_STAGES-1; i++, stage = (stage + 1) % PIPELINE_STAGES) {
-                    wait(inputs_finished(s, stage), get_phasebit<1>(semaphore_bitfield, stage));
-                    int release_lid = stage*4 + laneid() - 28;
+                for(int i = 0; i < PIPELINE_STAGES-1; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
+                    wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
+                    int release_lid = pipeline_stage*4 + laneid() - 28;
                     int release_pid = s.pid(release_lid);
                     arrive(s.page_finished[release_pid], config::NUM_CONSUMER_WARPS);
                 }
@@ -126,34 +127,34 @@ template<typename config=config> struct MatmulOp {
         static __device__ void run(const globals &g, state<config> &s) {
             parsed_instruction inst{s};
             uint32_t semaphore_bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
-            int stage = 0;
-            wait(inputs_arrived(s, stage), get_phasebit<0>(semaphore_bitfield, stage));
+            int pipeline_stage = 0;
+            wait(inputs_arrived(s, pipeline_stage), get_phasebit<0>(semaphore_bitfield, pipeline_stage));
             s.wait_tensor_ready();
 
-            if (laneid() < 4) {
-                auto accumulator = s.tensor_alloc.template allocate<tt<float, 128, 128>>(laneid() * 128);
-                st_fp8e4m3<128, 128> &a = s.pages[get_a_page(s, stage, laneid()/2)].template as_st<fp8e4m3>();
-                st_fp8e4m3<128, 128> &b = s.pages[get_b_page(s, stage, laneid()%2)].template as_st<fp8e4m3>();
-                mm<transpose::N, transpose::T>(accumulator, a, b, inputs_finished(s, stage));
+            if(laneid() < 4) {
+                auto accumulator = s.tensor_alloc.template allocate<tt<float, 128, 128>>(laneid()*128);
+                st_fp8e4m3<128, 128> &a = s.pages[get_a_page(s, pipeline_stage, laneid()/2)].template as_st<fp8e4m3>();
+                st_fp8e4m3<128, 128> &b = s.pages[get_b_page(s, pipeline_stage, laneid()%2)].template as_st<fp8e4m3>();
+                mm<transpose::N, transpose::T>(accumulator, a, b, inputs_finished(s, pipeline_stage));
             }
-            update_phasebit<0>(semaphore_bitfield, stage);
+            update_phasebit<0>(semaphore_bitfield, pipeline_stage);
 
-            stage = (stage + 1) % PIPELINE_STAGES;
-            for (int i = 1; i < inst.num_iters - 1; i++, update_phasebit<0>(semaphore_bitfield, stage), stage = (stage + 1) % PIPELINE_STAGES) {
-                wait(inputs_arrived(s, stage), get_phasebit<0>(semaphore_bitfield, stage));
+            pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage);
+            for(int i = 1; i < inst.iters-1; i++, update_phasebit<0>(semaphore_bitfield, pipeline_stage), pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
+                wait(inputs_arrived(s, pipeline_stage), get_phasebit<0>(semaphore_bitfield, pipeline_stage));
                 if(laneid() < 4) {
-                    auto accumulator = s.tensor_alloc.template allocate<tt<float, 128, 128>>(laneid() * 128);
-                    st_fp8e4m3<128, 128> &a = s.pages[get_a_page(s, stage, laneid()/2)].template as_st<fp8e4m3>();
-                    st_fp8e4m3<128, 128> &b = s.pages[get_b_page(s, stage, laneid()%2)].template as_st<fp8e4m3>();
-                    mma<transpose::N, transpose::T>(accumulator, a, b, inputs_finished(s, stage));
+                    auto accumulator = s.tensor_alloc.template allocate<tt<float, 128, 128>>(laneid()*128);
+                    st_fp8e4m3<128, 128> &a = s.pages[get_a_page(s, pipeline_stage, laneid()/2)].template as_st<fp8e4m3>();
+                    st_fp8e4m3<128, 128> &b = s.pages[get_b_page(s, pipeline_stage, laneid()%2)].template as_st<fp8e4m3>();
+                    mma<transpose::N, transpose::T>(accumulator, a, b, inputs_finished(s, pipeline_stage));
                 }
             }
 
-            wait(inputs_arrived(s, stage), get_phasebit<0>(semaphore_bitfield, stage));
+            wait(inputs_arrived(s, pipeline_stage), get_phasebit<0>(semaphore_bitfield, pipeline_stage));
             if(laneid() < 4) {
-                auto accumulator = s.tensor_alloc.template allocate<tt<float, 128, 128>>(laneid() * 128);
-                st_fp8e4m3<128, 128> &a = s.pages[get_a_page(s, stage, laneid()/2)].template as_st<fp8e4m3>();
-                st_fp8e4m3<128, 128> &b = s.pages[get_b_page(s, stage, laneid()%2)].template as_st<fp8e4m3>();
+                auto accumulator = s.tensor_alloc.template allocate<tt<float, 128, 128>>(laneid()*128);
+                st_fp8e4m3<128, 128> &a = s.pages[get_a_page(s, pipeline_stage, laneid()/2)].template as_st<fp8e4m3>();
+                st_fp8e4m3<128, 128> &b = s.pages[get_b_page(s, pipeline_stage, laneid()%2)].template as_st<fp8e4m3>();
                 mma<transpose::N, transpose::T>(accumulator, a, b, outputs_arrived(s, laneid()));
             }
             warp::sync();

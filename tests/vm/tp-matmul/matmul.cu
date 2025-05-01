@@ -83,6 +83,7 @@ template<typename config=config> struct MatmulOp {
 
     struct loader {
         static __device__ void run(const globals &g, state<config> &s) {
+            if (laneid() == 0) s.record(0);
             warp::arrive(s.page_finished[s.pid(12)], config::NUM_CONSUMER_WARPS); // Release the unused page immediately.
 
             parsed_instruction inst{s};
@@ -91,6 +92,7 @@ template<typename config=config> struct MatmulOp {
             int pipeline_stage = 0;
             for(int i = 0; i < inst.iters; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
                 wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
+                if (laneid() == 0) s.record(10 + i);
                 warp::tma::expect_bytes(inputs_arrived(s, pipeline_stage), 128*128*4);
                 if(laneid() < 2) {
                     int a_page = get_a_page(s, pipeline_stage, laneid());
@@ -129,6 +131,7 @@ template<typename config=config> struct MatmulOp {
             uint32_t semaphore_bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
             int pipeline_stage = 0;
             wait(inputs_arrived(s, pipeline_stage), get_phasebit<0>(semaphore_bitfield, pipeline_stage));
+            if (laneid() == 0) s.record(50);
             s.wait_tensor_ready();
 
             if(laneid() < 4) {
@@ -142,6 +145,7 @@ template<typename config=config> struct MatmulOp {
             pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage);
             for(int i = 1; i < inst.iters-1; i++, update_phasebit<0>(semaphore_bitfield, pipeline_stage), pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
                 wait(inputs_arrived(s, pipeline_stage), get_phasebit<0>(semaphore_bitfield, pipeline_stage));
+                if (laneid() == 0) s.record(50 + i);
                 if(laneid() < 4) {
                     auto accumulator = s.tensor_alloc.template allocate<tt<float, 128, 128>>(laneid()*128);
                     st_fp8e4m3<128, 128> &a = s.pages[get_a_page(s, pipeline_stage, laneid()/2)].template as_st<fp8e4m3>();
@@ -151,6 +155,7 @@ template<typename config=config> struct MatmulOp {
             }
 
             wait(inputs_arrived(s, pipeline_stage), get_phasebit<0>(semaphore_bitfield, pipeline_stage));
+            if (laneid() == 0) s.record(50 + inst.iters - 1);
             if(laneid() < 4) {
                 auto accumulator = s.tensor_alloc.template allocate<tt<float, 128, 128>>(laneid()*128);
                 st_fp8e4m3<128, 128> &a = s.pages[get_a_page(s, pipeline_stage, laneid()/2)].template as_st<fp8e4m3>();

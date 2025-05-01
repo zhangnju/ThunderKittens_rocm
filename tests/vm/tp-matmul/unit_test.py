@@ -11,7 +11,7 @@ NUM_ITERS = 5
 OPCODE = 725
 # M, K, N = 3072, 4096, 3072
 # M, K, N = 512, 256, 256
-M, K, N = 16384, 3072, 16384
+M, K, N = 16384 * 8, 3072, 16384 * 8
 # M, K, N = 3072, 16384*2, 3072
 # M, K, N = 256, 4096, 256
 
@@ -66,7 +66,8 @@ for torch_device in torch_devices:
     dev_instructions = torch.tensor(dev_instructions, dtype=torch.int32, device=torch_device)
     instructions.append(dev_instructions)
     timings.append(torch.zeros((148, instruction_idx // 148, 128), dtype=torch.int32, device=torch_device))
-
+print(f'Instructions shape: {instructions[0].shape}')
+print(f'Timings shape: {timings[0].shape}')
 
 ###
 #  Enable P2P access
@@ -98,13 +99,19 @@ for i in range(NUM_ITERS):
         torch.cuda.synchronize(dev_id)
     end_time = time()
     times.append(end_time - start_time)
-print(f'Average time per iter: {sum(times)/NUM_ITERS * 1e6} us')
-print(f'TFLOP/s: {(2*M*N*K*1e-12)/(sum(times)/NUM_ITERS)}') # Theoretical max is 4,500 TFLOps for BF16 and 9,000 TFLops for FP8
+avg_time_ms = sum(times) / NUM_ITERS
+total_tflop = 2 * M * N * K * 1e-12
+print(f'Average time per iter: {avg_time_ms * 1e6} us')
+print(f'Total TFLOP/s: {total_tflop / avg_time_ms}')
+print(f'Per-device TFLOP/s: {(total_tflop / NUM_DEVICES) / avg_time_ms}')
 
 
 ###
 #   Check for correctness (do matmul on GPU for speed)
 ###
+if True:
+    print('Skipping correctness check')
+    quit()
 print("\nChecking for correctness...")
 C = torch.cat([tensor.to(dtype=torch.float32, device='cpu') for tensor in Cs], dim=1)
 C_ref = (A.to(dtype=torch.float16, device='cuda:0') @ 

@@ -48,16 +48,18 @@ Cs = [tensor.to(torch_devices[i]) for i, tensor in enumerate(C.chunk(len(torch_d
 print('\nGenerating instructions and timings...')
 instructions = []
 timings = []
-M_per_dev = M // NUM_DEVICES
-N_per_dev = N // NUM_DEVICES
+num_rows = M // 256
+num_cols = (N // NUM_DEVICES) // 256
+rows_per_dev = num_rows // NUM_DEVICES
 for torch_device in torch_devices:
     dev_instructions = [[] for _ in range(148)]
     instruction_idx = 0
-    for row in range(M // 256):
-        row_per_dev = (M // 256) // NUM_DEVICES
-        row_dev_idx = row // row_per_dev
-        row_local_idx = row % row_per_dev
-        for col in range(N_per_dev // 256):
+    row_start = torch_device.index * rows_per_dev
+    for _row in range(num_rows):
+        row = (row_start + _row) % num_rows
+        row_dev_idx = row // rows_per_dev
+        row_local_idx = row % rows_per_dev
+        for col in range(num_cols):
             dev_instructions[instruction_idx%148].append([OPCODE, row_dev_idx, 2*row_local_idx, 2*row, 2*col, K//128]+[0]*26)
             instruction_idx += 1
     while instruction_idx%148 != 0:

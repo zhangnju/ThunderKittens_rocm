@@ -11,13 +11,17 @@ NUM_ITERS = 5
 OPCODE = 725
 # M, K, N = 3072, 4096, 3072
 # M, K, N = 512, 256, 256
-M, K, N = 16384, 3072, 16384
+M, K, N = 16384 * 8, 3072, 16384 * 8
 # M, K, N = 3072, 16384*2, 3072
 # M, K, N = 256, 4096, 256
 
 if M%256 != 0: raise ValueError("M must be divisible by 256")
 if K%128 != 0: raise ValueError("K must be divisible by 128")
 if N%256 != 0: raise ValueError("N must be divisible by 256")
+if M%NUM_DEVICES != 0: raise ValueError("M must be divisible by NUM_DEVICES")
+if N%NUM_DEVICES != 0: raise ValueError("N must be divisible by NUM_DEVICES")
+if M%(NUM_DEVICES*256) != 0: raise ValueError("For now, M must be divisible by (NUM_DEVICES*256))")
+if N%(NUM_DEVICES*256) != 0: raise ValueError("For now, N must be divisible by (NUM_DEVICES*256))")
 
 
 ###
@@ -34,7 +38,7 @@ C =  torch.zeros((M, N), device='cpu', dtype=torch.float8_e4m3fn)
 
 # Shard the inputs
 As = [tensor.to(torch_devices[i]) for i, tensor in enumerate(A.chunk(len(torch_devices), dim=0))]
-Bs = [tensor.to(torch_devices[i]) for i, tensor in enumerate(B.chunk(len(torch_devices), dim=1))]
+Bs = [tensor.to(torch_devices[i]) for i, tensor in enumerate(B.chunk(len(torch_devices), dim=0))] # B is transposed in the kernel
 Cs = [tensor.to(torch_devices[i]) for i, tensor in enumerate(C.chunk(len(torch_devices), dim=1))]
 
 
@@ -44,12 +48,17 @@ Cs = [tensor.to(torch_devices[i]) for i, tensor in enumerate(C.chunk(len(torch_d
 print('\nGenerating instructions and timings...')
 instructions = []
 timings = []
+M_per_dev = M // len(torch_devices)
+N_per_dev = N // len(torch_devices)
 for torch_device in range(len(torch_devices)):
     dev_instructions = [[] for _ in range(148)]
     instruction_idx = 0
-    for row in range(M // 256): # ceil
-        for col in range(N // 256):
-            dev_instructions[instruction_idx % 148].append([OPCODE, row * 2, col * 2, K // 128] + [0] * 28)
+    for row in range(M // 256):
+        rows_per_dev = M_per_dev // 256
+        row_dev_idx = row // rows_per_dev
+        local_row = row % rows_per_dev
+        for col in range(N_per_dev // 256):
+            dev_instructions[instruction_idx % 148].append([OPCODE, row_dev_idx, local_row * 2, col * 2, K // 128] + [0] * 27)
             instruction_idx += 1
     while instruction_idx%148 != 0:
         dev_instructions[instruction_idx%148].append([0]*32)
@@ -59,24 +68,21 @@ for torch_device in range(len(torch_devices)):
     timings.append(torch.zeros((148, instruction_idx // 148, 128), dtype=torch.int32, device=torch_device))
 
 
-print(instructions[0])
-print(timings[0])
-
 ###
 #   Launch the kernel and benchmark
 ###
 print("\nLaunching the kernel...")
-matmul(instructions, timings, As, Bs, Cs, dev_ids)
+matmul(instructions, timings, As, Bs, Cs)
 torch.cuda.synchronize()
 
-# print('\nKernel finished, now benchmarking...')
-# start_event = torch.cuda.Event(enable_timing=True)
-# end_event = torch.cuda.Event(enable_timing=True)
-# start_event.record()
-# for i in range(NUM_ITERS):
-#     matmul(instructions[0], timings[0], As, Bs, Cs, 0)
-# end_event.record()
-# torch.cuda.synchronize()
+print('\nKernel finished, now benchmarking...')
+start_event = torch.cuda.Event(enable_timing=True)
+end_event = torch.cuda.Event(enable_timing=True)
+start_event.record()
+for i in range(NUM_ITERS):
+    matmul(instructions, timings, As, Bs, Cs)
+end_event.record()
+torch.cuda.synchronize()
 
 elapsed_time = start_event.elapsed_time(end_event)
 time_per_iter_us = elapsed_time * 1e3 / NUM_ITERS
@@ -85,13 +91,13 @@ print(f'TFLOP/s: {(2*M*N*K*1e-12)/(time_per_iter_us*1e-6)}') # Theoretical max i
 
 
 ###
-#   Check for correctness
+#   Check for correctness (do matmul on GPU for speed)
 ###
 print("\nChecking for correctness...")
-C = C.to(torch.float32).cpu().numpy()
-print(C.shape)
-C_ref = (A.to(torch.float16) @ B.to(torch.float16).T).to(torch.float8_e4m3fn)
-C_ref = C_ref.to(torch.float32).cpu().numpy()
-print(C_ref.shape)
+C = torch.cat([tensor.to(dtype=torch.float32, device='cpu') for tensor in Cs], dim=1)
+C_ref = (A.to(dtype=torch.bfloat16, device='cuda:0') @ 
+         B.to(dtype=torch.bfloat16, device='cuda:0').T).to(torch.float8_e4m3fn).to(dtype=torch.float32, device='cpu') # simulate precision loss
+print(C.dtype, C.shape)
+print(C_ref.dtype, C_ref.shape)
 print('Max abs diff:', abs(C-C_ref).max())
 print('Mean abs diff:', abs(C-C_ref).mean())

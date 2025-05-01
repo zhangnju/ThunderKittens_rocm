@@ -1,6 +1,6 @@
 import torch
-from matmul import matmul
-import time
+from matmul import matmul, can_access_peer, enable_p2p_access
+from time import time
 
 
 ###
@@ -69,25 +69,35 @@ for torch_device in range(len(torch_devices)):
 
 
 ###
+#  Enable P2P access
+###
+print('\nEnabling cross-device access...')
+for i in dev_ids:
+    for j in dev_ids:
+        if i != j:
+            assert can_access_peer(i, j), f'Device {i} cannot access device {j}'
+            enable_p2p_access(i, j)
+
+
+###
 #   Launch the kernel and benchmark
 ###
 print("\nLaunching the kernel...")
 matmul(instructions, timings, As, Bs, Cs)
-torch.cuda.synchronize()
+for dev_id in dev_ids:
+    torch.cuda.synchronize(dev_id)
 
 print('\nKernel finished, now benchmarking...')
-start_event = torch.cuda.Event(enable_timing=True)
-end_event = torch.cuda.Event(enable_timing=True)
-start_event.record()
+times = []
 for i in range(NUM_ITERS):
+    start_time = time()
     matmul(instructions, timings, As, Bs, Cs)
-end_event.record()
-torch.cuda.synchronize()
-
-elapsed_time = start_event.elapsed_time(end_event)
-time_per_iter_us = elapsed_time * 1e3 / NUM_ITERS
-print(f'Time per iter: {time_per_iter_us} us')
-print(f'TFLOP/s: {(2*M*N*K*1e-12)/(time_per_iter_us*1e-6)}') # Theoretical max is 4,500 TFLOps for BF16 and 9,000 TFLops for FP8
+    for dev_id in dev_ids: # can't use cudaEvent (which is device-specific)
+        torch.cuda.synchronize(dev_id)
+    end_time = time()
+    times.append(end_time - start_time)
+print(f'Average time per iter: {sum(times)/NUM_ITERS * 1e6} us')
+print(f'TFLOP/s: {(2*M*N*K*1e-12)/(sum(times)/NUM_ITERS)}') # Theoretical max is 4,500 TFLOps for BF16 and 9,000 TFLops for FP8
 
 
 ###

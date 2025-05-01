@@ -142,7 +142,7 @@ void enable_p2p_access(int device, int peer_device) {
 template<typename T> concept has_dynamic_shared_memory = requires(T t) { { t.dynamic_shared_memory() } -> std::convertible_to<int>; };
 template<typename T> concept is_multi_gpu = requires { 
     { T::num_devices } -> std::convertible_to<std::size_t>;
-} && T::num_devices > 1;
+} && T::num_devices >= 1;
 
 template<typename> struct trait;
 template<typename MT, typename T> struct trait<MT T::*> { using member_type = MT; using type = T; };

@@ -217,7 +217,7 @@ template<typename config=config> struct MatmulOp {
 
 PYBIND11_MODULE(matmul, m) {
     m.doc() = "matmul python module";
-    kittens::py::bind_kernel<kernel<config, globals, MatmulOp<config>>>(m, "matmul",
+    kittens::py::bind_kernel<kvm<config, globals, MatmulOp<config>>>(m, "matmul",
         &globals::instructions,
         &globals::timings,
         &globals::A,

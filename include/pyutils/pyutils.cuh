@@ -125,6 +125,20 @@ template<ducks::gl_array::all GL_ARRAY> struct from_object<GL_ARRAY> {
     }
 };
 
+// Multi-GPU support
+bool can_access_peer(int device, int peer_device) {
+    int can_access = 0;
+    CUDACHECK(cudaDeviceCanAccessPeer(&can_access, device, peer_device));
+    return can_access != 0;
+}
+void enable_p2p_access(int device, int peer_device) {
+    int current_device;
+    CUDACHECK(cudaGetDevice(&current_device));
+    CUDACHECK(cudaSetDevice(device));
+    CUDACHECK(cudaDeviceEnablePeerAccess(peer_device, 0));
+    CUDACHECK(cudaSetDevice(current_device));
+}
+
 template<typename T> concept has_dynamic_shared_memory = requires(T t) { { t.dynamic_shared_memory() } -> std::convertible_to<int>; };
 template<typename T> concept is_multi_gpu = requires { 
     { T::num_devices } -> std::convertible_to<std::size_t>;
@@ -150,6 +164,9 @@ static inline void bind_multigpu_kernel(std::index_sequence<I...>, auto m, auto 
             }
         }
     });
+    // Additional helpers for multi-GPU support
+    m.def("can_access_peer", can_access_peer);
+    m.def("enable_p2p_access", enable_p2p_access);
 }
 template<auto kernel, typename TGlobal> static void bind_kernel(auto m, auto name, auto TGlobal::*... member_ptrs) {
     if constexpr (is_multi_gpu<TGlobal>)

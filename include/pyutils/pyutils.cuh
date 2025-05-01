@@ -128,7 +128,6 @@ template<ducks::gl_array::all GL_ARRAY> struct from_object<GL_ARRAY> {
 template<typename T> concept has_dynamic_shared_memory = requires(T t) { { t.dynamic_shared_memory() } -> std::convertible_to<int>; };
 template<typename T> concept is_multi_gpu = requires { 
     { T::num_devices } -> std::convertible_to<std::size_t>;
-    { T::dev_idx } -> std::convertible_to<std::size_t>;
 } && T::num_devices > 1;
 
 template<typename> struct trait;

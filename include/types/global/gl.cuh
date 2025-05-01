@@ -248,8 +248,8 @@ struct gl_array {
             uint64_t _data_ptr[N], int _batch, int _depth, int _rows, int _cols) : 
         gls{make_gl<GL>(_data_ptr[I], _batch, _depth, _rows, _cols)...} { }
 
-    GL& operator[](size_t i) { return gls[i]; }
-    const GL& operator[](size_t i) const { return gls[i]; }
+    __host__ __device__ GL& operator[](size_t i) { return gls[i]; }
+    __host__ __device__ const GL& operator[](size_t i) const { return gls[i]; }
 };
 
 } // namespace kittens

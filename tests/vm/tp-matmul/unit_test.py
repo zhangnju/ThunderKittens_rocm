@@ -11,7 +11,7 @@ NUM_ITERS = 5
 OPCODE = 725
 # M, K, N = 3072, 4096, 3072
 # M, K, N = 512, 256, 256
-M, K, N = 16384 * 8, 3072, 16384 * 8
+M, K, N = 16384*8, 3072, 16384*8
 # M, K, N = 3072, 16384*2, 3072
 # M, K, N = 256, 4096, 256
 
@@ -68,6 +68,7 @@ for torch_device in torch_devices:
     timings.append(torch.zeros((148, instruction_idx // 148, 128), dtype=torch.int32, device=torch_device))
 print(f'Instructions shape: {instructions[0].shape}')
 print(f'Timings shape: {timings[0].shape}')
+
 
 ###
 #  Enable P2P access

@@ -7,6 +7,7 @@ from time import time
 #   Global Parameters
 ###
 NUM_DEVICES = 8
+NUM_COMMS = 8 # this is the magic number that works the best
 NUM_ITERS = 5
 MATMUL_OPCODE = 725
 COMM_OPCODE = 97
@@ -48,17 +49,27 @@ Cs = [tensor.to(torch_devices[i]) for i, tensor in enumerate(C.chunk(len(torch_d
 ###
 #   Prepare Instructions
 ###
+instructions = []
 M_per_dev = M // NUM_DEVICES
 N_per_dev = N // NUM_DEVICES
-# num_rows = M // 256
-# num_local_cols = (N // NUM_DEVICES) // 256
-# num_iters = K // 128
-# rows_per_dev = num_rows // NUM_DEVICES
-instructions = []
 for torch_device in torch_devices:
+    dev_idx = torch_device.index
+    prev_dev_idx = (dev_idx + NUM_DEVICES - 1) % NUM_DEVICES
+    next_dev_idx = (dev_idx + 1) % NUM_DEVICES
     dev_instructions = [[] for _ in range(148)]
     instruction_idx = 0
 
+    # Comm Ops
+    comm_size = (M_per_dev * K) // NUM_COMMS
+    for comm_idx in range(NUM_COMMS):
+        dev_instructions[comm_idx].append([COMM_OPCODE, comm_size, comm_idx, NUM_COMMS, dev_idx, prev_dev_idx] + [0] * 26)
+        instruction_idx += 1
+
+    # Compute Ops
+    # num_rows = M // 256
+    # num_local_cols = (N // NUM_DEVICES) // 256
+    # num_iters = K // 128
+    # rows_per_dev = num_rows // NUM_DEVICES
     # row_start = torch_device.index * rows_per_dev
     # dev_idx = torch_device.index
     # next_dev_idx = (dev_idx + 1) % NUM_DEVICES
@@ -72,19 +83,17 @@ for torch_device in torch_devices:
     #         )
     #         instruction_idx += 1
 
-    num_comms = 8
-    dev_idx = torch_device.index
-    prev_dev_idx = (dev_idx + NUM_DEVICES - 1) % NUM_DEVICES
-    comm_size = (M_per_dev * K) // num_comms
+    # Paddings
+    max_instruction_len = 0
+    for sm_instructions in dev_instructions:
+        max_instruction_len = max(max_instruction_len, len(sm_instructions))
+    for sm_instructions in dev_instructions:
+        while len(sm_instructions) < max_instruction_len:
+            sm_instructions.append([0]*32)
 
-    for i in range(num_comms):
-        dev_instructions[instruction_idx%148].append([COMM_OPCODE, comm_size, i, num_comms, dev_idx, prev_dev_idx] + [0]*26)
-        instruction_idx += 1
-
-    while instruction_idx%148 != 0:
-        dev_instructions[instruction_idx%148].append([0]*32)
-        instruction_idx += 1
+    # Append
     instructions.append(torch.tensor(dev_instructions, dtype=torch.int32, device=torch_device))
+
 print(f'Instructions shape: {instructions[0].shape}')
 
 
@@ -96,7 +105,8 @@ barriers = []
 timings = []
 for torch_device in torch_devices:
     barriers.append(torch.zeros((NUM_DEVICES,), dtype=torch.uint32, device=torch_device))
-    timings.append(torch.zeros((148, instruction_idx // 148, 128), dtype=torch.int32, device=torch_device))
+    timings.append(torch.zeros((148, instructions[0].shape[1], 128), dtype=torch.int32, device=torch_device))
+
 print(f'Barriers shape: {barriers[0].shape}')
 print(f'Timings shape: {timings[0].shape}')
 
@@ -139,10 +149,10 @@ print(f'Per-device TFLOP/s: {(total_tflop / NUM_DEVICES) / avg_time_ms}')
 
 
 ###
-#   Check for correctness (do matmul on GPU for speed)
+#   Check for correctness
 ###
-if True:
-    print('Skipping correctness check')
+if True: # note that running the kernel more than once will cause the results to be incorrect
+    print('\nSkipping correctness check')
     quit()
 print("\nChecking for correctness...")
 C = torch.cat([tensor.to(dtype=torch.float32, device='cpu') for tensor in Cs], dim=1)

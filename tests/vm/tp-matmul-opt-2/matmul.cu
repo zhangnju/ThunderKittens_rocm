@@ -72,22 +72,19 @@ template<typename config=config> struct CommOp {
         static __device__ void run(const globals &g, state<config> &s) {
             parsed_instruction inst{s};
             int laneid = warp::laneid();
+            constexpr uint32_t membermask = 0xFFFFFFFF >> (32 - config::NUM_PAGES);
             if (laneid < config::NUM_PAGES) {
                 int page = s.pid(laneid);
                 s.wait_page_ready(page);
-                auto &data = reinterpret_cast<st_fp8e4m3<128, 128> &>(s.pages[page]);
+                auto &data = reinterpret_cast<st_fp8e4m3<128, 128> &>(s.pages[page]); // use st_fp8e4m3 as a placeholder for full page
                 int phasebit = 0;
                 int iters = inst.comm_size / size_per_iter;
                 for (int stage = 0; stage < globals::num_devices - 1; ++stage) {
-                    // load complete (NUM_PAGES * num_comms) + read from compute complete (1) => must wait for NUM_PAGES * num_comms + 1
+                    // load complete (num_comms) + read from compute complete (1) => must wait for num_comms + 1
                     // TODO: technically, we can separate the waits on the above two, and wait for latter in storing stage
-                    while (stage > 0 && *(volatile int *)&g.barriers[inst.prev_dev_idx][{stage - 1}] < config::NUM_PAGES * inst.num_comms + 1)
+                    while (stage > 0 && *(volatile int *)&g.barriers[inst.prev_dev_idx][{stage - 1}] < inst.num_comms + 1)
                         __nanosleep(20);
-
-                    // Sanity check: print barrier value:
-                    // printf("Barrier value: %d\n", *(volatile int *)&g.barriers[inst.prev_dev_idx][{stage - 1}]);
                     for (int i = 0; i < iters; ++i) {
-                        wait(data_finished(s, laneid), phasebit);
                         kittens::tma::expect(data_arrived(s, laneid), data);
                         if (stage % 2 == 0)
                             kittens::tma::load_async(data, g.A0s[inst.prev_dev_idx], 
@@ -95,48 +92,36 @@ template<typename config=config> struct CommOp {
                         else
                             kittens::tma::load_async(data, g.A1s[inst.prev_dev_idx], 
                                 coord<>{inst.comm_idx * inst.comm_size + i * size_per_iter + laneid * config::PAGE_SIZE}, data_arrived(s, laneid));
-                        phasebit = (phasebit + 1) % 2;
-                    }
-                }
-            }
-        }
-    };
-    struct launcher {
-        static __device__ void run(const globals &g, state<config> &s) {}
-    };
-    struct consumer {
-        static __device__ void run(const globals &g, state<config> &s) {}
-    };
-    struct storer {
-        // Uses 4 full pages for outputs.
-        static __device__ void run(const globals &g, state<config> &s) {
-            parsed_instruction inst{s};
-            int laneid = warp::laneid();
-            if (laneid < config::NUM_PAGES) {
-                int page = s.pid(laneid);
-                auto &data = reinterpret_cast<st_fp8e4m3<128, 128> &>(s.pages[page]);
-                int phasebit = 0;
-                int iters = inst.comm_size / size_per_iter;
-                for (int stage = 0; stage < globals::num_devices - 1; ++stage) {
-                    for (int i = 0; i < iters; ++i) {
                         wait(data_arrived(s, laneid), phasebit);
+                        phasebit = 1 - phasebit;
                         if (stage % 2 == 0)
                             kittens::tma::store_async(g.A1s[inst.dev_idx], data, 
                                 coord<>{inst.comm_idx * inst.comm_size + i * size_per_iter + laneid * config::PAGE_SIZE});
                         else
                             kittens::tma::store_async(g.A0s[inst.dev_idx], data,
                                 coord<>{inst.comm_idx * inst.comm_size + i * size_per_iter + laneid * config::PAGE_SIZE});
-                        phasebit = (phasebit + 1) % 2;
-                        tma::store_async_wait();
-                        arrive(data_finished(s, laneid));
+                        asm volatile("{bar.warp.sync %0;}" ::"n"(membermask));
+                        if (laneid == 0) asm volatile("{cp.async.bulk.wait_group 0;}");
+                        asm volatile("{bar.warp.sync %0;}" ::"n"(membermask));
                     }
-                    // printf("Adding to barrier from dev idx %d, stage %d, lane id %d\n", inst.dev_idx, stage, laneid);
-                    atomicAdd(&g.barriers[inst.dev_idx][{stage}], 1); // equals config::NUM_PAGES * num_comms after completion
-                    if (laneid == 0 && inst.comm_idx == 0) atomicAdd(&g.barriers[inst.dev_idx][{stage}], 1); // temp
+                    if (laneid == 0) {
+                        asm volatile("{fence.acq_rel.sys;}");
+                        atomicAdd(&g.barriers[inst.dev_idx][{stage}], 1); // equals num_comms after completion
+                        if (inst.comm_idx == 0) atomicAdd(&g.barriers[inst.dev_idx][{stage}], 1); // temp
+                    }
                 }
-                kittens::arrive(s.page_finished[page], config::NUM_CONSUMER_WARPS);
+                kittens::arrive(s.page_finished[page], config::NUM_CONSUMER_WARPS); 
             }
         }
+    };
+    struct launcher {
+        static __device__ void run(const globals &g, state<config> &s) { }
+    };
+    struct consumer {
+        static __device__ void run(const globals &g, state<config> &s) { }
+    };
+    struct storer {
+        static __device__ void run(const globals &g, state<config> &s) { }
     };
 };
 

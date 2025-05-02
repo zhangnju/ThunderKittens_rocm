@@ -13,7 +13,7 @@ MATMUL_OPCODE = 725
 COMM_OPCODE = 97
 # M, K, N = 3072, 4096, 3072
 # M, K, N = 512, 256, 256
-M, K, N = 16384 * 128, 3072, 16384
+M, K, N = 16384*8, 3072, 16384
 # M, K, N = 3072, 16384*2, 3072
 # M, K, N = 256, 4096, 256
 
@@ -22,8 +22,8 @@ if K%128 != 0: raise ValueError("K must be divisible by 128")
 if N%256 != 0: raise ValueError("N must be divisible by 256")
 if M%NUM_DEVICES != 0: raise ValueError("M must be divisible by NUM_DEVICES")
 if N%NUM_DEVICES != 0: raise ValueError("N must be divisible by NUM_DEVICES")
-if M%(NUM_DEVICES*256) != 0: raise ValueError("For now, M must be divisible by (NUM_DEVICES*256))")
-if N%(NUM_DEVICES*256) != 0: raise ValueError("For now, N must be divisible by (NUM_DEVICES*256))")
+if (M//NUM_DEVICES)%256 != 0: raise ValueError("M//NUM_DEVICES must be divisible by 256")
+if (N//NUM_DEVICES)%256 != 0: raise ValueError("N//NUM_DEVICES must be divisible by 256")
 
 
 ###
@@ -51,38 +51,31 @@ Cs = [tensor.to(torch_devices[i]) for i, tensor in enumerate(C.chunk(len(torch_d
 instructions = []
 M_per_dev = M // NUM_DEVICES
 N_per_dev = N // NUM_DEVICES
+num_ring_stages = NUM_DEVICES
+num_rows = M_per_dev // 256
+num_cols = N_per_dev // 256
+num_iters = K // 128
 for torch_device in torch_devices:
     dev_idx = torch_device.index
     prev_dev_idx = (dev_idx + NUM_DEVICES - 1) % NUM_DEVICES
     next_dev_idx = (dev_idx + 1) % NUM_DEVICES
     dev_instructions = [[] for _ in range(148)]
-    instruction_idx = 0
 
     # Comm Ops
     num_chunks = (M_per_dev * K) // 16384
     num_chunk_cols = K // 128
     comm_size = num_chunks // NUM_COMMS
+    num_comps = num_rows * num_cols
     for comm_idx in range(NUM_COMMS):
-        dev_instructions[comm_idx].append([COMM_OPCODE, comm_size, comm_idx, NUM_COMMS, num_chunk_cols, dev_idx, prev_dev_idx, next_dev_idx] + [0] * 24)
-        instruction_idx += 1
+        dev_instructions[comm_idx].append([COMM_OPCODE, comm_size, comm_idx, NUM_COMMS, num_comps, num_chunk_cols, dev_idx, prev_dev_idx, next_dev_idx] + [0]*23)
 
     # Compute Ops
-    # num_rows = M // 256
-    # num_local_cols = (N // NUM_DEVICES) // 256
-    # num_iters = K // 128
-    # rows_per_dev = num_rows // NUM_DEVICES
-    # row_start = torch_device.index * rows_per_dev
-    # dev_idx = torch_device.index
-    # next_dev_idx = (dev_idx + 1) % NUM_DEVICES
-    # for _row in range(num_rows):
-    #     row = (row_start + _row) % num_rows
-    #     local_row = row % rows_per_dev
-    #     phasebit = (_row // rows_per_dev) % 2
-    #     for local_col in range(num_local_cols):
-    #         dev_instructions[instruction_idx%148].append(
-    #             [MATMUL_OPCODE, 2*row, 2*local_row, 2*local_col, num_iters, dev_idx, next_dev_idx, phasebit] + [0]*24
-    #         )
-    #         instruction_idx += 1
+    instruction_idx = 0
+    for ring_stage in range(num_ring_stages):
+        for row in range(num_rows):
+            for col in range(num_cols):
+                dev_instructions[NUM_COMMS+(instruction_idx%(148-NUM_COMMS))].append([MATMUL_OPCODE, 2*row, 2*col, num_iters, ring_stage, NUM_COMMS, num_comps, dev_idx] + [0]*24)
+                instruction_idx += 1
 
     # Paddings
     max_instruction_len = 0
@@ -128,6 +121,7 @@ for i in dev_ids:
 ###
 print("\nLaunching the kernel...")
 for dev_id in dev_ids:
+    barriers[dev_id].zero_()
     torch.cuda.synchronize(dev_id)
 matmul(instructions, barriers, timings, A0s, A1s, Bs, Cs)
 for dev_id in dev_ids:
@@ -136,6 +130,9 @@ for dev_id in dev_ids:
 print('\nKernel finished, now benchmarking...')
 times = []
 for i in range(NUM_ITERS):
+    for dev_id in dev_ids:
+        barriers[dev_id].zero_()
+        torch.cuda.synchronize(dev_id)
     start_time = time()
     matmul(instructions, barriers, timings, A0s, A1s, Bs, Cs)
     for dev_id in dev_ids: # can't use cudaEvent (which is device-specific)

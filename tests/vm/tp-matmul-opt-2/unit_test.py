@@ -7,13 +7,13 @@ from time import time
 #   Global Parameters
 ###
 NUM_DEVICES = 8
-NUM_COMMS = 8 # this is the magic number that works the best
+NUM_COMMS = 32 # this is the magic number that works the best
 NUM_ITERS = 5
 MATMUL_OPCODE = 725
 COMM_OPCODE = 97
 # M, K, N = 3072, 4096, 3072
 # M, K, N = 512, 256, 256
-M, K, N = 16384*8, 3072, 16384
+M, K, N = 16384*64, 3072, 16384
 # M, K, N = 3072, 16384*2, 3072
 # M, K, N = 256, 4096, 256
 

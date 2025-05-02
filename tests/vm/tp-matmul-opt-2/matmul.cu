@@ -29,20 +29,21 @@ struct globals {
 
 template<typename config=config> struct CommOp {
     static constexpr int opcode = 97;
-    static constexpr int size_per_iter = config::NUM_PAGES * config::PAGE_SIZE; // 212,992
 
     struct parsed_instruction {
-        int comm_size; // size per stage per SM
+        int comm_size; // number of chunks each comm will do
         int comm_idx;
         int num_comms;
         int dev_idx;
         int prev_dev_idx;
+        int next_dev_idx;
         __device__ inline parsed_instruction(typename config::instruction_t &instruction) {
             comm_size = instruction[1];
             comm_idx = instruction[2];
             num_comms = instruction[3];
             dev_idx = instruction[4];
             prev_dev_idx = instruction[5];
+            next_dev_idx = instruction[6];
         }
         __device__ inline parsed_instruction(state<config> &s): parsed_instruction(s.instruction()) {}
     };
@@ -76,38 +77,43 @@ template<typename config=config> struct CommOp {
             if (laneid < config::NUM_PAGES) {
                 int page = s.pid(laneid);
                 s.wait_page_ready(page);
-                auto &data = reinterpret_cast<st_fp8e4m3<128, 128> &>(s.pages[page]); // use st_fp8e4m3 as a placeholder for full page
+                auto &data = reinterpret_cast<st_fp8e4m3<128, 128> &>(s.pages[page]); // use sv_bf as a placeholder for full page
                 int phasebit = 0;
-                int iters = inst.comm_size / size_per_iter;
+                int iters = (inst.comm_size + config::NUM_PAGES - 1) / config::NUM_PAGES;
                 for (int stage = 0; stage < globals::num_devices - 1; ++stage) {
-                    // load complete (num_comms) + read from compute complete (1) => must wait for num_comms + 1
-                    // TODO: technically, we can separate the waits on the above two, and wait for latter in storing stage
-                    while (stage > 0 && *(volatile int *)&g.barriers[inst.prev_dev_idx][{stage - 1}] < inst.num_comms + 1)
+                    // Are we ready to move on? == previous device's store done + current device's compute done + next device's load done
+                    // TODO: technically, I can put the latter two conditions before the first store
+                    while (stage > 0 && 
+                           (*(volatile int *)&g.barriers[inst.prev_dev_idx][{stage - 1}] < inst.num_comms + 1 ||
+                            *(volatile int *)&g.barriers[inst.dev_idx     ][{stage - 1}] < inst.num_comms + 1 ||
+                            *(volatile int *)&g.barriers[inst.next_dev_idx][{stage - 1}] < inst.num_comms + 1))
                         __nanosleep(20);
                     for (int i = 0; i < iters; ++i) {
-                        kittens::tma::expect(data_arrived(s, laneid), data);
-                        if (stage % 2 == 0)
-                            kittens::tma::load_async(data, g.A0s[inst.prev_dev_idx], 
-                                coord<>{inst.comm_idx * inst.comm_size + i * size_per_iter + laneid * config::PAGE_SIZE}, data_arrived(s, laneid));
-                        else
-                            kittens::tma::load_async(data, g.A1s[inst.prev_dev_idx], 
-                                coord<>{inst.comm_idx * inst.comm_size + i * size_per_iter + laneid * config::PAGE_SIZE}, data_arrived(s, laneid));
-                        wait(data_arrived(s, laneid), phasebit);
-                        phasebit = 1 - phasebit;
-                        if (stage % 2 == 0)
-                            kittens::tma::store_async(g.A1s[inst.dev_idx], data, 
-                                coord<>{inst.comm_idx * inst.comm_size + i * size_per_iter + laneid * config::PAGE_SIZE});
-                        else
-                            kittens::tma::store_async(g.A0s[inst.dev_idx], data,
-                                coord<>{inst.comm_idx * inst.comm_size + i * size_per_iter + laneid * config::PAGE_SIZE});
+                        int local_index = i * config::NUM_PAGES + laneid;
+                        if (local_index < inst.comm_size) {
+                            int index = inst.comm_idx * inst.comm_size + local_index;
+                            int row = index / 24;
+                            int col = index % 24;
+                            kittens::tma::expect(data_arrived(s, laneid), data);
+                            if (stage % 2 == 0)
+                                kittens::tma::load_async(data, g.A0s[inst.prev_dev_idx], {row, col}, data_arrived(s, laneid));
+                            else
+                                kittens::tma::load_async(data, g.A1s[inst.prev_dev_idx], {row, col}, data_arrived(s, laneid));
+                            wait(data_arrived(s, laneid), phasebit);
+                            phasebit = 1 - phasebit;
+                            if (stage % 2 == 0)
+                                kittens::tma::store_async(g.A1s[inst.dev_idx], data, {row, col});
+                            else
+                                kittens::tma::store_async(g.A0s[inst.dev_idx], data, {row, col});
+                        }
                         asm volatile("{bar.warp.sync %0;}" ::"n"(membermask));
                         if (laneid == 0) asm volatile("{cp.async.bulk.wait_group 0;}");
                         asm volatile("{bar.warp.sync %0;}" ::"n"(membermask));
                     }
                     if (laneid == 0) {
                         asm volatile("{fence.acq_rel.sys;}");
-                        atomicAdd(&g.barriers[inst.dev_idx][{stage}], 1); // equals num_comms after completion
-                        if (inst.comm_idx == 0) atomicAdd(&g.barriers[inst.dev_idx][{stage}], 1); // temp
+                        atomicAdd_system(&g.barriers[inst.dev_idx][{stage}], 1); // mark store finished
+                        if (inst.comm_idx == 0) atomicAdd_system(&g.barriers[inst.dev_idx][{stage}], 1); // temp -- mark compute complete
                     }
                 }
                 kittens::arrive(s.page_finished[page], config::NUM_CONSUMER_WARPS); 

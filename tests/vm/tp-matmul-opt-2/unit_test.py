@@ -60,9 +60,10 @@ for torch_device in torch_devices:
     instruction_idx = 0
 
     # Comm Ops
-    comm_size = (M_per_dev * K) // NUM_COMMS
+    num_chunks = (M_per_dev * K) // 16384
+    comm_size = num_chunks // NUM_COMMS
     for comm_idx in range(NUM_COMMS):
-        dev_instructions[comm_idx].append([COMM_OPCODE, comm_size, comm_idx, NUM_COMMS, dev_idx, prev_dev_idx] + [0] * 26)
+        dev_instructions[comm_idx].append([COMM_OPCODE, comm_size, comm_idx, NUM_COMMS, dev_idx, prev_dev_idx, next_dev_idx] + [0] * 25)
         instruction_idx += 1
 
     # Compute Ops
@@ -132,34 +133,49 @@ matmul(instructions, barriers, timings, A0s, A1s, Bs, Cs)
 for dev_id in dev_ids:
     torch.cuda.synchronize(dev_id)
 
-print('\nKernel finished, now benchmarking...')
-times = []
-for i in range(NUM_ITERS):
-    start_time = time()
-    matmul(instructions, barriers, timings, A0s, A1s, Bs, Cs)
-    for dev_id in dev_ids: # can't use cudaEvent (which is device-specific)
-        torch.cuda.synchronize(dev_id)
-    end_time = time()
-    times.append(end_time - start_time)
-avg_time_ms = sum(times) / NUM_ITERS
-total_tflop = 2 * M * N * K * 1e-12
-print(f'Average time per iter: {avg_time_ms * 1e6} us')
-print(f'Total TFLOP/s: {total_tflop / avg_time_ms}')
-print(f'Per-device TFLOP/s: {(total_tflop / NUM_DEVICES) / avg_time_ms}')
+# print('\nKernel finished, now benchmarking...')
+# times = []
+# for i in range(NUM_ITERS):
+#     start_time = time()
+#     matmul(instructions, barriers, timings, A0s, A1s, Bs, Cs)
+#     for dev_id in dev_ids: # can't use cudaEvent (which is device-specific)
+#         torch.cuda.synchronize(dev_id)
+#     end_time = time()
+#     times.append(end_time - start_time)
+# avg_time_ms = sum(times) / NUM_ITERS
+# total_tflop = 2 * M * N * K * 1e-12
+# print(f'Average time per iter: {avg_time_ms * 1e6} us')
+# print(f'Total TFLOP/s: {total_tflop / avg_time_ms}')
+# print(f'Per-device TFLOP/s: {(total_tflop / NUM_DEVICES) / avg_time_ms}')
 
 
 ###
 #   Check for correctness
 ###
-if True: # note that running the kernel more than once will cause the results to be incorrect
+if False: # note that running the kernel more than once will cause the results to be incorrect
     print('\nSkipping correctness check')
     quit()
 print("\nChecking for correctness...")
-C = torch.cat([tensor.to(dtype=torch.float32, device='cpu') for tensor in Cs], dim=1)
-C_ref = (A.to(dtype=torch.float16, device='cuda:0') @ 
-         B.to(dtype=torch.float16, device='cuda:0').T).to(torch.float8_e4m3fn).to(dtype=torch.float32, device='cpu') # simulate precision loss
+# C = torch.cat([tensor.to(dtype=torch.float32, device='cpu') for tensor in Cs], dim=1)
+# C_ref = (A.to(dtype=torch.float16, device='cuda:0') @ 
+#          B.to(dtype=torch.float16, device='cuda:0').T).to(torch.float8_e4m3fn).to(dtype=torch.float32, device='cpu') # simulate precision loss
 
-print(C.dtype, C.shape)
-print(C_ref.dtype, C_ref.shape)
-print('Max abs diff:', abs(C-C_ref).max())
-print('Mean abs diff:', abs(C-C_ref).mean())
+# print(C.dtype, C.shape)
+# print(C_ref.dtype, C_ref.shape)
+# print('Max abs diff:', abs(C-C_ref).max())
+# print('Mean abs diff:', abs(C-C_ref).mean())
+# A0s[0] # should have A[2]
+# A1s[0] # should have A[1]
+
+def check_diff(x, y):
+    x = x.to(dtype=torch.float32, device='cpu')
+    y = y.to(dtype=torch.float32, device='cpu')
+    abs_diff = abs(x - y)
+    print('Max abs diff:', abs_diff.max())
+    print('Mean abs diff:', abs_diff.mean())
+
+zero = torch.zeros_like(A0s[0])
+As = A.chunk(len(torch_devices), dim=0)
+for i in range(NUM_DEVICES):
+    check_diff(A0s[i], As[(i + 2) % NUM_DEVICES])
+    check_diff(A1s[i], As[(i + 1) % NUM_DEVICES])

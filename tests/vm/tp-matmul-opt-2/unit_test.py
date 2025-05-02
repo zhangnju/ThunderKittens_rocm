@@ -7,13 +7,13 @@ from time import time
 #   Global Parameters
 ###
 NUM_DEVICES = 8
-NUM_COMMS = 32 # this is the magic number that works the best
+NUM_COMMS = 8 # this is the magic number that works the best
 NUM_ITERS = 5
 MATMUL_OPCODE = 725
 COMM_OPCODE = 97
 # M, K, N = 3072, 4096, 3072
 # M, K, N = 512, 256, 256
-M, K, N = 16384*64, 3072, 16384
+M, K, N = 16384*8, 3072, 16384
 # M, K, N = 3072, 16384*2, 3072
 # M, K, N = 256, 4096, 256
 
@@ -73,8 +73,11 @@ for torch_device in torch_devices:
     instruction_idx = 0
     for ring_stage in range(num_ring_stages):
         for row in range(num_rows):
+            row_global_start = num_rows * dev_idx
+            row_global_total = num_rows * num_ring_stages
+            row_global = (row_global_start + row_global_total - num_rows * ring_stage + row) % row_global_total
             for col in range(num_cols):
-                dev_instructions[NUM_COMMS+(instruction_idx%(148-NUM_COMMS))].append([MATMUL_OPCODE, 2*row, 2*col, num_iters, ring_stage, NUM_COMMS, num_comps, dev_idx] + [0]*24)
+                dev_instructions[NUM_COMMS+(instruction_idx%(148-NUM_COMMS))].append([MATMUL_OPCODE, 2*row, 2*col, 2*row_global, num_iters, ring_stage, NUM_COMMS, num_comps, dev_idx] + [0]*23)
                 instruction_idx += 1
 
     # Paddings
@@ -153,17 +156,6 @@ print(f'Per-unidirectional-NVLink GB/s: {M_per_dev * 7 * K * 1e-9 / avg_time}')
 if True: # note that running the kernel more than once will cause the results to be incorrect
     print('\nSkipping correctness check')
     quit()
-print("\nChecking for correctness...")
-# C = torch.cat([tensor.to(dtype=torch.float32, device='cpu') for tensor in Cs], dim=1)
-# C_ref = (A.to(dtype=torch.float16, device='cuda:0') @ 
-#          B.to(dtype=torch.float16, device='cuda:0').T).to(torch.float8_e4m3fn).to(dtype=torch.float32, device='cpu') # simulate precision loss
-
-# print(C.dtype, C.shape)
-# print(C_ref.dtype, C_ref.shape)
-# print('Max abs diff:', abs(C-C_ref).max())
-# print('Mean abs diff:', abs(C-C_ref).mean())
-# A0s[0] # should have A[2]
-# A1s[0] # should have A[1]
 
 def check_diff(x, y):
     x = x.to(dtype=torch.float32, device='cpu')
@@ -172,7 +164,13 @@ def check_diff(x, y):
     print('Max abs diff:', abs_diff.max())
     print('Mean abs diff:', abs_diff.mean())
 
-zero = torch.zeros_like(A0s[0])
+print("\nChecking for correctness...")
+C = torch.cat([tensor.to(dtype=torch.float32, device='cpu') for tensor in Cs], dim=1)
+C_ref = (A.to(dtype=torch.float16, device='cuda:0') @ 
+         B.to(dtype=torch.float16, device='cuda:0').T).to(torch.float8_e4m3fn).to(dtype=torch.float32, device='cpu') # simulate precision loss
+check_diff(C, C_ref)
+
+# Sanity check if comms are correct
 As = A.chunk(len(torch_devices), dim=0)
 for i in range(NUM_DEVICES):
     check_diff(A0s[i], As[(i + 2) % NUM_DEVICES])

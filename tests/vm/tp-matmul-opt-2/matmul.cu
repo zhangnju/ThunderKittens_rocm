@@ -34,6 +34,7 @@ template<typename config=config> struct MatmulOp {
     struct parsed_instruction {
         int row;
         int col;
+        int row_global;
         int iters;
         int ring_stage;
         int num_comms;
@@ -42,11 +43,12 @@ template<typename config=config> struct MatmulOp {
         __device__ inline parsed_instruction(typename config::instruction_t &instruction) {
             row = instruction[1];
             col = instruction[2];
-            iters = instruction[3];
-            ring_stage = instruction[4];
-            num_comms = instruction[5];
-            num_comps = instruction[6];
-            dev_idx = instruction[7];
+            row_global = instruction[3];
+            iters = instruction[4];
+            ring_stage = instruction[5];
+            num_comms = instruction[6];
+            num_comps = instruction[7];
+            dev_idx = instruction[8];
         }
         __device__ inline parsed_instruction(state<config> &s): parsed_instruction(s.instruction()) {}
     };
@@ -204,7 +206,7 @@ template<typename config=config> struct MatmulOp {
 
                 int store_page = get_store_page(s, inst, laneid());
                 st_fp8e4m3<128, 128> &output = s.pages[store_page].template as_st<fp8e4m3>();
-                tma::store_async(g.C, output, {inst.row+laneid()/2, inst.col+laneid()%2});
+                tma::store_async(g.C, output, {inst.row_global+laneid()/2, inst.col+laneid()%2});
                 tma::store_async_read_wait();
                 arrive(s.page_finished[store_page], config::NUM_CONSUMER_WARPS);
             }

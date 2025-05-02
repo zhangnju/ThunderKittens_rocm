@@ -24,7 +24,6 @@ if M%NUM_DEVICES != 0: raise ValueError("M must be divisible by NUM_DEVICES")
 if N%NUM_DEVICES != 0: raise ValueError("N must be divisible by NUM_DEVICES")
 if M%(NUM_DEVICES*256) != 0: raise ValueError("For now, M must be divisible by (NUM_DEVICES*256))")
 if N%(NUM_DEVICES*256) != 0: raise ValueError("For now, N must be divisible by (NUM_DEVICES*256))")
-if (M*K//NUM_DEVICES)%16384 != 0: raise ValueError("For now, M*K//NUM_DEVICES must be divisible by 16384")
 
 
 ###
@@ -61,9 +60,10 @@ for torch_device in torch_devices:
 
     # Comm Ops
     num_chunks = (M_per_dev * K) // 16384
+    num_chunk_cols = K // 128
     comm_size = num_chunks // NUM_COMMS
     for comm_idx in range(NUM_COMMS):
-        dev_instructions[comm_idx].append([COMM_OPCODE, comm_size, comm_idx, NUM_COMMS, dev_idx, prev_dev_idx, next_dev_idx] + [0] * 25)
+        dev_instructions[comm_idx].append([COMM_OPCODE, comm_size, comm_idx, NUM_COMMS, num_chunk_cols, dev_idx, prev_dev_idx, next_dev_idx] + [0] * 24)
         instruction_idx += 1
 
     # Compute Ops

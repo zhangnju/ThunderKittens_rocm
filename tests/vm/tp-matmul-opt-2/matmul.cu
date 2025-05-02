@@ -34,6 +34,7 @@ template<typename config=config> struct CommOp {
         int comm_size; // number of chunks each comm will do
         int comm_idx;
         int num_comms;
+        int num_chunk_cols;
         int dev_idx;
         int prev_dev_idx;
         int next_dev_idx;
@@ -41,9 +42,10 @@ template<typename config=config> struct CommOp {
             comm_size = instruction[1];
             comm_idx = instruction[2];
             num_comms = instruction[3];
-            dev_idx = instruction[4];
-            prev_dev_idx = instruction[5];
-            next_dev_idx = instruction[6];
+            num_chunk_cols = instruction[4];
+            dev_idx = instruction[5];
+            prev_dev_idx = instruction[6];
+            next_dev_idx = instruction[7];
         }
         __device__ inline parsed_instruction(state<config> &s): parsed_instruction(s.instruction()) {}
     };
@@ -92,8 +94,8 @@ template<typename config=config> struct CommOp {
                         int local_index = i * config::NUM_PAGES + laneid;
                         if (local_index < inst.comm_size) {
                             int index = inst.comm_idx * inst.comm_size + local_index;
-                            int row = index / 24;
-                            int col = index % 24;
+                            int row = index / inst.num_chunk_cols;
+                            int col = index % inst.num_chunk_cols;
                             kittens::tma::expect(data_arrived(s, laneid), data);
                             if (stage % 2 == 0)
                                 kittens::tma::load_async(data, g.A0s[inst.prev_dev_idx], {row, col}, data_arrived(s, laneid));

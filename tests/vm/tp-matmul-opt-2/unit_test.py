@@ -133,26 +133,27 @@ matmul(instructions, barriers, timings, A0s, A1s, Bs, Cs)
 for dev_id in dev_ids:
     torch.cuda.synchronize(dev_id)
 
-# print('\nKernel finished, now benchmarking...')
-# times = []
-# for i in range(NUM_ITERS):
-#     start_time = time()
-#     matmul(instructions, barriers, timings, A0s, A1s, Bs, Cs)
-#     for dev_id in dev_ids: # can't use cudaEvent (which is device-specific)
-#         torch.cuda.synchronize(dev_id)
-#     end_time = time()
-#     times.append(end_time - start_time)
-# avg_time_ms = sum(times) / NUM_ITERS
-# total_tflop = 2 * M * N * K * 1e-12
-# print(f'Average time per iter: {avg_time_ms * 1e6} us')
-# print(f'Total TFLOP/s: {total_tflop / avg_time_ms}')
-# print(f'Per-device TFLOP/s: {(total_tflop / NUM_DEVICES) / avg_time_ms}')
+print('\nKernel finished, now benchmarking...')
+times = []
+for i in range(NUM_ITERS):
+    start_time = time()
+    matmul(instructions, barriers, timings, A0s, A1s, Bs, Cs)
+    for dev_id in dev_ids: # can't use cudaEvent (which is device-specific)
+        torch.cuda.synchronize(dev_id)
+    end_time = time()
+    times.append(end_time - start_time)
+avg_time = sum(times) / NUM_ITERS
+total_tflop = 2 * M * N * K * 1e-12
+print(f'Average time per iter: {avg_time * 1e6} us')
+print(f'Total TFLOP/s: {total_tflop / avg_time}')
+print(f'Per-device TFLOP/s: {(total_tflop / NUM_DEVICES) / avg_time}')
+print(f'Per-unidirectional-NVLink GB/s: {M_per_dev * 7 * K * 1e-9 / avg_time}')
 
 
 ###
 #   Check for correctness
 ###
-if False: # note that running the kernel more than once will cause the results to be incorrect
+if True: # note that running the kernel more than once will cause the results to be incorrect
     print('\nSkipping correctness check')
     quit()
 print("\nChecking for correctness...")

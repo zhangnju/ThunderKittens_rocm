@@ -92,7 +92,7 @@ void matmul(const __grid_constant__ matmul_globals g) {
         }
     }
 
-    everyone::tma::cluster::sync();
+    tma::cluster::sync();
     
     if(warpgroupid == NUM_CONSUMERS) {
         warpgroup::decrease_registers<56>();
@@ -113,10 +113,10 @@ void matmul(const __grid_constant__ matmul_globals g) {
                     wait(inputs_finished[input_ring], prototype::get_phasebit<1>(bitfield, input_ring));
                     prototype::update_phasebit<1>(bitfield, input_ring);
                     if(task_iter>0 && idx==PIPE_DEPTH-1 && laneid() == 0) arrive(outputs_arrived); 
-                    warp::tma::expect(inputs_arrived[input_ring], a_smem[0][0], a_smem[0][1], b_smem[0]);
-                    warp::tma::load_async(a_smem[input_ring][0], g.a, {(rowcol.x+0), idx}, inputs_arrived[input_ring]);
-                    warp::tma::load_async(a_smem[input_ring][1], g.a, {(rowcol.x+1), idx}, inputs_arrived[input_ring]);
-                    warp::tma::load_async(b_smem[input_ring],    g.b, { rowcol.y,    idx}, inputs_arrived[input_ring]);
+                    tma::expect(inputs_arrived[input_ring], a_smem[0][0], a_smem[0][1], b_smem[0]);
+                    tma::load_async(a_smem[input_ring][0], g.a, {(rowcol.x+0), idx}, inputs_arrived[input_ring]);
+                    tma::load_async(a_smem[input_ring][1], g.a, {(rowcol.x+1), idx}, inputs_arrived[input_ring]);
+                    tma::load_async(b_smem[input_ring],    g.b, { rowcol.y,    idx}, inputs_arrived[input_ring]);
                     input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring);
                 }
             }
@@ -130,12 +130,12 @@ void matmul(const __grid_constant__ matmul_globals g) {
                 wait(outputs_finished[warpgroup::warpid()], (task_iter+1)%2); // make sure tensor memory is ready to be written to.
                 wait(inputs_arrived[input_ring], prototype::get_phasebit<0>(bitfield, input_ring));
                 prototype::update_phasebit<0>(bitfield, input_ring);
-                warp::mm_ABt(d_tt, a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
+                mm_ABt(d_tt, a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
                 input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring);
                 for(int idx = 1; idx < iters_per_task; idx++) {
                     wait(inputs_arrived[input_ring], prototype::get_phasebit<0>(bitfield, input_ring));
                     prototype::update_phasebit<0>(bitfield, input_ring);
-                    warp::mma_ABt(d_tt, a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
+                    mma_ABt(d_tt, a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
                     input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring);
                 }
             }
@@ -154,28 +154,28 @@ void matmul(const __grid_constant__ matmul_globals g) {
             for(int i = 0; i < Nb/d_tile::cols; i++) {
                 warpgroup::load_async(d_reg[i], d_tt.subtile<tt<float, 128, 64>>(0, 64*i));
             }
-            tensor_load_wait();
+            tm_load_wait();
             warpgroup::sync(warpgroupid);
             if(warpgroup::laneid() == 0) arrive(outputs_finished[warpgroupid]); // Tensor memory for warpgroup 0 is now free.
             if(warpgroupid == 0) group<8>::sync(15);
             if(warpgroupid == 1) group<8>::sync(14);
             warpgroup::store(d_smem, d_reg[0]);
             warpgroup::sync(warpgroupid);
-            if(warpgroup::warpid() == 0) warp::tma::store_async(g.d, d_smem, {rowcol.x, 4*rowcol.y+0});
+            if(warpgroup::warpid() == 0) tma::store_async(g.d, d_smem, {rowcol.x, 4*rowcol.y+0});
             #pragma unroll
             for(int i = 1; i < Nb/d_tile::cols; i++) {
                 tma::store_async_read_wait();
                 warpgroup::sync(warpgroupid);
                 warpgroup::store(d_smem, d_reg[i]);
                 warpgroup::sync(warpgroupid);
-                if(warpgroup::warpid() == 0) warp::tma::store_async(g.d, d_smem, {rowcol.x, 4*rowcol.y+i});
+                if(warpgroup::warpid() == 0) tma::store_async(g.d, d_smem, {rowcol.x, 4*rowcol.y+i});
             }
             tma::store_async_read_wait();
             if(warpgroupid == 0) group<8>::sync(14);
             group<8>::sync(15); // All consumers sync here.
         }
     }
-    everyone::tma::cluster::sync();
+    tma::cluster::sync();
 }
 
 

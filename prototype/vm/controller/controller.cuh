@@ -28,7 +28,6 @@ namespace kittens
                 {
                     auto laneid = ::kittens::laneid();
                     int num_iters = g.instructions.rows();
-                    int num_semaphores[config::INSTRUCTION_PIPELINE_STAGES];
 
                     // for warps
                     static_assert(config::DYNAMIC_SEMAPHORES <= 32);
@@ -43,14 +42,8 @@ namespace kittens
                         if (kvms.instruction_index >= config::INSTRUCTION_PIPELINE_STAGES)
                         {
                             auto last_slot_instruction_index = kvms.instruction_index - config::INSTRUCTION_PIPELINE_STAGES;
-
                             int phasebit = (last_slot_instruction_index / config::INSTRUCTION_PIPELINE_STAGES) & 1;
                             wait(kvms.instruction_finished[kvms.instruction_ring], phasebit);
-
-                            if (laneid < num_semaphores[kvms.instruction_ring])
-                            {
-                                invalidate_semaphore(kvms.all_instructions[kvms.instruction_ring].semaphores[laneid]);
-                            }
 
                             // TODO needed?
                             warp::sync();
@@ -103,26 +96,6 @@ namespace kittens
                             kvms.record(TEVENT_PAGE_ALLOC_DONE);
                         }
 
-                        // Step 3. Construct semaphores
-                        int opcode = kvms.instruction()[0];
-                        if (opcode == 0)
-                        {
-                            num_semaphores[kvms.instruction_ring] = 0;
-                        }
-                        else
-                        {
-                            if (laneid == 0)
-                            {
-                                num_semaphores[kvms.instruction_ring] = dispatch_op<semaphore_constructor_op_dispatcher<config, globals>::dispatcher, ops...>::template run<int, config, globals, ::kittens::prototype::vm::state<config>>(
-                                    opcode, g, kvms);
-                            }
-
-                            auto shfl_val = __shfl_sync(0xffffffff, num_semaphores[kvms.instruction_ring], 0);
-
-                            // broadcast the result to all lanes
-                            num_semaphores[kvms.instruction_ring] = shfl_val;
-                        }
-
                         if (laneid == 0)
                         {
                             kvms.record(TEVENT_SEMS_SETUP);
@@ -140,15 +113,9 @@ namespace kittens
                             continue;
                         }
 
-                        auto instruction_ring = instruction_index % config::INSTRUCTION_PIPELINE_STAGES;
-
                         auto phasebit = (instruction_index / config::INSTRUCTION_PIPELINE_STAGES) & 1;
+                        auto instruction_ring = instruction_index % config::INSTRUCTION_PIPELINE_STAGES;
                         wait(kvms.instruction_finished[instruction_ring], phasebit);
-
-                        if (laneid < num_semaphores[instruction_ring])
-                        {
-                            invalidate_semaphore(kvms.all_instructions[instruction_ring].semaphores[laneid]);
-                        }
 
                         kvms.instruction_index = instruction_index;
                         kvms.instruction_ring = instruction_ring;

@@ -32,12 +32,24 @@ namespace kittens
                 __shared__ kittens::semaphore page_finished[config::NUM_PAGES],
                     instruction_arrived[config::INSTRUCTION_PIPELINE_STAGES],
                     instruction_finished[config::INSTRUCTION_PIPELINE_STAGES],
-                    tensor_finished,
-                    semaphores_ready;
+                    tensor_finished;
                 extern __shared__ int __shm[];
                 void *aligned_shm_addr = (void *)((1023 + (uint64_t)&__shm[0]) & ~(uint64_t)1023);
                 typename state<config>::page_array_t &pages = *reinterpret_cast<typename state<config>::page_array_t *>(aligned_shm_addr);
                 typename state<config>::tensor_allocator_t tensor_alloc{};
+
+                if (threadIdx.x < config::INSTRUCTION_PIPELINE_STAGES) {
+                    for (int i = 0; i < config::DYNAMIC_SEMAPHORES; i++)
+                        instruction_state[threadIdx.x].phasebits[i] = 0;
+                    for (int i = 0; i < 3; ++i)
+                        init_semaphore(instruction_state[threadIdx.x].semaphores[i], 1); // inputs arrived
+                    for (int i = 0; i < 3; ++i)
+                        init_semaphore(instruction_state[threadIdx.x].semaphores[i + 3], 4); // inputs finished
+                    for (int i = 0; i < 4; ++i)
+                        init_semaphore(instruction_state[threadIdx.x].semaphores[i + 6], 1); // outputs arrived
+                    for (int i = 0; i < 4; ++i)
+                        init_semaphore(instruction_state[threadIdx.x].semaphores[i + 10], 1); // outputs shared  
+                }
 
 #ifdef KVM_DEBUG
                 if (threadIdx.x == 0)
@@ -54,7 +66,6 @@ namespace kittens
                     pages,
                     page_finished,
                     tensor_finished,
-                    semaphores_ready,
                     start_time,
                     tensor_alloc}; // kittens virtual machine state
 
@@ -88,7 +99,6 @@ namespace kittens
                 {
                     init_semaphore(tensor_finished, config::NUM_CONSUMER_WARPS);
                     arrive(tensor_finished, config::NUM_CONSUMER_WARPS); // Flip to state 0, to mark that it starts as available.
-                    init_semaphore(semaphores_ready, 1);
                 }
 
                 asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");

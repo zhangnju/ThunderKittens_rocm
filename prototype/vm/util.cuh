@@ -18,6 +18,7 @@ template<typename config> struct __align__(128) instruction_state_t {
     int pid_order[config::NUM_PAGES];
     int padding[((config::NUM_PAGES + 31) & ~31) - config::NUM_PAGES]; // Round up to multiple of 32
     kittens::semaphore semaphores[config::DYNAMIC_SEMAPHORES];
+    char phasebits[config::DYNAMIC_SEMAPHORES];
     int scratch[config::SCRATCH_BYTES/4];
 };
 
@@ -93,6 +94,9 @@ template<typename config> struct state {
     __device__ inline const kittens::semaphore (&semaphores() const)[config::DYNAMIC_SEMAPHORES] {
         return all_instructions[instruction_ring].semaphores;
     }
+    __device__ inline instruction_state_t<config> &instruction_state() const {
+        return all_instructions[instruction_ring];
+    }
     __device__ inline void await_instruction() {
         wait(instruction_arrived[instruction_ring], (instruction_index / config::INSTRUCTION_PIPELINE_STAGES) & 1);
         #pragma unroll
@@ -128,11 +132,6 @@ template<typename config> struct state {
     semaphore &tensor_finished;
     __device__ inline void wait_tensor_ready() {
         wait(tensor_finished, instruction_index%2);
-    }
-
-    semaphore &semaphores_ready;
-    __device__ inline void wait_semaphores_ready() {
-        wait(semaphores_ready, instruction_index%2);
     }
 
     uint64_t start_clock;

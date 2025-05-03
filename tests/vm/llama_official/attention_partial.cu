@@ -33,6 +33,7 @@ namespace kittens::prototype::vm
         using l_sv = sv_fl<16>;                                    // only 4 values are used
         using o_rt = rt_fl<16, LLAMA_1B_HEAD_DIM>;                 // only 4 rows are used
         using o_sv = sv_fl<LLAMA_1B_HEAD_DIM>;
+        using o_sv_bf = sv_bf<LLAMA_1B_HEAD_DIM>;
 
         struct parsed_instruction
         {
@@ -85,12 +86,12 @@ namespace kittens::prototype::vm
         __device__ static inline void finish_QOL_page(state<config> &s)
         {
             if (warp::laneid() == 0)
-                arrive(s.page_finished[s.pid(QOL_PAGE)], config::NUM_CONSUMER_WARPS);
+                s.finish_page(s.pid(QOL_PAGE), config::NUM_CONSUMER_WARPS);
         }
         __device__ static inline void finish_KV_page(state<config> &s)
         {
             if (warp::laneid() == 0)
-                arrive(s.page_finished[s.pid(KV_PAGE)], config::NUM_CONSUMER_WARPS);
+                s.finish_page(s.pid(KV_PAGE), config::NUM_CONSUMER_WARPS);
         }
         __device__ static inline q_st &get_Q_smem(state<config> &s)
         {
@@ -285,14 +286,24 @@ namespace kittens::prototype::vm
         {
             static __device__ void run(const globals &g, state<config> &s)
             {
+                auto laneid = warp::laneid();
+                if (laneid >= 2 && laneid < config::NUM_PAGES)
+                {
+                    int unused_page = s.pid(laneid);
+                    s.wait_page_ready(unused_page);
+                    s.finish_page(unused_page, config::NUM_CONSUMER_WARPS);
+                }
+            }
+        };
+        struct launcher
+        {
+            static __device__ void run(const globals &g, state<config> &s)
+            {
                 if (warp::laneid() == 0)
                 {
-                    s.record(TEVENT_LOADER_START);
-                }
+                    s.wait_tensor_ready();
+                    arrive(s.tensor_finished, config::NUM_CONSUMER_WARPS);
 
-                auto laneid = warp::laneid();
-                if (laneid == 0)
-                {
                     // Setup
                     parsed_instruction inst{s};
                     int seq_len = g.pos_id + 1;
@@ -337,40 +348,12 @@ namespace kittens::prototype::vm
                         tma::load_async<dim::DEPTH, cache_policy::EVICT_FIRST>(V_smem, g.v_cache, {inst.layer_idx, i + start_blk_idx, inst.kv_head_idx, 0}, V_arrived(s, stage));
                     }
                 }
-                else if (laneid >= 2 && laneid < config::NUM_PAGES)
-                {
-                    int unused_page = s.pid(laneid);
-                    s.wait_page_ready(unused_page);
-                    arrive(s.page_finished[unused_page], config::NUM_CONSUMER_WARPS);
-                }
-
-                warp::sync();
-                if (laneid == 0)
-                {
-                    s.record(TEVENT_LOADER_END);
-                }
-            }
-        };
-        struct launcher
-        {
-            static __device__ void run(const globals &g, state<config> &s)
-            {
-                if (warp::laneid() == 0)
-                {
-                    s.wait_tensor_ready();
-                    arrive(s.tensor_finished, config::NUM_CONSUMER_WARPS);
-                }
             }
         };
         struct consumer
         {
             static __device__ void run(const globals &g, state<config> &s)
             {
-
-                if (warp::laneid() == 0)
-                {
-                    s.record(TEVENT_CONSUMER_START + warpid());
-                }
 
                 if (warpid() == 0)
                 {
@@ -421,11 +404,6 @@ namespace kittens::prototype::vm
 
                     // Wait for Q to arrive
                     warp::load_async_wait();
-
-                    if (laneid() == 0)
-                    {
-                        s.record(TEVENT_CONSUMER_START + 16);
-                    }
 
                     warp::load(Q_reg, Q_smem);
 
@@ -486,8 +464,7 @@ namespace kittens::prototype::vm
 
                     // Finish
                     warp::sync();
-                    if (laneid() == 0)
-                        s.record(TEVENT_CONSUMER_START + 64);
+
                     if (start_blk_idx < end_blk_idx)
                     {
                         finish_KV_page(s);
@@ -505,50 +482,86 @@ namespace kittens::prototype::vm
                     // Store the results
                     store_4_rows(O_smem, O_reg, q_head_local_idx);
                     warp::sync();
-                    if (laneid() == 0)
-                    {
-                        s.record(TEVENT_CONSUMER_START + 65);
-                    }
+
                     warp::arrive(O_arrived(s));
                     warp::store(L_smem, L_reg);
                     warp::sync();
                     warp::arrive(L_arrived(s));
                 }
-
-                if (laneid == 0)
-                {
-                    s.record(TEVENT_CONSUMER_END + warpid());
-                }
             }
         };
         struct storer
         {
-            static __device__ void run(const globals &g, state<config> &s)
+
+            static inline __device__ void store_o_skip(const globals &g, state<config> &s, int q_head_start_idx)
             {
-                if (laneid == 0)
+                auto O_smem = get_O_smem(s);
+
+                if (laneid() == 0)
                 {
-                    s.record(TEVENT_STORE_START);
+                    wait(O_arrived(s), 0);
+                    s.record(TEVENT_OUTPUT_READY);
+                }
+                warp::sync();
+
+                rv_bf<globals::head_dim> O_bf;
+                for (int head_offset = 0; head_offset < GQA_RATIO; head_offset++)
+                {
+                    auto &smem_fl = O_smem[head_offset];
+                    auto &smem_bf = *reinterpret_cast<o_sv_bf *>(&smem_fl);
+
+                    warp::load(O_bf, smem_fl);
+                    warp::sync();
+                    warp::store(smem_bf, O_bf);
+                    warp::sync();
                 }
 
+                if (laneid() == 0)
+                {
+                    for (int head_offset = 0; head_offset < GQA_RATIO; head_offset++)
+                    {
+                        auto &smem_bf = *reinterpret_cast<o_sv_bf *>(&O_smem[head_offset]);
+                        tma::store_async<cache_policy::NORMAL>(g.attn_out, smem_bf, {q_head_start_idx + head_offset});
+                    }
+                }
+            }
+
+            static inline __device__ void store_o_no_skip(const globals &g, state<config> &s, int q_head_start_idx, parsed_instruction &inst)
+            {
+                // Store partial attention output to global memory
+                if (laneid == 0)
+                {
+                    o_sv(&O_smem)[GQA_RATIO] = get_O_smem(s);
+                    wait(O_arrived(s), 0);
+                    s.record(TEVENT_OUTPUT_READY);
+
+                    for (int head_offset = 0; head_offset < GQA_RATIO; head_offset++)
+                    {
+                        tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[head_offset], {0, q_head_start_idx + head_offset, inst.partial_idx, 0});
+                    }
+                }
+            }
+
+            static __device__ void run(const globals &g, state<config> &s)
+            {
                 parsed_instruction inst{s};
                 int laneid = warp::laneid();
                 int q_head_start_idx = inst.kv_head_idx * GQA_RATIO; // 0, 4, 8, 12, 16, 20, 24, 28
                 int q_head_vec_start_idx = q_head_start_idx % 16;
 
-                // Store partial attention output to global memory
-                if (laneid == 0)
+                auto skip_attn_reduction = g.skip_attn_reduction;
+
+                if (skip_attn_reduction)
                 {
-                    o_sv(&O_smem)[4] = get_O_smem(s);
-                    wait(O_arrived(s), 0);
-                    s.record(TEVENT_OUTPUT_READY);
-                    tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[0], {0, q_head_start_idx + 0, inst.partial_idx, 0});
-                    tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[1], {0, q_head_start_idx + 1, inst.partial_idx, 0});
-                    tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[2], {0, q_head_start_idx + 2, inst.partial_idx, 0});
-                    tma::store_async<cache_policy::NORMAL>(g.attn_out_intermediates, O_smem[3], {0, q_head_start_idx + 3, inst.partial_idx, 0});
+                    store_o_skip(g, s, q_head_start_idx);
+                }
+                else
+                {
+                    store_o_no_skip(g, s, q_head_start_idx, inst);
                 }
 
                 // Store LSE to global memory
-                if (laneid < GQA_RATIO)
+                if (laneid < GQA_RATIO && !skip_attn_reduction)
                 {
                     l_sv &L_smem = get_L_smem(s);
                     wait(L_arrived(s), 0);
@@ -564,20 +577,25 @@ namespace kittens::prototype::vm
                 warp::sync(); // ensure all writes are committed
                 asm volatile("fence.acq_rel.gpu;");
 
+                tma::store_async_wait();
+                if (laneid == 0)
+                {
+                    s.record(123 + laneid);
+                    finish_QOL_page(s);
+                }
+
                 // Wait and finish
                 if (laneid < GQA_RATIO)
                 {
-                    tma::store_async_wait();
-                    if (laneid == 0)
-                        s.record(123 + laneid);
-                    finish_QOL_page(s);
-                    // Adding only at 0, 4, 8, ... should be sufficient for the reduction op!
-                    atomicAdd(&g.Bar[{inst.layer_idx, OPCODE_PartialAttention - 1, q_head_start_idx + laneid}], 1);
-                }
-                warp::sync();
-                if (laneid == 0)
-                {
-                    s.record(TEVENT_STORE_END);
+                    if (skip_attn_reduction)
+                    {
+                        atomicAdd(&g.Bar[{inst.layer_idx, OPCODE_AttentionReduction - 1, 0}], 1);
+                    }
+                    else
+                    {
+                        // Adding only at 0, 4, 8, ... should be sufficient for the reduction op!
+                        atomicAdd(&g.Bar[{inst.layer_idx, opcode - 1, q_head_start_idx + laneid}], 1);
+                    }
                 }
             }
         };

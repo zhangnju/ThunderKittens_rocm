@@ -120,15 +120,35 @@ for i in dev_ids:
 #  Launch the kernel
 ###
 print('\nLaunching kernel...')
+for dev_id in dev_ids:
+    barriers[dev_id].zero_()
+    torch.cuda.synchronize(dev_id)
 ring_attention(
     instructions, barriers, timings,
     Qs, K0s, K1s, V0s, V1s, Os
 )
+for dev_id in dev_ids:
+    torch.cuda.synchronize(dev_id)
 
 
 ###
 #  Verify correctness
 ###
+def pytorch_mha(q, k, v):
+    QK = torch.matmul(q, k.transpose(-2, -1))
+    # QK /= (q.size(-1) ** 0.5)
+    # QK = torch.nn.functional.softmax(QK, dim=-1)
+    # out = torch.matmul(QK, v)
+    # return out
+    return QK
+
+O_ref = pytorch_mha(Qs[0], K0s[0], V0s[0])
+
+print(O_ref)
+# print(Os[0])
+
+breakpoint()
+
 
 
 # def ring_mha_torch(Qs, Ks, Vs):

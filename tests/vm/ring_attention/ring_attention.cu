@@ -77,12 +77,12 @@ template<typename config=config> struct RingAttentionOp {
     __device__ static inline semaphore &v_arrived(state<config> &s, int stage)   { return s.semaphores()[8 + PIPELINE_STAGES * 1 + stage]; }
     __device__ static inline semaphore &qk_finished(state<config> &s, int stage) { return s.semaphores()[8 + PIPELINE_STAGES * 2 + stage]; }
     __device__ static inline semaphore &av_finished(state<config> &s, int stage) { return s.semaphores()[8 + PIPELINE_STAGES * 3 + stage]; }
- 
+
     __device__ static inline int get_q_page(state<config> &s, int id)    { return id; } // use PIDs for now
     __device__ static inline int get_a_page(state<config> &s, int id)    { return 2 + id; }
-    __device__ static inline int get_k_page(state<config> &s, int stage) { return 4 + PIPELINE_STAGES * 0 + stage; }
-    __device__ static inline int get_v_page(state<config> &s, int stage) { return 4 + PIPELINE_STAGES * 1 + stage; }
-    __device__ static inline int get_o_page(state<config> &s)            { return 4 + PIPELINE_STAGES * 2; }
+    __device__ static inline int get_o_page(state<config> &s, int id)    { return 4 + id; }
+    __device__ static inline int get_k_page(state<config> &s, int stage) { return 6 + PIPELINE_STAGES * 0 + stage; }
+    __device__ static inline int get_v_page(state<config> &s, int stage) { return 6 + PIPELINE_STAGES * 1 + stage; }
 
     struct controller {
         static __device__ int release_lid(const globals &g, typename config::instruction_t &instruction, int &query) {
@@ -99,8 +99,8 @@ template<typename config=config> struct RingAttentionOp {
             for (int i = 0; i < PIPELINE_STAGES; ++i) {
                 init_semaphore(k_arrived(s, i), 1);
                 init_semaphore(v_arrived(s, i), 1);
-                init_semaphore(qk_finished(s, i), 1);
-                init_semaphore(av_finished(s, i), 1);
+                init_semaphore(qk_finished(s, i), 2);
+                init_semaphore(av_finished(s, i), 2);
             }
             return 2*4 + PIPELINE_STAGES*4;
         }
@@ -117,8 +117,9 @@ template<typename config=config> struct RingAttentionOp {
                 s.wait_page_ready(q_page);
                 tma::expect(q_arrived(s, laneid), q);
                 tma::load_async(q, g.Q, {inst.B, inst.H, inst.QO_idx + laneid, 0}, q_arrived(s, laneid));
+                // printf("Q load start %d\n", laneid);
             } else if (laneid == 2) { // Load Ks
-                int phasebit = 0;
+                uint32_t phasebit = 0;
                 for (int i = 0; i < inst.num_kv_blocks; i++) {
                     int stage = i % PIPELINE_STAGES;
                     auto k_page = get_k_page(s, stage);
@@ -126,21 +127,23 @@ template<typename config=config> struct RingAttentionOp {
                     if (i < PIPELINE_STAGES) {
                         s.wait_page_ready(get_k_page(s, stage));
                     } else {
-                        wait(qk_finished(s, stage), phasebit);
-                        phasebit ^= 1;
+                        wait(qk_finished(s, stage), get_phasebit<0>(phasebit, stage));
+                        update_phasebit<0>(phasebit, stage);
                     }
                     tma::expect(k_arrived(s, stage), k);
                     // Todo: vary by ring stage
                     tma::load_async(k, g.K0s[inst.dev_idx], {inst.B, inst.H, i, 0}, k_arrived(s, stage));
+                    // printf("K load start %d\n", i);
                 }
                 for (int i = 0; i < PIPELINE_STAGES; i++) {
                     int stage = (i + inst.num_kv_blocks) % PIPELINE_STAGES;
-                    wait(qk_finished(s, stage), phasebit);
+                    wait(qk_finished(s, stage), get_phasebit<0>(phasebit, stage));
+                    // printf("arriving K finished page %d\n", stage);
                     s.finish_page(get_k_page(s, stage), config::NUM_CONSUMER_WARPS);
-                    phasebit ^= 1;
+                    update_phasebit<0>(phasebit, stage);
                 }
             } else if (laneid == 3) { // Load Vs
-                int phasebit = 0;
+                uint32_t phasebit = 0;
                 for (int i = 0; i < inst.num_kv_blocks; i++) {
                     int stage = i % PIPELINE_STAGES;
                     auto v_page = get_v_page(s, stage);
@@ -148,23 +151,23 @@ template<typename config=config> struct RingAttentionOp {
                     if (i < PIPELINE_STAGES) {
                         s.wait_page_ready(get_v_page(s, stage));
                     } else {
-                        wait(av_finished(s, stage), phasebit);
-                        phasebit ^= 1;
+                        wait(av_finished(s, stage), get_phasebit<0>(phasebit, stage));
+                        update_phasebit<0>(phasebit, stage);
                     }
                     tma::expect(v_arrived(s, stage), v);
                     tma::load_async(v, g.V0s[inst.dev_idx], {inst.B, inst.H, i, 0}, v_arrived(s, stage));
-                    if (i >= PIPELINE_STAGES) {
-                    }
+                    // printf("V load start %d\n", i);
                 }
                 for (int i = 0; i < PIPELINE_STAGES; i++) {
                     int stage = (i + inst.num_kv_blocks) % PIPELINE_STAGES;
-                    wait(av_finished(s, stage), phasebit);
+                    wait(av_finished(s, stage), get_phasebit<0>(phasebit, stage));
                     s.finish_page(get_v_page(s, stage), config::NUM_CONSUMER_WARPS);
-                    phasebit ^= 1;
+                    update_phasebit<0>(phasebit, stage);
                 }
-            } else if (laneid >= 5+PIPELINE_STAGES*2 && laneid < config::NUM_PAGES) { // Finish unused pages
+            } else if (6 + PIPELINE_STAGES*2 <= laneid && laneid < config::NUM_PAGES) { // Finish unused pages
                 s.wait_page_ready(laneid);
                 s.finish_page(laneid, config::NUM_CONSUMER_WARPS);
+                // printf("page %d finished\n", laneid);
             }
         }
     };
@@ -181,34 +184,56 @@ template<typename config=config> struct RingAttentionOp {
                 auto q_page = get_q_page(s, laneid);
                 auto &q = *reinterpret_cast<qo_tile *>(s.pages[q_page].data);
                 wait(q_arrived(s, laneid), 0);
+                // printf("Q load done %d\n", laneid);
                 
-                int phasebit = 0;
+                uint32_t phasebit = 0;
                 for (int i = 0; i < inst.num_kv_blocks; ++i) {
                     int stage = i % PIPELINE_STAGES;
                     if (i > 0) {
-                        wait(qk_unloaded(s, laneid), phasebit^1); // off by one
+                        wait(qk_unloaded(s, laneid), get_phasebit<1>(phasebit, laneid));
+                        update_phasebit<1>(phasebit, laneid);
+                        // printf("QK unload done %d - %d\n", laneid, i - 1);
                     }
                     auto k_page = get_k_page(s, stage);
                     auto &k = *reinterpret_cast<kv_tile *>(s.pages[k_page].data);
-                    wait(k_arrived(s, stage), phasebit);
+                    wait(k_arrived(s, stage), get_phasebit<0>(phasebit, stage));
+                    // printf("K load done %d\n", i);
+                    // if (laneid == 0) {
+                    //     printf("Launching QK %d - %d\n", laneid, i);
+                    //     printf("Q:");
+                    //     for (int x = 0; x < 128; x++)
+                    //         printf("%f ", float(q[x]));
+                    //     printf("\n");
+                    //     printf("K:");
+                    //     for (int x = 0; x < 128; x++)
+                    //         printf("%f ", float(k[x]));
+                    //     printf("\n");
+                    // }
+
+
                     auto qk_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, KV_BLOCK_SIZE>>(laneid*KV_BLOCK_SIZE);
                     mm_ABt(qk_accumulator, q, k, qk_finished(s, stage));
-                    phasebit ^= 1;
+                    // printf("qk launched %d - %d\n", laneid, i);
+                    update_phasebit<0>(phasebit, stage);
                 }
             } else if (laneid < 4) { // Launch ATT @ V for the 2 consumer warpgroups
                 auto att_page = get_a_page(s, laneid-2);
                 auto &att = *reinterpret_cast<a_tile *>(s.pages[att_page].data);
 
-                int phasebit = 0;
+                uint32_t phasebit = 0;
                 for (int i = 0; i < inst.num_kv_blocks; ++i) {
                     int stage = i % PIPELINE_STAGES;
                     auto v_page = get_v_page(s, stage);
                     auto &v = *reinterpret_cast<kv_tile *>(s.pages[v_page].data);
-                    wait(v_arrived(s, stage), phasebit);
-                    wait(av_ready(s, laneid-2), phasebit);
+                    wait(v_arrived(s, stage), get_phasebit<0>(phasebit, stage));
+                    wait(av_ready(s, laneid-2), get_phasebit<1>(phasebit, laneid-2));
+                    
+                    // printf("v load done and av ready %d - %d\n", laneid, i);
                     auto av_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, HEAD_DIM>>(2*KV_BLOCK_SIZE+(laneid-2)*HEAD_DIM);
                     mma_AB(av_accumulator, att, v, av_finished(s, stage));
-                    phasebit ^= 1;
+                    update_phasebit<0>(phasebit, stage);
+                    update_phasebit<1>(phasebit, laneid-2);
+                    // printf("av launched %d - %d\n", laneid, i);
                 }
             }
         }
@@ -240,19 +265,32 @@ template<typename config=config> struct RingAttentionOp {
             auto qk_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, KV_BLOCK_SIZE>>(groupid*KV_BLOCK_SIZE);
             auto av_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, HEAD_DIM>>(2*KV_BLOCK_SIZE + groupid*HEAD_DIM);
 
-            int phasebit = 0;
+            uint32_t phasebit = 0;
             for (int i = 0; i < inst.num_kv_blocks; ++i) {
                 int stage = i % PIPELINE_STAGES;
 
                 // Read in QK^T
-                wait(qk_finished(s, stage), phasebit); // wait for mm to finish
+                wait(qk_finished(s, stage), get_phasebit<0>(phasebit, stage)); // wait for mm to finish
+                // printf("QK finished %d - %d\n", groupid, i);
                 if (i == inst.num_kv_blocks - 1) {
-                    s.finish_page(get_q_page(s, groupid), config::NUM_CONSUMER_WARPS);
+                    s.warp_finish_page(get_q_page(s, groupid), config::NUM_CONSUMER_WARPS / 4);
                 }
                 warpgroup::load_async(att_fl, qk_accumulator);
                 tensor_load_wait();
                 __syncwarp();
                 warp::arrive(qk_unloaded(s, groupid));
+
+
+                auto &test = *reinterpret_cast<st_bf<QO_BLOCK_SIZE, KV_BLOCK_SIZE> *>(s.pages[10].data);
+                warpgroup::store(test, att_fl);
+                for (int x = 0; x < 100; x++) {
+                    if (groupid == 0 && warpgroup::laneid() == 0)
+                         printf("%f ", float(test[x]));
+                }
+                if (groupid == 0 && warpgroup::laneid() == 0)
+                    printf("\n");
+
+
 
                 // Get maximums and scale by softmax temp
                 warp::row_max(max_vec, att_fl, max_vec);
@@ -275,7 +313,9 @@ template<typename config=config> struct RingAttentionOp {
                     s.wait_page_ready(att_page);
                 } else {
                     int prev_stage = (i + PIPELINE_STAGES - 1) % PIPELINE_STAGES;
-                    wait(av_finished(s, prev_stage), phasebit^1); // wait for the previous mma to finish
+                    // printf("waiting for av finished %d - %d\n", groupid, prev_stage);
+                    wait(av_finished(s, prev_stage), get_phasebit<0>(phasebit, prev_stage)^1); // wait for the previous mma to finish
+                    // printf("av finished %d - %d\n", groupid, prev_stage);
                     warpgroup::load_async(out_fl, av_accumulator);
                     tensor_load_wait(); // TODO: is this needed?
                 }
@@ -290,22 +330,29 @@ template<typename config=config> struct RingAttentionOp {
                 warp::mul(norm_vec, norm_vec, diff_scaled_max_vec);
                 warp::row_sum(norm_vec, att_fl, norm_vec);
 
-                phasebit ^= 1;
+                update_phasebit<0>(phasebit, stage);
             }
 
+            // printf("Arrivedddddd\n");
+
             // Finish
-            wait(av_finished(s, (inst.num_kv_blocks - 1) % PIPELINE_STAGES), phasebit^1);
+            int last_stage = (inst.num_kv_blocks - 1) % PIPELINE_STAGES;
+            wait(av_finished(s, last_stage), get_phasebit<0>(phasebit, last_stage)^1);
             warpgroup::load_async(out_fl, av_accumulator);
-            s.finish_page(get_a_page(s, groupid), config::NUM_CONSUMER_WARPS);
+            s.warp_finish_page(get_a_page(s, groupid), config::NUM_CONSUMER_WARPS / 4);
             tensor_load_wait();
             warp::arrive(s.tensor_finished);
             warp::div_row(out_fl, out_fl, norm_vec);
 
-            int out_page = get_o_page(s);
+            // printf("Arrivedddddd2\n");
+
+            int out_page = get_o_page(s, groupid);
             auto &out = *reinterpret_cast<qo_tile *>(s.pages[out_page].data);
             s.wait_page_ready(out_page);
             warpgroup::store(out, out_fl);
             warp::arrive(o_arrived(s, groupid));
+
+            // printf("Arrivedddddd3\n");
         }
     };
     struct storer {
@@ -313,11 +360,17 @@ template<typename config=config> struct RingAttentionOp {
             parsed_instruction inst{s};
             int laneid = warp::laneid();
             if (laneid < 2) {
-                int out_page = get_o_page(s);
+
+                // printf("Arrivedddddd4\n");
+                int out_page = get_o_page(s, laneid);
                 auto &out = *reinterpret_cast<qo_tile *>(s.pages[out_page].data);
                 wait(o_arrived(s, laneid), 0);
+
+                // printf("Arrivedddddd5\n");
                 tma::store_async(g.O, out, {inst.B, inst.H, inst.QO_idx + laneid, 0});
                 tma::store_async_read_wait(); // or wait until read complete
+
+                // printf("Arrivedddddd6\n");
                 s.finish_page(out_page, config::NUM_CONSUMER_WARPS);
             }
             // TODO: write to barrier

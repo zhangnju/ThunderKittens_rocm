@@ -196,7 +196,7 @@ template<typename config=config> struct MatmulOp {
                 wait(outputs_shared(s, laneid()), 0);
                 int store_page = get_store_page(s, inst, laneid());
                 c_tile &output = *reinterpret_cast<c_tile *>(s.pages[get_store_page(s, inst, laneid())].data);
-                tma::store_async(g.C, output, {inst.row+laneid()/2, inst.col/2+laneid()});
+                tma::store_async(g.C, output, {inst.row+laneid(), inst.col/2});
                 tma::store_async_read_wait();
                 s.finish_page(store_page, config::NUM_CONSUMER_WARPS);
                 s.finish_page(store_page + 1, config::NUM_CONSUMER_WARPS); // because store_page is megapage

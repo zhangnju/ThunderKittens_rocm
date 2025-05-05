@@ -12,7 +12,7 @@ NUM_COMMS = 8 # this is the magic number that works the best
 NUM_ITERS = 5
 ATTN_OPCODE = 725
 COMM_OPCODE = 97
-B, H, N, D_h = 16, 16, 256*4096, 64
+B, H, N, D_h = 16, 16, 131072*NUM_DEVICES, 64
 
 assert N%NUM_DEVICES==0, "N must be divisible by NUM_DEVICES"
 assert (N//NUM_DEVICES)%256==0, "N_per_dev must be divisible by 256 (QO Block Size * 2)"
@@ -74,8 +74,8 @@ for torch_device in torch_devices:
     for i in range(NUM_COMMS):
         k_or_v = i // (num_comms_per_kv)
         comm_idx = i % (num_comms_per_kv)
-        dev_instructions[comm_idx].append(
-            [COMM_OPCODE, k_or_v, num_chunks_per_comm, comm_idx, num_comms_per_kv, num_comps, num_chunks_N, H, dev_idx, prev_dev_idx, next_dev_idx] 
+        dev_instructions[i].append(
+            [COMM_OPCODE, k_or_v, num_chunks_per_comm, comm_idx, NUM_COMMS, num_comps, num_chunks_N, H, dev_idx, prev_dev_idx, next_dev_idx] 
             + [0]*21
         )
 
@@ -163,6 +163,8 @@ print('\nChecking correctness...')
 for i in range(NUM_DEVICES):
     check_diff(K0s[i], Ks[(i + NUM_DEVICES - 6) % NUM_DEVICES])
     check_diff(K1s[i], Ks[(i + NUM_DEVICES - 7) % NUM_DEVICES])
+    check_diff(V0s[i], Vs[(i + NUM_DEVICES - 6) % NUM_DEVICES])
+    check_diff(V1s[i], Vs[(i + NUM_DEVICES - 7) % NUM_DEVICES])
 
 
 ###

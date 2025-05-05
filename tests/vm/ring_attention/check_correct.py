@@ -1,5 +1,6 @@
 import torch
 from ring_attention import ring_attention, can_access_peer, enable_p2p_access
+from time import time
 import numpy as np
 
 
@@ -8,9 +9,10 @@ import numpy as np
 ###
 NUM_DEVICES = 4
 NUM_COMMS = 8 # this is the magic number that works the best
+NUM_ITERS = 10
 ATTN_OPCODE = 725
 COMM_OPCODE = 97
-B, H, N, D_h = 16, 16, 256*16, 64
+B, H, N, D_h = 16, 16, 2048*NUM_DEVICES, 64
 
 assert N%NUM_DEVICES==0, "N must be divisible by NUM_DEVICES"
 assert (N//NUM_DEVICES)%256==0, "N_per_dev must be divisible by 256 (QO Block Size * 2)"
@@ -59,29 +61,26 @@ for torch_device in torch_devices:
     dev_instructions = [[] for _ in range(148)]
 
     # Comm Ops
-    # num_comms_per_kv = NUM_COMMS // 2
-    # num_chunks_N = N_per_dev // 128
-    # total_chunks = B * H * num_chunks_N
-    # num_chunks_per_comm = total_chunks // (num_comms_per_kv)
-    # print('total_chunks:', total_chunks)
-    # print('num_chunks_per_comm:', num_chunks_per_comm)
-    # print('num_chunks_N:', num_chunks_N)
-    # assert NUM_COMMS % 2 == 0, "NUM_COMMS must be even"
-    # assert total_chunks % (num_comms_per_kv) == 0, "total_chunks must be divisible by NUM_COMMS / 2"
-    # num_comps = B * H * num_qo_blocks
-    # for i in range(NUM_COMMS):
-    #     k_or_v = i // (num_comms_per_kv)
-    #     comm_idx = i % (num_comms_per_kv)
-    #     dev_instructions[comm_idx].append(
-    #         [COMM_OPCODE, k_or_v, num_chunks_per_comm, comm_idx, num_comms_per_kv, num_comps, num_chunks_N, H, dev_idx, prev_dev_idx, next_dev_idx] 
-    #         + [0]*21
-    #     )
+    num_comms_per_kv = NUM_COMMS // 2
+    num_chunks_N = N_per_dev // 128
+    total_chunks = B * H * num_chunks_N
+    num_chunks_per_comm = total_chunks // (num_comms_per_kv)
+    print('total_chunks:', total_chunks)
+    print('num_chunks_per_comm:', num_chunks_per_comm)
+    print('num_chunks_N:', num_chunks_N)
+    assert NUM_COMMS % 2 == 0, "NUM_COMMS must be even"
+    assert total_chunks % (num_comms_per_kv) == 0, "total_chunks must be divisible by NUM_COMMS / 2"
+    num_comps = B * H * num_qo_blocks
+    for i in range(NUM_COMMS):
+        k_or_v = i // (num_comms_per_kv)
+        comm_idx = i % (num_comms_per_kv)
+        dev_instructions[i].append(
+            [COMM_OPCODE, k_or_v, num_chunks_per_comm, comm_idx, NUM_COMMS, num_comps, num_chunks_N, H, dev_idx, prev_dev_idx, next_dev_idx] 
+            + [0]*21
+        )
 
     # Compute Ops
     instruction_idx = 0
-    # num_ring_stages = 1 # TESTTETS
-    NUM_COMMS = 0
-    num_comps = 0
     for ring_stage in range(num_ring_stages):
         for batch_idx in range(B):
             for head_idx in range(H):
@@ -148,17 +147,31 @@ ring_attention(
 for dev_id in dev_ids:
     torch.cuda.synchronize(dev_id)
 
-print('DONE')
-# ###
-# #  Verify correctness
-# ###
-# def check_diff(x, y):
-#     x = x.to(dtype=torch.float32, device='cpu')
-#     y = y.to(dtype=torch.float32, device='cpu')
-#     abs_diff = abs(x - y)
-#     print('Max abs diff:', abs_diff.max())
-#     print('Mean abs diff:', abs_diff.mean())
 
+###
+#  Verify correctness
+###
+def pytorch_mha(q, k, v):
+    QK = torch.matmul(q, k.transpose(-2, -1))
+    QK /= (q.size(-1) ** 0.5)
+    QK = torch.nn.functional.softmax(QK, dim=-1)
+    out = torch.matmul(QK, v)
+    return out
+
+def check_diff(x, y):
+    x = x.to(dtype=torch.float32, device='cpu')
+    y = y.to(dtype=torch.float32, device='cpu')
+    abs_diff = abs(x - y)
+    print('Max abs diff:', abs_diff.max())
+    print('Mean abs diff:', abs_diff.mean())
+
+K = torch.cat(Ks, dim=2)
+V = torch.cat(Vs, dim=2)
+for dev_id in dev_ids:
+    O_ref = pytorch_mha(Qs[dev_id], K.to(Qs[dev_id].device), V.to(Qs[dev_id].device))
+    check_diff(Os[dev_id], O_ref)
+
+breakpoint()
 
 ###
 #  Launch the PyTorch version
@@ -179,50 +192,6 @@ print('DONE')
 
 
 
-# def ring_mha_torch(Qs, Ks, Vs):
-#     As = []
-#     num_QO_blocks = len(Qs)
-#     num_KV_blocks = len(Ks)
-
-#     for i in range(num_QO_blocks): 
-#         # "Outer loop". Done in parallel on `num_QO_blocks` devices
-#         # Qs[i] stay on device i, Ks[i] and Vs[i] are rotated
-#         torch.cuda.set_device(Qs[i].device)
-
-#         # We only need to scale once
-#         Qi = Qs[i] / (Qs[i].size(-1) ** 0.5)
-
-#         # Accumulating variables
-#         numerator = torch.zeros_like(Qi, device=Qi.device) # (B, H, N_per_dev, D_h)
-#         denominator = torch.zeros(Qi.shape[:-1], dtype=Qi.dtype, device=Qi.device, layout=Qi.layout) # (B, H, N_per_dev)
-#         local_max = torch.full(denominator.shape, float('-inf'), dtype=Qi.dtype, device=Qi.device, layout=Qi.layout) # (B, H, N)
-
-#         for rotation_idx in range(num_KV_blocks):
-#             # "Inner loop". Done sequentially on each device. 
-#             # `num_KV_blocks` ring rotations of Ks and Vs
-
-#             # device i starts with Ks[i] and Vs[i]
-#             j = (i + rotation_idx) % num_KV_blocks
-#             Kj = Ks[j].to(device=Qi.device) # (B, H, N_per_dev, D_h)
-#             Vj = Vs[j].to(device=Qi.device) # (B, H, N_per_dev, D_h)
-
-#             # Blockwise attention
-#             QiKj = torch.matmul(Qi, Kj.transpose(-1, -2)) # (B, H, N_per_dev, N_per_dev)
-#             new_max = torch.max(local_max, torch.max(QiKj, dim=-1).values) # (B, H, N_per_dev)
-#             exp_QiKj = torch.exp(QiKj - new_max.unsqueeze(-1)) # (B, H, N_per_dev, N_per_dev)
-#             if rotation_idx > 0:
-#                 rescaler = torch.exp(local_max - new_max)
-#                 numerator *= rescaler.unsqueeze(-1)
-#                 denominator *= rescaler
-#             numerator += torch.matmul(exp_QiKj, Vj)
-#             denominator += torch.sum(exp_QiKj, dim=-1)
-#             local_max = new_max
-
-#         # Normalize and store
-#         Ai = numerator / denominator.unsqueeze(-1) # (B, H, N_per_dev, D_h)
-#         As.append(Ai)
-
-#     return As
 
 # As_ref = ring_mha_torch(Qs, K0s, V0s)
 # torch.cuda.empty_cache()

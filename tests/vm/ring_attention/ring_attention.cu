@@ -10,21 +10,23 @@ constexpr int SM_COUNT = 148;
 constexpr int QO_BLOCK_SIZE = 128; // sequence length must be divisible by this * 2
 constexpr int KV_BLOCK_SIZE = 128; // sequence length must be divisible by this
 constexpr int HEAD_DIM = 64;
+constexpr int COMM_CHUNK_LENGTH = 128;
 
 using qo_tile = st_bf<QO_BLOCK_SIZE, HEAD_DIM>;
 using kv_tile = st_bf<KV_BLOCK_SIZE, HEAD_DIM>;
 using a_tile = st_bf<QO_BLOCK_SIZE, KV_BLOCK_SIZE>; // uses 32KB megapage
+using comm_tile = st_bf<COMM_CHUNK_LENGTH, HEAD_DIM>; // Full 16KB page
 
 using config = default_config;
 struct globals {
-    constexpr static int num_devices = 1;
+    constexpr static int num_devices = 8;
 
     using instruction_layout = ::kittens::prototype::vm::instruction_layout<config>;
     using barrier_layout = gl<uint, 1, 1, 1, num_devices>;
     using timing_layout = ::kittens::prototype::vm::timing_layout<config>;
     
     using qo_layout = gl<bf16, -1, -1, -1, HEAD_DIM, qo_tile>; // Batch, Head, Seq, Dim (full MHA)
-    using kv_layout = gl<bf16, -1, -1, -1, HEAD_DIM, kv_tile>;
+    using kv_layout = gl<bf16, -1, -1, -1, HEAD_DIM, kv_tile, comm_tile>;
 
     instruction_layout instructions;
     gl_array<barrier_layout, num_devices> barriers;
@@ -112,8 +114,12 @@ template<typename config=config> struct RingAttentionOp {
 
     struct loader {
         static __device__ void run(const globals &g, state<config> &s) {
-            // TODO: wait for comms complete
             parsed_instruction inst{s};
+
+            // Wait for the previous ring stage comms to finish
+            while (inst.ring_stage > 0 && *(volatile int *)&g.barriers[inst.dev_idx][{inst.ring_stage - 1}] < inst.num_comms + inst.num_comps)
+                __nanosleep(20);
+
             int laneid = warp::laneid();
             if (laneid < 2) { // Load Q for the 2 consumer warpgroups
                 auto q_page = get_q_page(s, laneid);
@@ -239,6 +245,8 @@ template<typename config=config> struct RingAttentionOp {
                     // printf("av launched %d - %d\n", laneid, i);
                 }
             }
+            __syncwarp();
+            if (laneid == 0) atomicAdd_system(&g.barriers[inst.dev_idx][{inst.ring_stage}], 1); // signal the next ring stage comms
         }
     };
 
@@ -353,8 +361,6 @@ template<typename config=config> struct RingAttentionOp {
                 phasebit ^= 1;
             }
 
-            // printf("Arrivedddddd\n");
-
             // Finish
             wait(av_finished(s, groupid), phasebit^1);
             warp::arrive(v_finished(s, (inst.num_kv_blocks - 1) % PIPELINE_STAGES));
@@ -365,8 +371,6 @@ template<typename config=config> struct RingAttentionOp {
             __syncwarp();
             warp::arrive(s.tensor_finished);
             warp::div_row(out_fl, out_fl, norm_vec);
-            
-            // printf("Arrivedddddd2\n");
 
             int out_page = get_o_page(s, groupid);
             auto &out = *reinterpret_cast<qo_tile *>(s.pages[out_page].data);
@@ -387,8 +391,136 @@ template<typename config=config> struct RingAttentionOp {
                 tma::store_async_read_wait(); // or wait until read complete
                 s.finish_page(out_page, config::NUM_CONSUMER_WARPS);
             }
-            // TODO: write to barrier
         }
+    };
+};
+
+template<typename config=config> struct CommOp {
+    static constexpr int opcode = 97;
+
+    struct parsed_instruction {
+        int k_or_v;     // 0 for K, 1 for V
+        int num_chunks; // number of chunks per SM
+        int comm_idx;
+        int num_comms;
+        int num_comps;
+        int num_chunks_N; // number of chunks in sequence dimension
+        int num_chunks_H; // number of chunks in head dimension
+        int dev_idx;
+        int prev_dev_idx;
+        int next_dev_idx;
+        __device__ inline parsed_instruction(typename config::instruction_t &instruction) {
+            k_or_v = instruction[1];
+            num_chunks = instruction[2];
+            comm_idx = instruction[3];
+            num_comms = instruction[4]; // total number of SMs doing comms (includes all K & V comms)
+            num_comps = instruction[5];
+            num_chunks_N = instruction[6];
+            num_chunks_H = instruction[7];
+            dev_idx = instruction[8];
+            prev_dev_idx = instruction[9];
+            next_dev_idx = instruction[10];
+        }
+        __device__ inline parsed_instruction(state<config> &s): parsed_instruction(s.instruction()) {}
+    };
+
+    __device__ static inline semaphore &data_arrived(state<config> &s, int idx) {
+        return s.semaphores()[idx];
+    }
+    __device__ static inline semaphore &data_finished(state<config> &s, int idx) {
+        return s.semaphores()[idx + config::NUM_PAGES];
+    }
+
+    struct controller {
+        static __device__ int release_lid(const globals &g, typename config::instruction_t &instruction, int &query) {
+            int release_order[config::NUM_PAGES] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+            return release_order[query];
+        }
+        static __device__ int init_semaphores(const globals &g, state<config> &s) {
+            for(int i = 0; i < config::NUM_PAGES; i++) {
+                init_semaphore(data_arrived(s, i), 1);
+                init_semaphore(data_finished(s, i), 1);
+                arrive(data_finished(s, i)); // arrive first
+            }
+            return 2 * config::NUM_PAGES;
+        }
+    };
+    struct loader {
+        static __device__ void run(const globals &g, state<config> &s) {
+            parsed_instruction inst{s};
+            int laneid = warp::laneid();
+            constexpr uint32_t membermask = 0xFFFFFFFF >> (32 - config::NUM_PAGES);
+            if (laneid < config::NUM_PAGES) {
+                int page = s.pid(laneid);
+                s.wait_page_ready(page);
+                auto &data = reinterpret_cast<comm_tile &>(s.pages[page]);
+                int phasebit = 0;
+                int iters = (inst.num_chunks + config::NUM_PAGES - 1) / config::NUM_PAGES;
+                for (int ring_stage = 0; ring_stage < globals::num_devices - 1; ++ring_stage) {
+                    // Are we ready to move on? == previous device's store done + current device's compute done + next device's load done
+                    // TODO: technically, I can put the latter two conditions before the first store
+                    while (ring_stage > 0 && 
+                           (*(volatile int *)&g.barriers[inst.prev_dev_idx][{ring_stage - 1}] < inst.num_comms + inst.num_comps ||
+                            *(volatile int *)&g.barriers[inst.dev_idx     ][{ring_stage - 1}] < inst.num_comms + inst.num_comps ||
+                            *(volatile int *)&g.barriers[inst.next_dev_idx][{ring_stage - 1}] < inst.num_comms + inst.num_comps))
+                        __nanosleep(20);
+                    for (int i = 0; i < iters; ++i) {
+                        int local_index = i * config::NUM_PAGES + laneid;
+                        if (local_index < inst.num_chunks) {
+                            int index = inst.comm_idx * inst.num_chunks + local_index;
+                            int B_idx = (index / inst.num_chunks_N / inst.num_chunks_H);
+                            int H_idx = (index / inst.num_chunks_N) % inst.num_chunks_H;
+                            int N_idx = index % inst.num_chunks_N;
+                            kittens::tma::expect(data_arrived(s, laneid), data);
+                            if (inst.k_or_v == 0) {
+                                if (ring_stage % 2 == 0)
+                                    kittens::tma::load_async(data, g.K0s[inst.prev_dev_idx], {B_idx, H_idx, N_idx, 0}, data_arrived(s, laneid));
+                                else
+                                    kittens::tma::load_async(data, g.K1s[inst.prev_dev_idx], {B_idx, H_idx, N_idx, 0}, data_arrived(s, laneid));
+                            } else {
+                                if (ring_stage % 2 == 0)
+                                    kittens::tma::load_async(data, g.V0s[inst.prev_dev_idx], {B_idx, H_idx, N_idx, 0}, data_arrived(s, laneid));
+                                else
+                                    kittens::tma::load_async(data, g.V1s[inst.prev_dev_idx], {B_idx, H_idx, N_idx, 0}, data_arrived(s, laneid));
+                            }
+                            wait(data_arrived(s, laneid), phasebit);
+                            phasebit ^= 1;
+                            if (inst.k_or_v == 0) {
+                                if (ring_stage % 2 == 0)
+                                    kittens::tma::store_async(g.K1s[inst.dev_idx], data, {B_idx, H_idx, N_idx, 0});
+                                else
+                                    kittens::tma::store_async(g.K0s[inst.dev_idx], data, {B_idx, H_idx, N_idx, 0});
+                            } else {
+                                if (ring_stage % 2 == 0)
+                                    kittens::tma::store_async(g.V1s[inst.dev_idx], data, {B_idx, H_idx, N_idx, 0});
+                                else
+                                    kittens::tma::store_async(g.V0s[inst.dev_idx], data, {B_idx, H_idx, N_idx, 0});
+                            }
+                        }
+                        asm volatile("{bar.warp.sync %0;}" ::"n"(membermask));
+                        if (laneid == 0) asm volatile("{cp.async.bulk.wait_group 0;}");
+                        asm volatile("{bar.warp.sync %0;}" ::"n"(membermask));
+                    }
+                    if (laneid == 0) {
+                        asm volatile("{fence.acq_rel.sys;}");
+                        atomicAdd_system(&g.barriers[inst.dev_idx][{ring_stage}], 1); // mark store finished
+                    }
+                }
+                s.finish_page(page, config::NUM_CONSUMER_WARPS); 
+            }
+        }
+    };
+    struct launcher {
+        static __device__ void run(const globals &g, state<config> &s) { 
+            s.wait_tensor_ready();
+            if (laneid() == 0) arrive(s.tensor_finished, config::NUM_CONSUMER_WARPS);
+        }
+    };
+    struct consumer {
+        static __device__ void run(const globals &g, state<config> &s) { }
+    };
+    struct storer {
+        static __device__ void run(const globals &g, state<config> &s) { }
     };
 };
 
@@ -397,7 +529,8 @@ template<typename config=config> struct RingAttentionOp {
 PYBIND11_MODULE(ring_attention, m) {
     m.doc() = "ring attention python module";
     kittens::py::bind_kernel<kvm<config, globals,
-        RingAttentionOp<config>
+        RingAttentionOp<config>,
+        CommOp<config>
     >>(m, "ring_attention",
         &globals::instructions,
         &globals::barriers,

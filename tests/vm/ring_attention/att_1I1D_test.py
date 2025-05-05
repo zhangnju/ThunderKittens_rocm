@@ -144,20 +144,6 @@ def pytorch_mha(q, k, v):
 
 O_ref = pytorch_mha(Qs[0], K0s[0], V0s[0])
 
-# print(O_ref)
-# print(Os[0])
-
-
-_qk = torch.matmul(Qs[0][0, 0], K0s[0][0, 0].transpose(-2, -1))
-__qk = _qk
-_max = torch.max(_qk, dim=-1, keepdim=True).values
-_qk /= (np.log(2) * (Qs[0].size(-1) ** 0.5))
-_max /= (np.log(2) * (Qs[0].size(-1) ** 0.5))
-_qk -= _max
-_qk = torch.exp2(_qk)
-print(__qk[:128, :128])
-
-
 for i in range(20):
     for dev_id in dev_ids:
         barriers[dev_id].zero_()
@@ -170,57 +156,3 @@ for i in range(20):
         torch.cuda.synchronize(dev_id)
     print(torch.max(O_ref - Os[0]))
     print(torch.mean(O_ref - Os[0]))
-
-
-
-breakpoint()
-
-
-
-# def ring_mha_torch(Qs, Ks, Vs):
-#     As = []
-#     num_QO_blocks = len(Qs)
-#     num_KV_blocks = len(Ks)
-
-#     for i in range(num_QO_blocks): 
-#         # "Outer loop". Done in parallel on `num_QO_blocks` devices
-#         # Qs[i] stay on device i, Ks[i] and Vs[i] are rotated
-#         torch.cuda.set_device(Qs[i].device)
-
-#         # We only need to scale once
-#         Qi = Qs[i] / (Qs[i].size(-1) ** 0.5)
-
-#         # Accumulating variables
-#         numerator = torch.zeros_like(Qi, device=Qi.device) # (B, H, N_per_dev, D_h)
-#         denominator = torch.zeros(Qi.shape[:-1], dtype=Qi.dtype, device=Qi.device, layout=Qi.layout) # (B, H, N_per_dev)
-#         local_max = torch.full(denominator.shape, float('-inf'), dtype=Qi.dtype, device=Qi.device, layout=Qi.layout) # (B, H, N)
-
-#         for rotation_idx in range(num_KV_blocks):
-#             # "Inner loop". Done sequentially on each device. 
-#             # `num_KV_blocks` ring rotations of Ks and Vs
-
-#             # device i starts with Ks[i] and Vs[i]
-#             j = (i + rotation_idx) % num_KV_blocks
-#             Kj = Ks[j].to(device=Qi.device) # (B, H, N_per_dev, D_h)
-#             Vj = Vs[j].to(device=Qi.device) # (B, H, N_per_dev, D_h)
-
-#             # Blockwise attention
-#             QiKj = torch.matmul(Qi, Kj.transpose(-1, -2)) # (B, H, N_per_dev, N_per_dev)
-#             new_max = torch.max(local_max, torch.max(QiKj, dim=-1).values) # (B, H, N_per_dev)
-#             exp_QiKj = torch.exp(QiKj - new_max.unsqueeze(-1)) # (B, H, N_per_dev, N_per_dev)
-#             if rotation_idx > 0:
-#                 rescaler = torch.exp(local_max - new_max)
-#                 numerator *= rescaler.unsqueeze(-1)
-#                 denominator *= rescaler
-#             numerator += torch.matmul(exp_QiKj, Vj)
-#             denominator += torch.sum(exp_QiKj, dim=-1)
-#             local_max = new_max
-
-#         # Normalize and store
-#         Ai = numerator / denominator.unsqueeze(-1) # (B, H, N_per_dev, D_h)
-#         As.append(Ai)
-
-#     return As
-
-# As_ref = ring_mha_torch(Qs, K0s, V0s)
-# torch.cuda.empty_cache()

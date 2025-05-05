@@ -12,7 +12,7 @@ NUM_COMMS = 8 # this is the magic number that works the best
 NUM_ITERS = 5
 ATTN_OPCODE = 725
 COMM_OPCODE = 97
-B, H, N, D_h = 16, 16, 256*16, 64
+B, H, N, D_h = 16, 16, 256*4096, 64
 
 assert N%NUM_DEVICES==0, "N must be divisible by NUM_DEVICES"
 assert (N//NUM_DEVICES)%256==0, "N_per_dev must be divisible by 256 (QO Block Size * 2)"
@@ -157,6 +157,33 @@ def check_diff(x, y):
     print('Mean abs diff:', abs_diff.mean())
 
 # Sanity check if comms are correct
+print('\nChecking correctness...')
 for i in range(NUM_DEVICES):
     check_diff(K0s[i], Ks[(i + NUM_DEVICES - 6) % NUM_DEVICES])
     check_diff(K1s[i], Ks[(i + NUM_DEVICES - 7) % NUM_DEVICES])
+
+
+###
+#  Check speed
+###
+print('\nKernel finished, now benchmarking...')
+times = []
+for i in range(NUM_ITERS):
+    for dev_id in dev_ids:
+        barriers[dev_id].zero_()
+        torch.cuda.synchronize(dev_id)
+    start_time = time()
+    ring_attention(
+        instructions, barriers, timings,
+        Qs, K0s, K1s, V0s, V1s, Os
+    )
+    for dev_id in dev_ids: # can't use cudaEvent (which is device-specific)
+        torch.cuda.synchronize(dev_id)
+    end_time = time()
+    times.append(end_time - start_time)
+avg_time = sum(times) / NUM_ITERS
+total_tflops = (4 * B * H * N * N * D_h + 5 * B * H * N * N) * 1e-12
+print(f'Average time per iter: {avg_time * 1e6} us')
+print(f'Total TFLOP/s: {total_tflops / avg_time}')
+print(f'Per-device TFLOP/s: {(total_tflops / NUM_DEVICES) / avg_time}')
+print(f'Per-unidirectional-NVLink GB/s: {B * H * N_per_dev * D_h * 4 * (NUM_DEVICES - 1) * 1e-9 / avg_time}')

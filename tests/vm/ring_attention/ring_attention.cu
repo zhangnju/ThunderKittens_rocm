@@ -15,11 +15,12 @@ constexpr int COMM_CHUNK_LENGTH = 128;
 using qo_tile = st_bf<QO_BLOCK_SIZE, HEAD_DIM>;
 using kv_tile = st_bf<KV_BLOCK_SIZE, HEAD_DIM>;
 using a_tile = st_bf<QO_BLOCK_SIZE, KV_BLOCK_SIZE>; // uses 32KB megapage
+using lm_vec = col_vec<st_fl<QO_BLOCK_SIZE, HEAD_DIM>>;
 using comm_tile = st_bf<COMM_CHUNK_LENGTH, HEAD_DIM>; // Full 16KB page
 
 using config = default_config;
 struct globals {
-    constexpr static int num_devices = 8;
+    constexpr static int num_devices = 4;
 
     using instruction_layout = ::kittens::prototype::vm::instruction_layout<config>;
     using barrier_layout = gl<uint, 1, 1, 1, num_devices>;
@@ -27,6 +28,7 @@ struct globals {
     
     using qo_layout = gl<bf16, -1, -1, -1, HEAD_DIM, qo_tile>; // Batch, Head, Seq, Dim (full MHA)
     using kv_layout = gl<bf16, -1, -1, -1, HEAD_DIM, kv_tile, comm_tile>;
+    using lm_layout = gl<float, 1, -1, -1, -1, lm_vec>; // Batch, Head, Seq
 
     instruction_layout instructions;
     gl_array<barrier_layout, num_devices> barriers;
@@ -38,6 +40,8 @@ struct globals {
     gl_array<kv_layout, num_devices> V0s;
     gl_array<kv_layout, num_devices> V1s;
     qo_layout O;
+    lm_layout L;
+    lm_layout M;
 
     dim3 grid() { return dim3(SM_COUNT); }
     dim3 block() { return dim3(config::NUM_THREADS); }
@@ -71,22 +75,26 @@ template<typename config=config> struct RingAttentionOp {
         __device__ inline parsed_instruction(state<config> &s): parsed_instruction(s.instruction()) {}
     };
 
-    __device__ static inline semaphore &q_arrived(state<config> &s, int id)     { return s.semaphores()[id]; }
-    __device__ static inline semaphore &o_arrived(state<config> &s, int id)     { return s.semaphores()[2 + id]; }
-    __device__ static inline semaphore &qk_unloaded(state<config> &s, int id)   { return s.semaphores()[4 + id]; }
-    __device__ static inline semaphore &av_ready(state<config> &s, int id)      { return s.semaphores()[6 + id]; }
-    __device__ static inline semaphore &qk_finished(state<config> &s, int id)   { return s.semaphores()[8 + id]; }
-    __device__ static inline semaphore &av_finished(state<config> &s, int id)   { return s.semaphores()[10 + id]; }
-    __device__ static inline semaphore &k_arrived(state<config> &s, int stage)  { return s.semaphores()[12 + PIPELINE_STAGES * 0 + stage]; }
-    __device__ static inline semaphore &v_arrived(state<config> &s, int stage)  { return s.semaphores()[12 + PIPELINE_STAGES * 1 + stage]; }
-    __device__ static inline semaphore &k_finished(state<config> &s, int stage) { return s.semaphores()[12 + PIPELINE_STAGES * 2 + stage]; }
-    __device__ static inline semaphore &v_finished(state<config> &s, int stage) { return s.semaphores()[12 + PIPELINE_STAGES * 3 + stage]; }
+    __device__ static inline semaphore &lm_arrived(state<config> &s, int id)    { return s.semaphores()[0 + id]; }
+    __device__ static inline semaphore &lm_finished(state<config> &s, int id)   { return s.semaphores()[2 + id]; }
+    __device__ static inline semaphore &q_arrived(state<config> &s, int id)     { return s.semaphores()[4 + id]; }
+    __device__ static inline semaphore &o_arrived(state<config> &s, int id)     { return s.semaphores()[6 + id]; }
+    __device__ static inline semaphore &o_finished(state<config> &s, int id)    { return s.semaphores()[8 + id]; }
+    __device__ static inline semaphore &qk_unloaded(state<config> &s, int id)   { return s.semaphores()[10 + id]; }
+    __device__ static inline semaphore &av_ready(state<config> &s, int id)      { return s.semaphores()[12 + id]; }
+    __device__ static inline semaphore &qk_finished(state<config> &s, int id)   { return s.semaphores()[14 + id]; }
+    __device__ static inline semaphore &av_finished(state<config> &s, int id)   { return s.semaphores()[16 + id]; }
+    __device__ static inline semaphore &k_arrived(state<config> &s, int stage)  { return s.semaphores()[18 + PIPELINE_STAGES * 0 + stage]; }
+    __device__ static inline semaphore &v_arrived(state<config> &s, int stage)  { return s.semaphores()[18 + PIPELINE_STAGES * 1 + stage]; }
+    __device__ static inline semaphore &k_finished(state<config> &s, int stage) { return s.semaphores()[18 + PIPELINE_STAGES * 2 + stage]; }
+    __device__ static inline semaphore &v_finished(state<config> &s, int stage) { return s.semaphores()[18 + PIPELINE_STAGES * 3 + stage]; }
 
     __device__ static inline int get_q_page(state<config> &s, int id)    { return id; } // use PIDs for now
     __device__ static inline int get_a_page(state<config> &s, int id)    { return 2 + id * 2; } // 32KB megapages
     __device__ static inline int get_o_page(state<config> &s, int id)    { return 6 + id; }
     __device__ static inline int get_k_page(state<config> &s, int stage) { return 8 + PIPELINE_STAGES * 0 + stage; }
     __device__ static inline int get_v_page(state<config> &s, int stage) { return 8 + PIPELINE_STAGES * 1 + stage; }
+    __device__ static inline int get_lm_page(state<config> &s)           { return 12; } // share one page between two consumers
 
     struct controller {
         static __device__ int release_lid(const globals &g, typename config::instruction_t &instruction, int &query) {
@@ -96,7 +104,10 @@ template<typename config=config> struct RingAttentionOp {
         static __device__ int init_semaphores(const globals &g, state<config> &s) {
             for (int i = 0; i < 2; ++i) {
                 init_semaphore(q_arrived(s, i), 1);
-                init_semaphore(o_arrived(s, i), 4);
+                init_semaphore(lm_arrived(s, i), 1);
+                init_semaphore(lm_finished(s, i), 4);
+                init_semaphore(o_arrived(s, i), 1);
+                init_semaphore(o_finished(s, i), 4);
                 init_semaphore(qk_unloaded(s, i), 4);
                 init_semaphore(av_ready(s, i), 4);
                 init_semaphore(qk_finished(s, i), 1);
@@ -108,7 +119,7 @@ template<typename config=config> struct RingAttentionOp {
                 init_semaphore(k_finished(s, i), 8);
                 init_semaphore(v_finished(s, i), 8);
             }
-            return 2*6 + PIPELINE_STAGES*4;
+            return 2*9 + PIPELINE_STAGES*4;
         }
     };
 
@@ -116,7 +127,7 @@ template<typename config=config> struct RingAttentionOp {
         static __device__ void run(const globals &g, state<config> &s) {
             parsed_instruction inst{s};
 
-            // Wait for the previous ring stage comms to finish
+            // Wait for the previous ring stage to finish
             while (inst.ring_stage > 0 && *(volatile int *)&g.barriers[inst.dev_idx][{inst.ring_stage - 1}] < inst.num_comms + inst.num_comps)
                 __nanosleep(20);
 
@@ -141,8 +152,10 @@ template<typename config=config> struct RingAttentionOp {
                         update_phasebit<0>(phasebit, stage);
                     }
                     tma::expect(k_arrived(s, stage), k);
-                    // Todo: vary by ring stage
-                    tma::load_async(k, g.K0s[inst.dev_idx], {inst.B, inst.H, i, 0}, k_arrived(s, stage));
+                    if ((inst.ring_stage & 1) == 0)
+                        tma::load_async(k, g.K0s[inst.dev_idx], {inst.B, inst.H, i, 0}, k_arrived(s, stage));
+                    else
+                        tma::load_async(k, g.K1s[inst.dev_idx], {inst.B, inst.H, i, 0}, k_arrived(s, stage));
                     // printf("K load start %d\n", i);
                 }
                 for (int i = 0; i < PIPELINE_STAGES; i++) {
@@ -165,7 +178,10 @@ template<typename config=config> struct RingAttentionOp {
                         update_phasebit<0>(phasebit, stage);
                     }
                     tma::expect(v_arrived(s, stage), v);
-                    tma::load_async(v, g.V0s[inst.dev_idx], {inst.B, inst.H, i, 0}, v_arrived(s, stage));
+                    if ((inst.ring_stage & 1) == 0)
+                        tma::load_async(v, g.V0s[inst.dev_idx], {inst.B, inst.H, i, 0}, v_arrived(s, stage));
+                    else
+                        tma::load_async(v, g.V1s[inst.dev_idx], {inst.B, inst.H, i, 0}, v_arrived(s, stage));
                     // printf("V load start %d\n", i);
                 }
                 for (int i = 0; i < PIPELINE_STAGES; i++) {
@@ -174,11 +190,35 @@ template<typename config=config> struct RingAttentionOp {
                     s.finish_page(get_v_page(s, stage), config::NUM_CONSUMER_WARPS);
                     update_phasebit<0>(phasebit, stage);
                 }
-            } else if (8 + PIPELINE_STAGES*2 <= laneid && laneid < config::NUM_PAGES) { // Finish unused pages
-                s.wait_page_ready(laneid);
-                s.finish_page(laneid, config::NUM_CONSUMER_WARPS);
-                // printf("page %d finished\n", laneid);
-            }
+            } else if (laneid < 6) { // Load Os for the 2 consumer warpgroups
+                // printf("Shouldn't be here\n");
+                auto o_page = get_o_page(s, laneid-4);
+                auto &o = *reinterpret_cast<qo_tile *>(s.pages[o_page].data);
+                s.wait_page_ready(o_page);
+                if (inst.ring_stage == 0) {
+                    arrive(o_arrived(s, laneid-4));
+                } else {
+                    tma::expect(o_arrived(s, laneid-4), o);
+                    tma::load_async(o, g.O, {inst.B, inst.H, inst.QO_idx + laneid-4, 0}, o_arrived(s, laneid-4));
+                }
+            } else if (laneid < 8) { // Load Ls and Ms for the 2 consumer warpgroups
+                // printf("Shouldn't be here\n");
+                auto lm_page = get_lm_page(s);
+                auto &l = *(reinterpret_cast<lm_vec *>(
+                    reinterpret_cast<char *>(s.pages[lm_page].data) + ((2*(laneid-6)+0)*sizeof(lm_vec))
+                )); // share 1 page between 2 consumers for Ls and Ms
+                auto &m = *(reinterpret_cast<lm_vec *>(
+                    reinterpret_cast<char *>(s.pages[lm_page].data) + ((2*(laneid-6)+1)*sizeof(lm_vec))
+                ));
+                s.wait_page_ready(lm_page);
+                if (inst.ring_stage == 0) {
+                    arrive(lm_arrived(s, laneid-6));
+                } else {
+                    tma::expect(lm_arrived(s, laneid-6), l, m);
+                    tma::load_async(l, g.L, {inst.B, inst.H, inst.QO_idx + laneid-6}, lm_arrived(s, laneid-6));
+                    tma::load_async(m, g.M, {inst.B, inst.H, inst.QO_idx + laneid-6}, lm_arrived(s, laneid-6));
+                }
+            } // All pages are used, no need to free unused pages
         }
     };
 
@@ -268,10 +308,33 @@ template<typename config=config> struct RingAttentionOp {
             col_vec<rt_fl<QO_BLOCK_SIZE / 4, KV_BLOCK_SIZE>> diff_scaled_max_vec;
             col_vec<rt_fl<QO_BLOCK_SIZE / 4, HEAD_DIM>> norm_vec;
 
-            warp::zero(out_fl);
-            warp::neg_infty(max_vec);
-            warp::zero(last_scaled_max_vec); // just not +-inf
-            warp::zero(norm_vec);
+            auto o_page = get_o_page(s, groupid);
+            auto &out = *reinterpret_cast<qo_tile *>(s.pages[o_page].data);
+            auto lm_page = get_lm_page(s);
+            auto &l = *(reinterpret_cast<lm_vec *>(
+                reinterpret_cast<char *>(s.pages[lm_page].data) + ((2*(groupid)+0)*sizeof(lm_vec))
+            )); // share 1 page between 2 consumers for Ls and Ms
+            auto &m = *(reinterpret_cast<lm_vec *>(
+                reinterpret_cast<char *>(s.pages[lm_page].data) + ((2*(groupid)+1)*sizeof(lm_vec))
+            ));
+
+            wait(o_arrived(s, groupid), 0);
+            wait(lm_arrived(s, groupid), 0);
+
+            if (inst.ring_stage == 0) {
+                // printf("Should be here!\n");
+                warp::zero(out_fl);
+                warp::neg_infty(max_vec);
+                warp::zero(last_scaled_max_vec); // just not +-inf
+                warp::zero(norm_vec);
+            } else {
+                // Continue from the previous ring stage
+                // printf("Shouldn't be here\n");
+                warpgroup::load(out_fl, out);
+                warpgroup::load(max_vec, m);
+                warpgroup::load(norm_vec, l); // note that l is not an LSE until the last stage
+                warp::mul(last_scaled_max_vec, max_vec, softmax_temp);
+            }
 
             auto qk_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, KV_BLOCK_SIZE>>(groupid*KV_BLOCK_SIZE);
             auto av_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, HEAD_DIM>>(2*KV_BLOCK_SIZE + groupid*HEAD_DIM);
@@ -326,7 +389,6 @@ template<typename config=config> struct RingAttentionOp {
                 warp::mul(norm_vec, norm_vec, diff_scaled_max_vec);
                 warp::row_sum(norm_vec, att_fl, norm_vec);
 
-
                 // Prepare for AV
                 auto att_page = get_a_page(s, groupid);
                 auto &att = *reinterpret_cast<a_tile *>(s.pages[att_page].data);
@@ -370,26 +432,47 @@ template<typename config=config> struct RingAttentionOp {
             tensor_load_wait();
             __syncwarp();
             warp::arrive(s.tensor_finished);
-            warp::div_row(out_fl, out_fl, norm_vec);
-
-            int out_page = get_o_page(s, groupid);
-            auto &out = *reinterpret_cast<qo_tile *>(s.pages[out_page].data);
-            s.wait_page_ready(out_page);
+            if (inst.ring_stage == globals::num_devices - 1) {
+                // Finish the softmax if last stage
+                // printf("Shouldn't be here\n");
+                warp::div_row(out_fl, out_fl, norm_vec);
+                // Make LSE
+                warp::log2(norm_vec, norm_vec);
+                warp::add(norm_vec, norm_vec, last_scaled_max_vec);
+            }
             warpgroup::store(out, out_fl);
-            warp::arrive(o_arrived(s, groupid));
+            warp::arrive(o_finished(s, groupid));
+            warpgroup::store(l, norm_vec);
+            warpgroup::store(m, max_vec);
+            warp::arrive(lm_finished(s, groupid));
         }
     };
     struct storer {
         static __device__ void run(const globals &g, state<config> &s) {
             parsed_instruction inst{s};
             int laneid = warp::laneid();
-            if (laneid < 2) {
+            if (laneid < 2) { // store Os
                 int out_page = get_o_page(s, laneid);
                 auto &out = *reinterpret_cast<qo_tile *>(s.pages[out_page].data);
-                wait(o_arrived(s, laneid), 0);
+                wait(o_finished(s, laneid), 0);
                 tma::store_async(g.O, out, {inst.B, inst.H, inst.QO_idx + laneid, 0});
                 tma::store_async_read_wait(); // or wait until read complete
                 s.finish_page(out_page, config::NUM_CONSUMER_WARPS);
+            } else if (laneid < 4) { // store Ls and Ms
+                // if (laneid == 2) printf("Waiting for lm page\n");
+                int lm_page = get_lm_page(s);
+                auto &l = *(reinterpret_cast<lm_vec *>(
+                    reinterpret_cast<char *>(s.pages[lm_page].data) + ((2*(laneid-2)+0)*sizeof(lm_vec))
+                )); // share 1 page between 2 consumers for Ls and Ms
+                auto &m = *(reinterpret_cast<lm_vec *>(
+                    reinterpret_cast<char *>(s.pages[lm_page].data) + ((2*(laneid-2)+1)*sizeof(lm_vec))
+                ));
+                wait(lm_finished(s, laneid-2), 0);
+                // printf("lm finished %d\n", laneid);
+                tma::store_async(g.L, l, {inst.B, inst.H, inst.QO_idx + laneid-2});
+                tma::store_async(g.M, m, {inst.B, inst.H, inst.QO_idx + laneid-2});
+                tma::store_async_read_wait();
+                s.finish_page(lm_page, config::NUM_CONSUMER_WARPS / 2);
             }
         }
     };
@@ -540,6 +623,8 @@ PYBIND11_MODULE(ring_attention, m) {
         &globals::K1s,
         &globals::V0s,
         &globals::V1s,
-        &globals::O
+        &globals::O,
+        &globals::L,
+        &globals::M
     );
 }

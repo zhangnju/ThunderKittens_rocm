@@ -7,7 +7,7 @@ import numpy as np
 ###
 #   Global Parameters
 ###
-NUM_DEVICES = 8
+NUM_DEVICES = 4
 NUM_COMMS = 8 # this is the magic number that works the best
 NUM_ITERS = 5
 ATTN_OPCODE = 725
@@ -33,7 +33,7 @@ print('\nGenerating inputs...')
 torch.manual_seed(42)
 dev_ids = [i for i in range(NUM_DEVICES)]
 torch_devices = [torch.device(f"cuda:{dev_id}") for dev_id in dev_ids]
-Qs, K0s, K1s, V0s, V1s, Os = [], [], [], [], [], []
+Qs, K0s, K1s, V0s, V1s, Os, Ls, Ms = [], [], [], [], [], [], [], []
 Ks, Vs = [], [] # for correctness check
 for torch_device in torch_devices:
     torch.manual_seed(42 + torch_device.index)
@@ -43,6 +43,8 @@ for torch_device in torch_devices:
     V0s.append(torch.randn((B, H, N_per_dev, D_h), device=torch_device, dtype=torch.bfloat16))
     V1s.append(torch.zeros((B, H, N_per_dev, D_h), device=torch_device, dtype=torch.bfloat16))
     Os.append(torch.zeros((B, H, N_per_dev, D_h), device=torch_device, dtype=torch.bfloat16))
+    Ls.append(torch.zeros((B, H, N_per_dev), device=torch_device, dtype=torch.float32))
+    Ms.append(torch.zeros((B, H, N_per_dev), device=torch_device, dtype=torch.float32))
     Ks.append(K0s[-1].clone()) # for correctness check
     Vs.append(V0s[-1].clone())
 
@@ -140,7 +142,7 @@ for dev_id in dev_ids:
     torch.cuda.synchronize(dev_id)
 ring_attention(
     instructions, barriers, timings,
-    Qs, K0s, K1s, V0s, V1s, Os
+    Qs, K0s, K1s, V0s, V1s, Os, Ls, Ms
 )
 for dev_id in dev_ids:
     torch.cuda.synchronize(dev_id)
@@ -175,7 +177,7 @@ for i in range(NUM_ITERS):
     start_time = time()
     ring_attention(
         instructions, barriers, timings,
-        Qs, K0s, K1s, V0s, V1s, Os
+        Qs, K0s, K1s, V0s, V1s, Os, Ls, Ms
     )
     for dev_id in dev_ids: # can't use cudaEvent (which is device-specific)
         torch.cuda.synchronize(dev_id)

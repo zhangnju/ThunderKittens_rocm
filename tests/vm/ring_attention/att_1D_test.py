@@ -7,12 +7,12 @@ import numpy as np
 ###
 #   Global Parameters
 ###
-NUM_DEVICES = 1
+NUM_DEVICES = 4
 NUM_COMMS = 8 # this is the magic number that works the best
 NUM_ITERS = 10
 ATTN_OPCODE = 725
 COMM_OPCODE = 97
-B, H, N, D_h = 16, 16, 768*8, 64
+B, H, N, D_h = 16, 16, 4096*NUM_DEVICES, 64
 
 assert N%NUM_DEVICES==0, "N must be divisible by NUM_DEVICES"
 assert (N//NUM_DEVICES)%256==0, "N_per_dev must be divisible by 256 (QO Block Size * 2)"
@@ -22,7 +22,7 @@ N_per_dev = N // NUM_DEVICES
 num_qo_blocks = N_per_dev // 256
 num_kv_blocks = N_per_dev // 128
 num_comps = B * H * num_qo_blocks
-num_ring_stages = NUM_DEVICES
+num_ring_stages = 1 # for unit testing
 
 
 ###
@@ -33,7 +33,8 @@ print('\nGenerating inputs...')
 torch.manual_seed(42)
 dev_ids = [i for i in range(NUM_DEVICES)]
 torch_devices = [torch.device(f"cuda:{dev_id}") for dev_id in dev_ids]
-Qs, K0s, K1s, V0s, V1s, Os = [], [], [], [], [], []
+Qs, K0s, K1s, V0s, V1s, Os, Ls, Ms = [], [], [], [], [], [], [], []
+Ks, Vs = [], [] # for correctness check
 for torch_device in torch_devices:
     torch.manual_seed(42 + torch_device.index)
     Qs.append(torch.randn((B, H, N_per_dev, D_h), device=torch_device, dtype=torch.bfloat16))
@@ -42,6 +43,10 @@ for torch_device in torch_devices:
     V0s.append(torch.randn((B, H, N_per_dev, D_h), device=torch_device, dtype=torch.bfloat16))
     V1s.append(torch.zeros((B, H, N_per_dev, D_h), device=torch_device, dtype=torch.bfloat16))
     Os.append(torch.zeros((B, H, N_per_dev, D_h), device=torch_device, dtype=torch.bfloat16))
+    Ls.append(torch.zeros((B, H, N_per_dev), device=torch_device, dtype=torch.float32))
+    Ms.append(torch.zeros((B, H, N_per_dev), device=torch_device, dtype=torch.float32))
+    Ks.append(K0s[-1].to('cpu')) # for correctness check
+    Vs.append(V0s[-1].to('cpu'))
 
 
 ###
@@ -55,14 +60,6 @@ for torch_device in torch_devices:
     next_dev_idx = (dev_idx + 1) % NUM_DEVICES
     dev_instructions = [[] for _ in range(148)]
 
-    # Comm Ops
-    # num_chunks = (M_per_dev * K) // 16384
-    # num_chunk_cols = K // 128
-    # comm_size = num_chunks // NUM_COMMS
-    # num_comps = num_rows * num_cols
-    # for comm_idx in range(NUM_COMMS):
-    #     dev_instructions[comm_idx].append([COMM_OPCODE, comm_size, comm_idx, NUM_COMMS, num_comps, num_chunk_cols, dev_idx, prev_dev_idx, next_dev_idx] + [0]*23)
-
     # Compute Ops
     instruction_idx = 0
     for ring_stage in range(num_ring_stages):
@@ -70,7 +67,7 @@ for torch_device in torch_devices:
             for head_idx in range(H):
                 for qo_idx in range(num_qo_blocks):
                     dev_instructions[NUM_COMMS+(instruction_idx%(148-NUM_COMMS))].append(
-                        [ATTN_OPCODE, batch_idx, head_idx, qo_idx, num_kv_blocks, ring_stage, NUM_COMMS, num_comps, dev_idx]
+                        [ATTN_OPCODE, batch_idx, head_idx, qo_idx*2, num_kv_blocks, ring_stage, NUM_COMMS, num_comps, dev_idx]
                         + [0]*23
                     )
                     instruction_idx += 1
@@ -126,7 +123,7 @@ for dev_id in dev_ids:
     torch.cuda.synchronize(dev_id)
 ring_attention(
     instructions, barriers, timings,
-    Qs, K0s, K1s, V0s, V1s, Os
+    Qs, K0s, K1s, V0s, V1s, Os, Ls, Ms
 )
 for dev_id in dev_ids:
     torch.cuda.synchronize(dev_id)
@@ -136,26 +133,24 @@ for dev_id in dev_ids:
 #  Verify correctness
 ###
 def pytorch_mha(q, k, v):
-    QK = torch.matmul(q.float(), k.float().transpose(-2, -1))
+    QK = torch.matmul(q, k.transpose(-2, -1))
     QK /= (q.size(-1) ** 0.5)
     QK = torch.nn.functional.softmax(QK, dim=-1)
-    out = torch.matmul(QK, v.float()).bfloat16()
+    out = torch.matmul(QK, v)
     return out
 
-O_ref = pytorch_mha(Qs[0], K0s[0], V0s[0])
+def check_diff(x, y):
+    x = x.to(dtype=torch.float32, device='cpu')
+    y = y.to(dtype=torch.float32, device='cpu')
+    abs_diff = abs(x - y)
+    print('Max abs diff:', abs_diff.max())
+    print('Mean abs diff:', abs_diff.mean())
 
-for i in range(10):
-    for dev_id in dev_ids:
-        barriers[dev_id].zero_()
-        torch.cuda.synchronize(dev_id)
-    ring_attention(
-        instructions, barriers, timings,
-        Qs, K0s, K1s, V0s, V1s, Os
-    )
-    for dev_id in dev_ids:
-        torch.cuda.synchronize(dev_id)
-    print(torch.max(O_ref - Os[0]))
-    print(torch.mean(O_ref - Os[0]))
+print('\nChecking correctness...')
+for dev_id in dev_ids:
+    O_ref = pytorch_mha(Qs[dev_id].cpu(), Ks[dev_id], Vs[dev_id])
+    O = Os[dev_id] / Ls[dev_id].unsqueeze(-1)
+    check_diff(O, O_ref)
 
 
 ###
@@ -170,7 +165,7 @@ for i in range(NUM_ITERS):
     start_time = time()
     ring_attention(
         instructions, barriers, timings,
-        Qs, K0s, K1s, V0s, V1s, Os
+        Qs, K0s, K1s, V0s, V1s, Os, Ls, Ms
     )
     for dev_id in dev_ids: # can't use cudaEvent (which is device-specific)
         torch.cuda.synchronize(dev_id)

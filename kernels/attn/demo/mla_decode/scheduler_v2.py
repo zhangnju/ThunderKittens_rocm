@@ -36,7 +36,7 @@ class Task:
         return self.uid < other.uid # just need a way to break ties.
 
 def backward_schedule(processors: List[int], batch_id: int, seq_length: int, tok_ids: List[int], partial_uid: int, reduction_uid: int, q_heads: int = 16):
-    max_tokens = 8
+    max_tokens = 4
     assert (len(tok_ids) > 0 and len(tok_ids) <= max_tokens), f"If num_tokens is > {max_tokens}, please generate two separate schedules for each group of {max_tokens} tokens."
     
     NUM_PROCESSORS = len(processors)

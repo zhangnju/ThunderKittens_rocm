@@ -75,7 +75,7 @@ def create_thundermla_arguments(seq_lengths, new_tokens, q_heads = 16):
     Instructions, O_scratch, Lvec_scratch, Semaphore, Timings = create_arguments_from_task_schedule(
         scheduled_tasks, new_tokens, num_processors=NUM_PROCESSORS, enable_timings=ENABLE_TIMINGS, q_heads=q_heads
     )
-    # visualize_schedule(scheduled_tasks, NUM_PROCESSORS)
+    visualize_schedule(scheduled_tasks, NUM_PROCESSORS)
     return Instructions, O_scratch, Lvec_scratch, Semaphore, Timings
 
 def run_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_scratch, Lvec_scratch, Semaphore, Timings, tic=None):
@@ -161,7 +161,7 @@ def main(seq_lengths, new_tokens, q_heads=16):
     save_gantt_chart(Timings, Instructions, save_all=True, name='new')
 
 if __name__ == "__main__":
-    main([4641,45118,1730,1696], 8, 16)
+    main([4641,45118,1730,1696], 4, 16)
     main([65536], 1, 16)
     main([512]*64, 2, 16)
     main([4096]*NUM_PROCESSORS, 4, 16)

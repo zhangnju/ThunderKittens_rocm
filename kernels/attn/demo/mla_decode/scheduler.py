@@ -57,7 +57,7 @@ def generate_sequence_tasks(batch_id: int, length: int, chunking,
             task = Task(
                 uid=starting_id,
                 batch_id=batch_id,
-                name=f"Seq{batch_id}_Partial_{position}-{end_pos}_tok{tok_ids[0]}-{tok_ids[-1]}",
+                name=f"uid{starting_id}_Seq{batch_id}_Partial_{position}-{end_pos}_tok{tok_ids[0]}-{tok_ids[-1]}",
                 task_type="partial",
                 duration=duration,
                 dependencies=[],
@@ -82,7 +82,7 @@ def generate_sequence_tasks(batch_id: int, length: int, chunking,
             merge_tasks.append(Task(
                 uid=starting_id,
                 batch_id=batch_id,
-                name=f"Seq{batch_id}_Merge_{i//2}_tok{new_token}",
+                name=f"uid{starting_id}_Seq{batch_id}_Merge_{i//2}_tok{new_token}",
                 task_type="reduction",
                 duration=b2 + m2*(len(dep)-1),
                 dependencies=dep,
@@ -168,7 +168,7 @@ def priority_schedule_tasks(tasks: List[Task], num_processors: int) -> List[Task
         raise ValueError("Cycle detected in task dependencies!")
     return tasks
 
-def create_arguments_from_task_schedule(tasks: List[Task], new_tokens: int, num_processors: int = 1, enable_timings: bool = False, q_heads: int = 16):
+def create_arguments_from_task_schedule(tasks: List[Task], new_tokens: int, num_processors: int = 1, enable_timings: bool = False, q_heads: int = 16, prints: bool = True):
     OP_PARTIAL, OP_REDUCTION = 1, 2
     partial_padding = [0]*23
 
@@ -191,7 +191,8 @@ def create_arguments_from_task_schedule(tasks: List[Task], new_tokens: int, num_
 
     num_instructions = max(t.uid for t in tasks) + 1
     processor_tasks = [[] for _ in range(num_processors)]
-    print(f'Number of instructions: {len(tasks)}')
+    if prints:
+        print(f'Number of instructions: {len(tasks)}')
     for task in tasks:
         processor_tasks[task.processor].append(task)
     for pid in range(num_processors):

@@ -152,7 +152,7 @@ struct SiLU_MLPOp
             }
 
             // 5) UNUSED pages: release them immediately so consumer warps can retire
-            else if (laneid() >= PAGE_INPUT+1 && laneid() < SEM_COUNT)
+            else if (lan eid() >= PAGE_INPUT+1 && laneid() < SEM_COUNT)
             {
                 int pg = s.pid(laneid());
                 s.wait_page_ready(pg);
@@ -172,7 +172,6 @@ struct SiLU_MLPOp
                 arrive(s.tensor_finished, config::NUM_CONSUMER_WARPS);
         }
     };
-
 
     struct consumer
     {

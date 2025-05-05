@@ -1,0 +1,175 @@
+import sys
+import time
+
+import torch
+from make_instructions import make_instructions
+from torch import Tensor
+from torch import nn
+import torch.nn.functional as F
+from einops import einsum
+
+
+torch.manual_seed(0)
+
+hidden_size = 2048
+intermediate_size = 2048
+num_layers = 16
+num_ops = 6
+num_heads = 32
+batch_size = 4096
+
+
+################# CREATE PYTORCH REFERENCE ######################
+
+def down_proj_plus_residual(silu_out: Tensor, residual: Tensor, down_proj: nn.Linear) -> Tensor:
+    down = einsum(silu_out, down_proj, "b i, o i -> b o")
+
+    return down + residual
+
+
+################## CREATE INPUTS ######################
+
+DEPTH = 1
+
+# Create input and output tensors
+
+DOWN_PROJ_W = (
+    torch.randn((hidden_size, intermediate_size), device=0, dtype=torch.float32) / 2048**0.25
+).to(torch.bfloat16)
+
+SILU_OUT = (
+    torch.randn((batch_size, intermediate_size), device=0, dtype=torch.float32) / 2048**0.25
+).to(torch.bfloat16)
+
+RESIDUAL = (
+    torch.randn((batch_size, hidden_size), device=0, dtype=torch.float32) / 2048**0.25
+).to(torch.bfloat16)
+
+Bar = torch.ones((num_layers, num_ops, num_heads), device=0, dtype=torch.int32)
+
+print(SILU_OUT.float().mean())
+
+
+print("Input tensors created, of shapes", f"{SILU_OUT.shape=}\n{DOWN_PROJ_W.shape}\n{RESIDUAL.shape}\n\n")
+
+sys.stdout.flush()
+
+
+# Create instruction and timing tensors
+instructions, timings = make_instructions(DEPTH)
+
+print(
+    f"Instruction and timing tensors created, of shapes {instructions.shape} and {timings.shape}"
+)
+print(instructions.float().mean())
+
+
+############# CORE FUNCTIONS ##################
+
+# Run the matvec kernel
+def go():
+    RESIDUAL.copy_(down_proj_plus_residual(
+        SILU_OUT, 
+        RESIDUAL, 
+        DOWN_PROJ_W, 
+    ))
+    return
+    # silu_mlp_tk(
+    #     instructions, 
+    #     timings, 
+    #     UP_PROJ_W, 
+    #     GATE_PROJ_W, 
+    #     INP, 
+    #     O,
+    #     Bar
+    # )
+
+
+def reference_go():
+    O2 = down_proj_plus_residual(
+        SILU_OUT,
+        RESIDUAL,
+        DOWN_PROJ_W,
+    )
+    return O2
+
+
+############## EVALUATE TIMINGS ######################
+
+print("Starting test...")
+
+torch.cuda.synchronize()
+
+go()
+print("Kernel launched")
+
+torch.cuda.synchronize()
+
+
+print("Starting timing loop...")
+
+start_event = torch.cuda.Event(enable_timing=True)
+end_event = torch.cuda.Event(enable_timing=True)
+start_event.record()
+for i in range(5):
+    go()
+torch.cuda.synchronize()
+end_event.record()
+torch.cuda.synchronize()
+elapsed_time = start_event.elapsed_time(end_event)
+t1 = time.time()  # Keep this for compatibility with the time_per_iter calculation
+t0 = t1 - (elapsed_time / 1000)  # Convert ms to seconds
+time_per_iter = ((t1 - t0) * 1e6) / 5
+print(f"Time per iter: {time_per_iter} us")
+print(f"GB/s: {(2 * 2048 * 2048 * 1e-9) / (time_per_iter * 1e-6)}\n")
+
+
+print("Test completed successfully!")
+
+print("Output tensor:")
+RESIDUAL_numpy = RESIDUAL.float().cpu().numpy()
+print(f"-- Shape = {RESIDUAL_numpy.shape}")
+print(f"-- Output = {RESIDUAL_numpy}, Mean = {RESIDUAL_numpy.mean()}, Max = {RESIDUAL_numpy.max()}, Min = {RESIDUAL_numpy.min()}")
+
+
+print(f"Reference tensor:")
+RESIDUAL2 = reference_go()
+RESIDUAL2_numpy = RESIDUAL2.float().cpu().numpy()
+print(f"-- Shape = {RESIDUAL2_numpy.shape}")
+print(f"-- Output = {RESIDUAL2_numpy}, Mean = {RESIDUAL2_numpy.mean()}, Max = {RESIDUAL2_numpy.max()}, Min = {RESIDUAL2_numpy.min()}")
+print("")
+
+
+diff = RESIDUAL - RESIDUAL2
+adiff = diff.abs()
+rdiff = 2 * adiff / (RESIDUAL.abs() + RESIDUAL2.abs())
+
+print("\nStats:")
+print("ADIFFS:", adiff.max(), adiff.min(), adiff.mean())
+print("RDIFFS:", rdiff.max(), rdiff.min(), rdiff.mean())
+
+
+print(diff.shape)
+
+# print("TIMINGS")
+# for i in range(128):
+#     print(
+#         f"event {i:3d}: {', '.join([f'{timings[0, j, i]:6d}' for j in range(DEPTH)])}"
+#     )
+
+# Create histogram of differences
+import matplotlib.pyplot as plt
+
+differences = (RESIDUAL - RESIDUAL2).flatten()
+plt.figure(figsize=(10, 6))
+plt.hist(differences.float().cpu(), bins=50, alpha=0.7)
+plt.title("Histogram of Differences Between Matrices")
+plt.xlabel("Difference Value")
+plt.ylabel("Frequency")
+plt.yscale("log")  # Set y-axis to logarithmic scale
+plt.grid(True, alpha=0.3)
+plt.savefig("matrix_diff_histogram.png")
+plt.close()
+print(f"Histogram saved to matrix_diff_histogram.png")
+
+

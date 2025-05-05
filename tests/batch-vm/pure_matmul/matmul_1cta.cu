@@ -13,7 +13,7 @@ static constexpr int Kb = 64;
 
 struct matmul_globals {
     using a_tile = st_bf<Mb, Kb>;
-    using b_tile = st_bf<Nb/2, Kb>;
+    using b_tile = st_bf<Nb, Kb>;
     using d_tile = st_bf<Mb, 64>;
 
     using a_gl = gl<bf16, 1, 1, -1, -1, a_tile>;
@@ -42,14 +42,14 @@ template<int SUPER_M=8> __device__ static inline int2 get_task_idx(const matmul_
     if (task_id < super_rows * Cblocks) {
         return { 
             (SUPER_M*(task_id/super_repeat) + task_id%SUPER_M)*4 + ctarank*2 + is_consumer*(warpgroup::groupid()),
-            is_consumer ? (task_id%super_repeat)/SUPER_M : 2*((task_id%super_repeat)/SUPER_M) + ctarank
+            is_consumer ? (task_id%super_repeat)/SUPER_M : (task_id%super_repeat)/SUPER_M
         };
     }
     else if (task_id < Rblocks*Cblocks) {
         int remainder_id = task_id - super_rows*Cblocks;
         return {
             (super_rows + remainder_id%final_rows)*4 + ctarank*2 + is_consumer*(warpgroup::groupid()),
-            is_consumer ? remainder_id/final_rows : 2*(remainder_id/final_rows) + ctarank
+            is_consumer ? remainder_id/final_rows : (remainder_id/final_rows)
         };
     }
     else {
@@ -59,13 +59,12 @@ template<int SUPER_M=8> __device__ static inline int2 get_task_idx(const matmul_
 
 __global__ __cluster_dims__(2) __launch_bounds__(NUM_THREADS, 1)
 void matmul(const __grid_constant__ matmul_globals g) {
-
     extern __shared__ int __shm[]; 
     tma_swizzle_allocator al((int*)&__shm[0]);
     int warpid = kittens::warpid(), warpgroupid = warpgroup::groupid();
     int iters_per_task = get_iters_per_task(g);
 
-    constexpr int PIPE_DEPTH = 4;
+    constexpr int PIPE_DEPTH = 3;
 
     using a_tile = matmul_globals::a_tile;
     using b_tile = matmul_globals::b_tile;
@@ -84,12 +83,12 @@ void matmul(const __grid_constant__ matmul_globals g) {
 
     if (threadIdx.x == 0) { 
         for(int i = 0; i < PIPE_DEPTH; i++) {
-            init_semaphore(inputs_arrived[i], 0, 2); 
-            init_semaphore(inputs_finished[i], 0, NUM_CONSUMERS); 
+            init_semaphore(inputs_arrived[i], 0, 1); 
+            init_semaphore(inputs_finished[i], 0, 2); 
         }
         init_semaphore(outputs_arrived, 0, 1);
         for(int i = 0; i < NUM_CONSUMERS; i++) {
-            init_semaphore(outputs_finished[i], 0, 2);
+            init_semaphore(outputs_finished[i], 0, 1);
         }
     }
 
@@ -101,44 +100,50 @@ void matmul(const __grid_constant__ matmul_globals g) {
         if(warpgroup::warpid() == 3) {
             int input_ring = 0; // tracking which input block is being loaded
             for(int task_iter = 0; true; task_iter++) {
+                if (laneid() == 0) printf("\033[0;31mProducer clusteridx=%d, ctarank=%d, warpgroup::groupid()=%d, warpgroup::warpid()=%d, threadid=%d, task_iter = %d\033[0m\n", clusterIdx().x, cluster_ctarank(), warpgroup::groupid(), warpgroup::warpid(), laneid(), task_iter);
                 int2 rowcol = get_task_idx(g, task_iter, false);
                 if(rowcol.x == -1) {
                     for(int idx = 0; idx < (PIPE_DEPTH); idx++) {
-                        warp::tma::cluster::wait(inputs_finished[input_ring], prototype::get_phasebit<1>(bitfield, input_ring));
+                        kittens::wait(inputs_finished[input_ring], prototype::get_phasebit<1>(bitfield, input_ring));
                         input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring);
                     }
                     if(laneid() == 0) arrive(outputs_arrived);
                     break;
                 }
                 for (int idx = 0; idx < iters_per_task; idx++) {
-                    tma::cluster::wait(inputs_finished[input_ring], prototype::get_phasebit<1>(bitfield, input_ring));
+                    kittens::wait(inputs_finished[input_ring], prototype::get_phasebit<1>(bitfield, input_ring));
                     prototype::update_phasebit<1>(bitfield, input_ring);
                     if(task_iter>0 && idx==PIPE_DEPTH-1 && laneid() == 0) arrive(outputs_arrived); 
-                    warp::tma::cluster::expect(inputs_arrived[input_ring], 0, a_smem[0][0], a_smem[0][1], b_smem[0]);
-                    warp::tma::cluster::load_async(a_smem[input_ring][0], g.a, {(rowcol.x+0), idx}, inputs_arrived[input_ring], (uint16_t)(1<<ctarank), 0);
-                    warp::tma::cluster::load_async(a_smem[input_ring][1], g.a, {(rowcol.x+1), idx}, inputs_arrived[input_ring], (uint16_t)(1<<ctarank), 0);
-                    warp::tma::cluster::load_async(b_smem[input_ring],    g.b, { rowcol.y,    idx}, inputs_arrived[input_ring], (uint16_t)(1<<ctarank), 0);
+                    warp::tma::expect(inputs_arrived[input_ring], a_smem[0][0], a_smem[0][1], b_smem[0]);
+                    warp::tma::load_async(a_smem[input_ring][0], g.a, {(rowcol.x+0), idx}, inputs_arrived[input_ring]);
+                    warp::tma::load_async(a_smem[input_ring][1], g.a, {(rowcol.x+1), idx}, inputs_arrived[input_ring]);
+                    warp::tma::load_async(b_smem[input_ring],    g.b, { rowcol.y,    idx}, inputs_arrived[input_ring]);
                     input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring);
                 }
+                if (laneid() == 0) printf("\033[0;31mProducer clusteridx=%d, ctarank=%d, warpgroup::groupid()=%d, warpgroup::warpid()=%d, threadid=%d, task_iter = %d, FINISHED LOADING\033[0m\n", clusterIdx().x, cluster_ctarank(), warpgroup::groupid(), warpgroup::warpid(), laneid(), task_iter);
             }
         }
-        else if(ctarank == 0 && (warpgroup::warpid() == 0 || warpgroup::warpid() == 1)) { // launch the MMA's
+        else if((warpgroup::warpid() == 0 || warpgroup::warpid() == 1)) { // launch the MMA's
             d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(warpgroup::warpid()*Nb);
             int input_ring = 0; // tracking which input block is being loaded
             for(int task_iter = 0; true; task_iter++) {
+                if (laneid() == 0) printf("\033[0;32mConsumer clusteridx=%d, ctarank=%d, warpgroup::groupid()=%d, warpgroup::warpid()=%d, threadid=%d, task_iter = %d\033[0m\n", clusterIdx().x, cluster_ctarank(), warpgroup::groupid(), warpgroup::warpid(), laneid(), task_iter);
                 int2 rowcol = get_task_idx(g, task_iter, false);
                 if(rowcol.x == -1) break;
-                tma::cluster::wait(outputs_finished[warpgroup::warpid()], (task_iter+1)%2); // make sure tensor memory is ready to be written to.
-                tma::cluster::wait(inputs_arrived[input_ring], prototype::get_phasebit<0>(bitfield, input_ring));
+                kittens::wait(outputs_finished[warpgroup::warpid()], (task_iter+1)%2); // make sure tensor memory is ready to be written to.
+                if (laneid() == 0) printf("\033[0;32mConsumer clusteridx=%d, ctarank=%d, warpgroup::groupid()=%d, warpgroup::warpid()=%d, threadid=%d, task_iter = %d MADE IT PAST WAIT\033[0m\n", clusterIdx().x, cluster_ctarank(), warpgroup::groupid(), warpgroup::warpid(), laneid(), task_iter);
+                kittens::wait(inputs_arrived[input_ring], prototype::get_phasebit<0>(bitfield, input_ring));
+                if (laneid() == 0) printf("\033[0;32mConsumer clusteridx=%d, ctarank=%d, warpgroup::groupid()=%d, warpgroup::warpid()=%d, threadid=%d, task_iter = %d MADE IT PAST WAIT 2\033[0m\n", clusterIdx().x, cluster_ctarank(), warpgroup::groupid(), warpgroup::warpid(), laneid(), task_iter);
                 prototype::update_phasebit<0>(bitfield, input_ring);
-                warp::mm2_ABt(d_tt, a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
+                warp::mm_ABt(d_tt, a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
                 input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring);
                 for(int idx = 1; idx < iters_per_task; idx++) {
-                    tma::cluster::wait(inputs_arrived[input_ring], prototype::get_phasebit<0>(bitfield, input_ring));
+                    kittens::wait(inputs_arrived[input_ring], prototype::get_phasebit<0>(bitfield, input_ring));
                     prototype::update_phasebit<0>(bitfield, input_ring);
-                    warp::mma2_ABt(d_tt, a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
+                    warp::mma_ABt(d_tt, a_smem[input_ring][warpgroup::warpid()], b_smem[input_ring], inputs_finished[input_ring]);
                     input_ring=prototype::ring_advance<PIPE_DEPTH>(input_ring);
                 }
+                if (laneid() == 0) printf("\033[0;32mConsumer clusteridx=%d, ctarank=%d, warpgroup::groupid()=%d, warpgroup::warpid()=%d, threadid=%d, task_iter = %d, FINISHED LOADING\033[0m\n", clusterIdx().x, cluster_ctarank(), warpgroup::groupid(), warpgroup::warpid(), laneid(), task_iter);
             }
         }
     }
@@ -146,9 +151,11 @@ void matmul(const __grid_constant__ matmul_globals g) {
         warpgroup::increase_registers<224>();
         d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(warpgroupid*Nb);
         for(int task_iter = 0; true; task_iter++) {
+            if (laneid() == 0) printf("\033[0;34mStore clusteridx=%d, ctarank=%d, warpgroup::groupid()=%d, warpgroup::warpid()=%d, threadid=%d, task_iter = %d\033[0m\n", clusterIdx().x, cluster_ctarank(), warpgroup::groupid(), warpgroup::warpid(), laneid(), task_iter);
             int2 rowcol = get_task_idx(g, task_iter, true);
             if(rowcol.x == -1) break;
             kittens::wait(outputs_arrived, task_iter%2);
+            if (laneid() == 0) printf("\033[0;34mStore clusteridx=%d, ctarank=%d, warpgroup::groupid()=%d, warpgroup::warpid()=%d, threadid=%d, task_iter = %d MADE IT PAST WAIT\033[0m\n", clusterIdx().x, cluster_ctarank(), warpgroup::groupid(), warpgroup::warpid(), laneid(), task_iter);
             rt_bf<Mb/4, d_tile::cols> d_reg[4];
             if(warpgroupid == 1) group<8>::sync(15);
             #pragma unroll
@@ -157,20 +164,21 @@ void matmul(const __grid_constant__ matmul_globals g) {
             }
             tensor_load_wait();
             warpgroup::sync(warpgroupid);
-            if(warpgroup::laneid() == 0) tma::cluster::arrive(outputs_finished[warpgroupid], 0); // Tensor memory for warpgroup 0 is now free.
+            if(warpgroup::laneid() == 0) kittens::arrive(outputs_finished[warpgroupid], 0); // Tensor memory for warpgroup 0 is now free.
             if(warpgroupid == 0) group<8>::sync(15);
             if(warpgroupid == 1) group<8>::sync(14);
             warpgroup::store(d_smem, d_reg[0]);
             warpgroup::sync(warpgroupid);
-            if(warpgroup::laneid() == 0) tma::store_async(g.d, d_smem, {rowcol.x, 4*rowcol.y+0});
+            if(warpgroup::warpid() == 0) tma::store_async(g.d, d_smem, {rowcol.x, 4*rowcol.y+0});
             #pragma unroll
             for(int i = 1; i < Nb/d_tile::cols; i++) {
                 tma::store_async_read_wait();
                 warpgroup::sync(warpgroupid);
                 warpgroup::store(d_smem, d_reg[i]);
                 warpgroup::sync(warpgroupid);
-                if(warpgroup::laneid() == 0) tma::store_async(g.d, d_smem, {rowcol.x, 4*rowcol.y+i});
+                if(warpgroup::warpid() == 0) tma::store_async(g.d, d_smem, {rowcol.x, 4*rowcol.y+i});
             }
+            if (laneid() == 0) printf("\033[0;34mStore clusteridx=%d, ctarank=%d, warpgroup::groupid()=%d, warpgroup::warpid()=%d, threadid=%d, task_iter = %d, FINISHED STORE\033[0m\n", clusterIdx().x, cluster_ctarank(), warpgroup::groupid(), warpgroup::warpid(), laneid(), task_iter);
             tma::store_async_read_wait();
             if(warpgroupid == 0) group<8>::sync(14);
             group<8>::sync(15); // All consumers sync here.
@@ -269,7 +277,8 @@ int run_benchmark(size_t M, size_t N, size_t K) {
     cudaFuncSetAttribute(matmul, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
 
     // Launch kernel
-    dim3 grid(148, 1);
+    //dim3 grid(148, 1);
+    dim3 grid(2, 1);
     dim3 block(NUM_THREADS);
     std::cout << "Launching warmup kernel with grid (" << grid.x << ", " << grid.y << "), block (" << block.x << ")\n";
     for(int i = 0; i < (NCU ? 0 : 1); i++) { // warmup

@@ -1,6 +1,7 @@
 import torch
 from ring_attention import ring_attention, can_access_peer, enable_p2p_access
 from time import time
+import numpy as np
 
 
 ###
@@ -136,16 +137,41 @@ for dev_id in dev_ids:
 ###
 def pytorch_mha(q, k, v):
     QK = torch.matmul(q, k.transpose(-2, -1))
-    # QK /= (q.size(-1) ** 0.5)
-    # QK = torch.nn.functional.softmax(QK, dim=-1)
-    # out = torch.matmul(QK, v)
-    # return out
-    return QK
+    QK /= (q.size(-1) ** 0.5)
+    QK = torch.nn.functional.softmax(QK, dim=-1)
+    out = torch.matmul(QK, v)
+    return out
 
 O_ref = pytorch_mha(Qs[0], K0s[0], V0s[0])
 
-print(O_ref)
+# print(O_ref)
 # print(Os[0])
+
+
+_qk = torch.matmul(Qs[0][0, 0], K0s[0][0, 0].transpose(-2, -1))
+__qk = _qk
+_max = torch.max(_qk, dim=-1, keepdim=True).values
+_qk /= (np.log(2) * (Qs[0].size(-1) ** 0.5))
+_max /= (np.log(2) * (Qs[0].size(-1) ** 0.5))
+_qk -= _max
+_qk = torch.exp2(_qk)
+print(__qk[:128, :128])
+
+
+for i in range(20):
+    for dev_id in dev_ids:
+        barriers[dev_id].zero_()
+        torch.cuda.synchronize(dev_id)
+    ring_attention(
+        instructions, barriers, timings,
+        Qs, K0s, K1s, V0s, V1s, Os
+    )
+    for dev_id in dev_ids:
+        torch.cuda.synchronize(dev_id)
+    print(torch.max(O_ref - Os[0]))
+    print(torch.mean(O_ref - Os[0]))
+
+
 
 breakpoint()
 

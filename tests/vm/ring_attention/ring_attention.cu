@@ -13,7 +13,7 @@ constexpr int HEAD_DIM = 64;
 
 using qo_tile = st_bf<QO_BLOCK_SIZE, HEAD_DIM>;
 using kv_tile = st_bf<KV_BLOCK_SIZE, HEAD_DIM>;
-using a_tile = st_bf<QO_BLOCK_SIZE, KV_BLOCK_SIZE>;
+using a_tile = st_bf<QO_BLOCK_SIZE, KV_BLOCK_SIZE>; // uses 32KB megapage
 
 using config = default_config;
 struct globals {
@@ -81,10 +81,10 @@ template<typename config=config> struct RingAttentionOp {
     __device__ static inline semaphore &v_finished(state<config> &s, int stage) { return s.semaphores()[12 + PIPELINE_STAGES * 3 + stage]; }
 
     __device__ static inline int get_q_page(state<config> &s, int id)    { return id; } // use PIDs for now
-    __device__ static inline int get_a_page(state<config> &s, int id)    { return 2 + id; }
-    __device__ static inline int get_o_page(state<config> &s, int id)    { return 4 + id; }
-    __device__ static inline int get_k_page(state<config> &s, int stage) { return 6 + PIPELINE_STAGES * 0 + stage; }
-    __device__ static inline int get_v_page(state<config> &s, int stage) { return 6 + PIPELINE_STAGES * 1 + stage; }
+    __device__ static inline int get_a_page(state<config> &s, int id)    { return 2 + id * 2; } // 32KB megapages
+    __device__ static inline int get_o_page(state<config> &s, int id)    { return 6 + id; }
+    __device__ static inline int get_k_page(state<config> &s, int stage) { return 8 + PIPELINE_STAGES * 0 + stage; }
+    __device__ static inline int get_v_page(state<config> &s, int stage) { return 8 + PIPELINE_STAGES * 1 + stage; }
 
     struct controller {
         static __device__ int release_lid(const globals &g, typename config::instruction_t &instruction, int &query) {
@@ -120,6 +120,8 @@ template<typename config=config> struct RingAttentionOp {
                 auto &q = *reinterpret_cast<qo_tile *>(s.pages[q_page].data);
                 s.wait_page_ready(q_page);
                 tma::expect(q_arrived(s, laneid), q);
+                __nanosleep(10000);
+
                 tma::load_async(q, g.Q, {inst.B, inst.H, inst.QO_idx + laneid, 0}, q_arrived(s, laneid));
                 // printf("Q load start %d\n", laneid);
             } else if (laneid == 2) { // Load Ks
@@ -136,15 +138,17 @@ template<typename config=config> struct RingAttentionOp {
                     }
                     tma::expect(k_arrived(s, stage), k);
                     // Todo: vary by ring stage
+                    __nanosleep(10000);
+
                     tma::load_async(k, g.K0s[inst.dev_idx], {inst.B, inst.H, i, 0}, k_arrived(s, stage));
                     // printf("K load start %d\n", i);
                 }
                 for (int i = 0; i < PIPELINE_STAGES; i++) {
-                    // int stage = (i + inst.num_kv_blocks) % PIPELINE_STAGES;
-                    // wait(k_finished(s, stage), get_phasebit<0>(phasebit, stage));
-                    // // printf("arriving K finished page %d\n", stage);
-                    // s.finish_page(get_k_page(s, stage), config::NUM_CONSUMER_WARPS);
-                    // update_phasebit<0>(phasebit, stage);
+                    int stage = (i + inst.num_kv_blocks) % PIPELINE_STAGES;
+                    wait(k_finished(s, stage), get_phasebit<0>(phasebit, stage));
+                    // printf("arriving K finished page %d\n", stage);
+                    s.finish_page(get_k_page(s, stage), config::NUM_CONSUMER_WARPS);
+                    update_phasebit<0>(phasebit, stage);
                 }
             } else if (laneid == 3) { // Load Vs
                 uint32_t phasebit = 0;
@@ -159,16 +163,19 @@ template<typename config=config> struct RingAttentionOp {
                         update_phasebit<0>(phasebit, stage);
                     }
                     tma::expect(v_arrived(s, stage), v);
+                    __nanosleep(10000);
                     tma::load_async(v, g.V0s[inst.dev_idx], {inst.B, inst.H, i, 0}, v_arrived(s, stage));
+                    __nanosleep(10000);
+
                     // printf("V load start %d\n", i);
                 }
                 for (int i = 0; i < PIPELINE_STAGES; i++) {
-                    // int stage = (i + inst.num_kv_blocks) % PIPELINE_STAGES;
-                    // wait(v_finished(s, stage), get_phasebit<0>(phasebit, stage));
-                    // s.finish_page(get_v_page(s, stage), config::NUM_CONSUMER_WARPS);
-                    // update_phasebit<0>(phasebit, stage);
+                    int stage = (i + inst.num_kv_blocks) % PIPELINE_STAGES;
+                    wait(v_finished(s, stage), get_phasebit<0>(phasebit, stage));
+                    s.finish_page(get_v_page(s, stage), config::NUM_CONSUMER_WARPS);
+                    update_phasebit<0>(phasebit, stage);
                 }
-            } else if (6 + PIPELINE_STAGES*2 <= laneid && laneid < config::NUM_PAGES) { // Finish unused pages
+            } else if (8 + PIPELINE_STAGES*2 <= laneid && laneid < config::NUM_PAGES) { // Finish unused pages
                 s.wait_page_ready(laneid);
                 s.finish_page(laneid, config::NUM_CONSUMER_WARPS);
                 // printf("page %d finished\n", laneid);
@@ -217,6 +224,7 @@ template<typename config=config> struct RingAttentionOp {
                     __nanosleep(10000);
 
                     auto qk_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, KV_BLOCK_SIZE>>(laneid*KV_BLOCK_SIZE);
+                    __nanosleep(10000);
                     mm_ABt(qk_accumulator, q, k, qk_finished(s, laneid));
                     // printf("qk launched %d - %d\n", laneid, i);
                 }
@@ -233,9 +241,11 @@ template<typename config=config> struct RingAttentionOp {
                     update_phasebit<0>(phasebit, stage);
                     wait(av_ready(s, laneid-2), get_phasebit<1>(phasebit, laneid-2));
                     update_phasebit<1>(phasebit, laneid-2);
+                    __nanosleep(10000);
 
                     // printf("v load done and av ready %d - %d\n", laneid, i);
                     auto av_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, HEAD_DIM>>(2*KV_BLOCK_SIZE+(laneid-2)*HEAD_DIM);
+                    __nanosleep(10000);
                     mma_AB(av_accumulator, att, v, av_finished(s, laneid-2));
                     // printf("av launched %d - %d\n", laneid, i);
                 }
@@ -289,16 +299,18 @@ template<typename config=config> struct RingAttentionOp {
 
                 __nanosleep(10000);
 
-                auto &test = *reinterpret_cast<st_bf<QO_BLOCK_SIZE, KV_BLOCK_SIZE> *>(s.pages[10].data);
-                warpgroup::store(test, att_fl);
-                __nanosleep(10000);
-                warpgroup::sync(6);
-                for (int x = 0; x < 100; x++) {
-                    if (groupid == 0 && warpgroup::laneid() == 0)
-                         printf("%f ", float(test[x]));
-                }
-                if (groupid == 0 && warpgroup::laneid() == 0)
-                    printf("\n");
+                // __nanosleep(10000);
+
+                // auto &test = *reinterpret_cast<st_bf<QO_BLOCK_SIZE, KV_BLOCK_SIZE> *>(s.pages[10].data);
+                // warpgroup::store(test, att_fl);
+                // warpgroup::sync(6);
+                // __nanosleep(10000);
+                // for (int x = 0; x < 100; x++) {
+                //     if (groupid == 0 && warpgroup::laneid() == 0)
+                //          printf("%f ", float(test.data[x]));
+                // }
+                // if (groupid == 0 && warpgroup::laneid() == 0)
+                //     printf("\n");
 
 
 
@@ -316,6 +328,12 @@ template<typename config=config> struct RingAttentionOp {
                 warp::exp2(diff_scaled_max_vec, diff_scaled_max_vec);
                 warp::copy(last_scaled_max_vec, scaled_max_vec); // save for next iteration
 
+                // Normalize and accumulate softmax denominator
+                warp::mul(norm_vec, norm_vec, diff_scaled_max_vec);
+                warp::row_sum(norm_vec, att_fl, norm_vec);
+
+                __nanosleep(10000);
+
                 // Prepare for AV
                 auto att_page = get_a_page(s, groupid);
                 auto &att = *reinterpret_cast<a_tile *>(s.pages[att_page].data);
@@ -325,19 +343,22 @@ template<typename config=config> struct RingAttentionOp {
                     // printf("waiting for av finished %d - %d\n", groupid, i);
                     wait(av_finished(s, groupid), phasebit^1); // wait for the previous mma to finish
                     // printf("av finished %d - %d\n", groupid, i);
-                    warp::arrive(v_finished(s, stage));
+                    int prev_stage = (i + PIPELINE_STAGES - 1) % PIPELINE_STAGES;
+                    warp::arrive(v_finished(s, prev_stage));
                     // printf("av finished %d - %d\n", groupid, prev_stage);
                     warpgroup::load_async(out_fl, av_accumulator);
                     tensor_load_wait(); // TODO: is this needed?
                     __syncwarp();
+                    __nanosleep(10000);
                     warp::mul_row(out_fl, out_fl, diff_scaled_max_vec); // normalize previous outputs
                 }
                 warpgroup::store_async(av_accumulator, out_fl);
                 warpgroup::store(att, att_fl);
                 tensor_store_wait();
                 __syncwarp();
+                __nanosleep(10000);
                 warp::arrive(av_ready(s, groupid));
-
+                __nanosleep(10000);
                 // warpgroup::sync(5);
                 // for (int x = 0; x < 100; x++) {
                 //     if (groupid == 0 && warpgroup::laneid() == 0)
@@ -346,53 +367,47 @@ template<typename config=config> struct RingAttentionOp {
                 // if (groupid == 0 && warpgroup::laneid() == 0)
                 //     printf("\n");
 
-                // Normalize and accumulate softmax denominator
-                warp::mul(norm_vec, norm_vec, diff_scaled_max_vec);
-                warp::row_sum(norm_vec, att_fl, norm_vec);
-
+                warpgroup::sync(groupid + 3);
                 phasebit ^= 1;
             }
 
             // printf("Arrivedddddd\n");
 
-            // // Finish
-            // wait(av_finished(s, groupid), phasebit^1);
-            // warpgroup::load_async(out_fl, av_accumulator);
-            // s.warp_finish_page(get_a_page(s, groupid), config::NUM_CONSUMER_WARPS / 4);
-            // tensor_load_wait();
-            // warp::arrive(s.tensor_finished);
-            // warp::div_row(out_fl, out_fl, norm_vec);
-
-            // // printf("Arrivedddddd2\n");
-
-            // int out_page = get_o_page(s, groupid);
-            // auto &out = *reinterpret_cast<qo_tile *>(s.pages[out_page].data);
-            // s.wait_page_ready(out_page);
-            // warpgroup::store(out, out_fl);
-            // warp::arrive(o_arrived(s, groupid));
-
-            // // printf("Arrivedddddd3\n");
+            // Finish
+            wait(av_finished(s, groupid), phasebit^1);
+            warp::arrive(v_finished(s, (inst.num_kv_blocks - 1) % PIPELINE_STAGES));
+            warpgroup::load_async(out_fl, av_accumulator);
+            s.warp_finish_page(get_a_page(s, groupid), config::NUM_CONSUMER_WARPS / 4);
+            s.warp_finish_page(get_a_page(s, groupid) + 1, config::NUM_CONSUMER_WARPS / 4); // free 2 16KB pages
+            tensor_load_wait();
+            __syncwarp();
+            warp::arrive(s.tensor_finished);
+            warp::div_row(out_fl, out_fl, norm_vec);
+            __nanosleep(10000);
+            // printf("Arrivedddddd2\n");
+            __nanosleep(10000);
+            int out_page = get_o_page(s, groupid);
+            auto &out = *reinterpret_cast<qo_tile *>(s.pages[out_page].data);
+            s.wait_page_ready(out_page);
+            warpgroup::store(out, out_fl);
+            __syncwarp();
+            warp::arrive(o_arrived(s, groupid));
         }
     };
     struct storer {
         static __device__ void run(const globals &g, state<config> &s) {
-            // parsed_instruction inst{s};
-            // int laneid = warp::laneid();
-            // if (laneid < 2) {
-
-            //     // printf("Arrivedddddd4\n");
-            //     int out_page = get_o_page(s, laneid);
-            //     auto &out = *reinterpret_cast<qo_tile *>(s.pages[out_page].data);
-            //     wait(o_arrived(s, laneid), 0);
-
-            //     // printf("Arrivedddddd5\n");
-            //     tma::store_async(g.O, out, {inst.B, inst.H, inst.QO_idx + laneid, 0});
-            //     tma::store_async_read_wait(); // or wait until read complete
-
-            //     // printf("Arrivedddddd6\n");
-            //     s.finish_page(out_page, config::NUM_CONSUMER_WARPS);
-            // }
-            // // TODO: write to barrier
+            parsed_instruction inst{s};
+            int laneid = warp::laneid();
+            if (laneid < 2) {
+                __nanosleep(10000);
+                int out_page = get_o_page(s, laneid);
+                auto &out = *reinterpret_cast<qo_tile *>(s.pages[out_page].data);
+                wait(o_arrived(s, laneid), 0);
+                tma::store_async(g.O, out, {inst.B, inst.H, inst.QO_idx + laneid, 0});
+                tma::store_async_read_wait(); // or wait until read complete
+                s.finish_page(out_page, config::NUM_CONSUMER_WARPS);
+            }
+            // TODO: write to barrier
         }
     };
 };

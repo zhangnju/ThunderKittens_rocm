@@ -12,7 +12,7 @@ NUM_COMMS = 8 # this is the magic number that works the best
 NUM_ITERS = 10
 ATTN_OPCODE = 725
 COMM_OPCODE = 97
-B, H, N, D_h = 16, 16, 2048*NUM_DEVICES, 64
+B, H, N, D_h = 16, 16, 512*NUM_DEVICES, 64
 
 assert N%NUM_DEVICES==0, "N must be divisible by NUM_DEVICES"
 assert (N//NUM_DEVICES)%256==0, "N_per_dev must be divisible by 256 (QO Block Size * 2)"
@@ -170,28 +170,3 @@ V = torch.cat(Vs, dim=2)
 for dev_id in dev_ids:
     O_ref = pytorch_mha(Qs[dev_id], K.to(Qs[dev_id].device), V.to(Qs[dev_id].device))
     check_diff(Os[dev_id], O_ref)
-
-breakpoint()
-
-###
-#  Launch the PyTorch version
-###
-# def pytorch_mha(q, k, v):
-#     QK = torch.matmul(q.float(), k.float().transpose(-2, -1))
-#     QK /= (q.size(-1) ** 0.5)
-#     QK = torch.nn.functional.softmax(QK, dim=-1)
-#     out = torch.matmul(QK, v.float()).bfloat16()
-#     return out
-
-# for i in range(NUM_DEVICES):
-#     O_ref = pytorch_mha(Qs[i], K0s[i], V0s[i])
-#     print(torch.max(O_ref - Os[i]))
-#     print(torch.mean(O_ref - Os[i]))
-
-# breakpoint()
-
-
-
-
-# As_ref = ring_mha_torch(Qs, K0s, V0s)
-# torch.cuda.empty_cache()

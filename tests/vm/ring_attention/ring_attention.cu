@@ -285,8 +285,6 @@ template<typename config=config> struct RingAttentionOp {
                     // printf("av launched %d - %d\n", laneid, i);
                 }
             }
-            __syncwarp();
-            if (laneid == 0) atomicAdd_system(&g.barriers[inst.dev_idx][{inst.ring_stage}], 1); // signal the next ring stage comms
         }
     };
 
@@ -404,8 +402,8 @@ template<typename config=config> struct RingAttentionOp {
                     warpgroup::load_async(out_fl, av_accumulator);
                     tensor_load_wait(); // TODO: is this needed?
                     __syncwarp();
-                    warp::mul_row(out_fl, out_fl, diff_scaled_max_vec); // normalize previous outputs
                 }
+                warp::mul_row(out_fl, out_fl, diff_scaled_max_vec); // normalize previous outputs
                 warpgroup::store_async(av_accumulator, out_fl);
                 warpgroup::store(att, att_fl);
                 tensor_store_wait();
@@ -474,6 +472,9 @@ template<typename config=config> struct RingAttentionOp {
                 tma::store_async_read_wait();
                 s.finish_page(lm_page, config::NUM_CONSUMER_WARPS / 2);
             }
+            tma::store_async_wait();
+            __syncwarp(); // TODO maybe not the best place to increase the barrier
+            if (laneid == 0) atomicAdd_system(&g.barriers[inst.dev_idx][{inst.ring_stage}], 1); // signal the next ring stage comms
         }
     };
 };

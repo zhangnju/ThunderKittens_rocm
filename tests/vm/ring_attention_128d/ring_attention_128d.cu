@@ -21,7 +21,7 @@ using comm_tile = st_bf<COMM_CHUNK_LENGTH, HEAD_DIM>; // Full 16KB page
 struct ring_attention_config
 {
     // Instruction pipeline
-    static constexpr int INSTRUCTION_PIPELINE_STAGES = 2;
+    static constexpr int INSTRUCTION_PIPELINE_STAGES = 2; // No point in having more than 2 stages for ring attention
 
     // num bits required to represent num pipeline stages
     static constexpr int INSTRUCTION_PIPELINE_STAGES_BITS = 1;
@@ -45,8 +45,8 @@ struct ring_attention_config
     static constexpr int MAX_SHARED_MEMORY = kittens::MAX_SHARED_MEMORY;
 
     // Shared memory declared statically
-    static constexpr int SCRATCH_BYTES = 2048;
-    static constexpr int STATIC_SHARED_MEMORY = 512 + INSTRUCTION_PIPELINE_STAGES * (SCRATCH_BYTES + (INSTRUCTION_WIDTH + TIMING_WIDTH) * 4 + DYNAMIC_SEMAPHORES * 8);
+    static constexpr int SCRATCH_BYTES = 4096; // Need at least 2048 for ring attention
+    static constexpr int STATIC_SHARED_MEMORY = 1024 + INSTRUCTION_PIPELINE_STAGES * (SCRATCH_BYTES + (INSTRUCTION_WIDTH + TIMING_WIDTH) * 4 + DYNAMIC_SEMAPHORES * 8);
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
 
     // Shared memory declared dynamically
@@ -135,7 +135,6 @@ template<typename config=config> struct RingAttentionOp {
     __device__ static inline int get_o_page(state<config> &s, int id)    { return 6 + id; }
     __device__ static inline int get_k_page(state<config> &s, int stage) { return 8 + PIPELINE_STAGES * 0 + stage; }
     __device__ static inline int get_v_page(state<config> &s, int stage) { return 8 + PIPELINE_STAGES * 1 + stage; }
-    __device__ static inline int get_lm_page(state<config> &s)           { return 12; } // share one page between two consumers
 
     struct controller {
         static __device__ int release_lid(const globals &g, typename config::instruction_t &instruction, int &query) {
@@ -243,15 +242,12 @@ template<typename config=config> struct RingAttentionOp {
                     tma::load_async(o, g.O, {inst.B, inst.H, inst.QO_idx + laneid-4, 0}, o_arrived(s, laneid-4));
                 }
             } else if (laneid < 8) { // Load Ls and Ms for the 2 consumer warpgroups
-                // printf("Shouldn't be here\n");
-                auto lm_page = get_lm_page(s);
                 auto &l = *(reinterpret_cast<lm_vec *>(
-                    reinterpret_cast<char *>(s.pages[lm_page].data) + ((2*(laneid-6)+0)*sizeof(lm_vec))
+                    reinterpret_cast<char *>(s.scratch()) + ((2*(laneid-6)+0)*sizeof(lm_vec))
                 )); // share 1 page between 2 consumers for Ls and Ms
                 auto &m = *(reinterpret_cast<lm_vec *>(
-                    reinterpret_cast<char *>(s.pages[lm_page].data) + ((2*(laneid-6)+1)*sizeof(lm_vec))
+                    reinterpret_cast<char *>(s.scratch()) + ((2*(laneid-6)+1)*sizeof(lm_vec))
                 ));
-                s.wait_page_ready(lm_page);
                 if (inst.ring_stage == 0) {
                     arrive(lm_arrived(s, laneid-6));
                 } else {
@@ -259,7 +255,10 @@ template<typename config=config> struct RingAttentionOp {
                     tma::load_async(l, g.L, {inst.B, inst.H, inst.QO_idx + laneid-6}, lm_arrived(s, laneid-6));
                     tma::load_async(m, g.M, {inst.B, inst.H, inst.QO_idx + laneid-6}, lm_arrived(s, laneid-6));
                 }
-            } // All pages are used, no need to free unused pages
+            } else if (12 <= laneid && laneid < config::NUM_PAGES) { // Finish unused pages
+                s.wait_page_ready(laneid);
+                s.finish_page(laneid, config::NUM_CONSUMER_WARPS);
+            }
         }
     };
 
@@ -349,12 +348,11 @@ template<typename config=config> struct RingAttentionOp {
 
             auto o_page = get_o_page(s, groupid);
             auto &out = *reinterpret_cast<qo_tile *>(s.pages[o_page].data);
-            auto lm_page = get_lm_page(s);
             auto &l = *(reinterpret_cast<lm_vec *>(
-                reinterpret_cast<char *>(s.pages[lm_page].data) + ((2*(groupid)+0)*sizeof(lm_vec))
+                reinterpret_cast<char *>(s.scratch()) + ((2*(groupid)+0)*sizeof(lm_vec))
             )); // share 1 page between 2 consumers for Ls and Ms
             auto &m = *(reinterpret_cast<lm_vec *>(
-                reinterpret_cast<char *>(s.pages[lm_page].data) + ((2*(groupid)+1)*sizeof(lm_vec))
+                reinterpret_cast<char *>(s.scratch()) + ((2*(groupid)+1)*sizeof(lm_vec))
             ));
 
             wait(o_arrived(s, groupid), 0);
@@ -498,20 +496,17 @@ template<typename config=config> struct RingAttentionOp {
                 tma::store_async_read_wait(); // or wait until read complete
                 s.finish_page(out_page, config::NUM_CONSUMER_WARPS);
             } else if (laneid < 4) { // store Ls and Ms
-                // if (laneid == 2) printf("Waiting for lm page\n");
-                int lm_page = get_lm_page(s);
                 auto &l = *(reinterpret_cast<lm_vec *>(
-                    reinterpret_cast<char *>(s.pages[lm_page].data) + ((2*(laneid-2)+0)*sizeof(lm_vec))
+                    reinterpret_cast<char *>(s.scratch()) + ((2*(laneid-2)+0)*sizeof(lm_vec))
                 )); // share 1 page between 2 consumers for Ls and Ms
                 auto &m = *(reinterpret_cast<lm_vec *>(
-                    reinterpret_cast<char *>(s.pages[lm_page].data) + ((2*(laneid-2)+1)*sizeof(lm_vec))
+                    reinterpret_cast<char *>(s.scratch()) + ((2*(laneid-2)+1)*sizeof(lm_vec))
                 ));
                 wait(lm_finished(s, laneid-2), 0);
                 // printf("lm finished %d\n", laneid);
                 tma::store_async(g.L, l, {inst.B, inst.H, inst.QO_idx + laneid-2});
                 tma::store_async(g.M, m, {inst.B, inst.H, inst.QO_idx + laneid-2});
                 tma::store_async_read_wait();
-                s.finish_page(lm_page, config::NUM_CONSUMER_WARPS / 2);
             }
             __syncwarp();
             if (laneid == 0) {

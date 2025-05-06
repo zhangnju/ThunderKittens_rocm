@@ -22,8 +22,7 @@ N_per_dev = N // NUM_DEVICES
 num_qo_blocks = N_per_dev // 256
 num_kv_blocks = N_per_dev // 128
 num_comps = B * H * num_qo_blocks
-# num_ring_stages = NUM_DEVICES
-num_ring_stages = 1 # for unit testing the b200 attention kernel
+num_ring_stages = NUM_DEVICES
 
 ###
 #   Prepare Inputs

@@ -45,11 +45,24 @@ namespace kittens::prototype::vm
                 auto block_idx = inst.start_block_idx + iter / 2;
                 if (iter % 2 == 0)
                 {
-                    tma::load_async(weight_chunk, g.up_weights, {inst.layer_idx, block_idx, col_idx}, sem);
+                    tma::load_async<dim::ROW, cache_policy::EVICT_FIRST>(weight_chunk, g.up_weights, {inst.layer_idx, block_idx, col_idx}, sem);
                 }
                 else
                 {
-                    tma::load_async(weight_chunk, g.gate_weights, {inst.layer_idx, block_idx, col_idx}, sem);
+                    tma::load_async<dim::ROW, cache_policy::EVICT_FIRST>(weight_chunk, g.gate_weights, {inst.layer_idx, block_idx, col_idx}, sem);
+                }
+            }
+
+            static __device__ inline void prefetch_iter(state<Config> &s, const Globals &g, parsed_instruction &inst, int iter, int col_idx, st_bf<16, 512> &weight_chunk)
+            {
+                auto block_idx = inst.start_block_idx + iter / 2;
+                if (iter % 2 == 0)
+                {
+                    tma::prefetch<dim::ROW, cache_policy::EVICT_FIRST>(weight_chunk, g.up_weights, {inst.layer_idx, block_idx, col_idx});
+                }
+                else
+                {
+                    tma::prefetch<dim::ROW, cache_policy::EVICT_FIRST>(weight_chunk, g.gate_weights, {inst.layer_idx, block_idx, col_idx});
                 }
             }
 
@@ -67,7 +80,7 @@ namespace kittens::prototype::vm
 
                 // NOTE: hardcoding to 3 output stages for now
                 auto prev_output_idx = (output_idx - 1);
-                auto prev_output_stage = prev_output_idx % 3;
+                auto prev_output_stage = prev_output_idx % 4;
 
                 int block_idx = inst.start_block_idx + true_output_idx;
 
@@ -100,7 +113,7 @@ namespace kittens::prototype::vm
 
                 if (laneid() == 0)
                 {
-                    tma::store_async<cache_policy::NORMAL>(g.silu_out, out_smem, {block_idx});
+                    tma::store_async<cache_policy::EVICT_LAST>(g.silu_out, out_smem, {block_idx});
                     tma::store_async_read_wait();
                 }
 
@@ -112,7 +125,7 @@ namespace kittens::prototype::vm
         };
 
         using pipeline = rms_matvec_pipeline<Config, Globals, parsed_instruction, pipeline_specifics>;
-        static_assert(pipeline::OUTPUT_PIPELINE_STAGES == 3);
+        static_assert(pipeline::OUTPUT_PIPELINE_STAGES == 4);
 
         struct controller
         {
@@ -134,6 +147,15 @@ namespace kittens::prototype::vm
 
                 parsed_instruction inst{s};
                 pipeline::loader_loop<&Globals::mlp_norm_weights>(s, g, inst.layer_idx);
+            }
+        };
+
+        struct prefetcher
+        {
+            static __device__ void run(const Globals &g, state<Config> &s)
+            {
+                parsed_instruction inst{s};
+                pipeline::loader_loop<&Globals::mlp_norm_weights, true>(s, g, inst.layer_idx);
             }
         };
 

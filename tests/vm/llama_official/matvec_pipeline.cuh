@@ -9,7 +9,7 @@ namespace kittens::prototype::vm
     struct matvec_pipeline
     {
         static constexpr int INPUT_PIPELINE_STAGES = 3;
-        static constexpr int OUTPUT_PIPELINE_STAGES = 3;
+        static constexpr int OUTPUT_PIPELINE_STAGES = 4;
         static constexpr int STAGE_PAGES = 4;
         static constexpr int ACTIVATION_PAGE = 0;
         static constexpr int WEIGHTS_START_PAGE = 1;
@@ -17,6 +17,8 @@ namespace kittens::prototype::vm
         static constexpr int REDUCTION_DIM_PER_WARP = Globals::hidden_dim / Config::NUM_CONSUMER_WARPS;
 
         static constexpr int SEM_COUNT = 1 + (INPUT_PIPELINE_STAGES + OUTPUT_PIPELINE_STAGES) * 2;
+
+        static constexpr bool ENABLE_PREFETCH = false;
 
         // Pages (very naive for now, no fine-grained usage)
         __device__ static inline int get_activation_page(state<Config> &s) { return s.pid(ACTIVATION_PAGE); }
@@ -95,8 +97,14 @@ namespace kittens::prototype::vm
         //     }
         // }
 
+        template <bool prefetch = false>
         __device__ static inline void loader_loop(state<Config> &s, const Globals &g)
         {
+            if constexpr (prefetch && !ENABLE_PREFETCH)
+            {
+                return;
+            }
+
             parsed_instruction inst{s};
 
             auto needed_pages = 1 + min(inst.iters, INPUT_PIPELINE_STAGES) * STAGE_PAGES;
@@ -107,21 +115,32 @@ namespace kittens::prototype::vm
                 int input_stage = 0;
                 for (int iter = 0; iter < inst.iters; iter++)
                 {
-                    wait(weights_finished(s, input_stage), (iter % (2 * INPUT_PIPELINE_STAGES)) < INPUT_PIPELINE_STAGES);
 
                     auto &sem = weights_arrived(s, input_stage);
-                    tma::expect_bytes(sem, sizeof(bf16) * 2048 * 16);
+                    if constexpr (!prefetch)
+                    {
+                        wait(weights_finished(s, input_stage), (iter % (2 * INPUT_PIPELINE_STAGES)) < INPUT_PIPELINE_STAGES);
+                        tma::expect_bytes(sem, sizeof(bf16) * 2048 * 16);
+                    }
 #pragma unroll
                     for (int i = 0; i < 4; i++)
                     {
                         int weight_page = get_weight_page(s, input_stage, i);
-                        if (iter < INPUT_PIPELINE_STAGES)
-                        {
-                            s.wait_page_ready(weight_page);
-                        }
+
                         auto &weight_chunk = reinterpret_cast<st_bf<16, 512> &>(s.pages[weight_page]);
 
-                        pipeline_specifics::load_iter(s, g, inst, iter, i, weight_chunk, sem);
+                        if constexpr (prefetch)
+                        {
+                            pipeline_specifics::prefetch_iter(s, g, inst, iter, i, weight_chunk);
+                        }
+                        else
+                        {
+                            if (iter < INPUT_PIPELINE_STAGES)
+                            {
+                                s.wait_page_ready(weight_page);
+                            }
+                            pipeline_specifics::load_iter(s, g, inst, iter, i, weight_chunk, sem);
+                        }
                     }
 
                     input_stage = (input_stage + 1) % INPUT_PIPELINE_STAGES;
@@ -129,6 +148,10 @@ namespace kittens::prototype::vm
             }
             else if (laneid() >= needed_pages && laneid() < Config::NUM_PAGES)
             {
+                if constexpr (prefetch)
+                {
+                    return;
+                }
                 auto pid = s.pid(laneid());
                 s.wait_page_ready(pid);
                 s.finish_page(pid, Config::NUM_CONSUMER_WARPS);
@@ -225,22 +248,35 @@ namespace kittens::prototype::vm
             return SEM_COUNT;
         }
 
-        template <auto RmsPtr>
+        template <auto RmsPtr, bool prefetch = false>
         __device__ static inline void loader_loop(state<Config> &s, const Globals &g, int layer_idx)
         {
+            if constexpr (prefetch && !pipeline::ENABLE_PREFETCH)
+            {
+                return;
+            }
+
             if (laneid() == 0)
             {
-                int activation_page = get_activation_page(s);
-                s.wait_page_ready(activation_page);
-
                 auto &rms_scale = get_rms_scale(s);
                 auto &sem = rms_scale_arrived(s);
 
-                tma::expect(sem, rms_scale);
-                tma::load_async(rms_scale, g.*RmsPtr, {layer_idx, 0}, sem);
+                if constexpr (!prefetch)
+                {
+                    int activation_page = get_activation_page(s);
+                    s.wait_page_ready(activation_page);
+                    tma::expect(sem, rms_scale);
+
+                    // evict last because we load for all the instructions in this op
+                    tma::load_async<cache_policy::EVICT_LAST>(rms_scale, g.*RmsPtr, {layer_idx, 0}, sem);
+                }
+                else
+                {
+                    tma::prefetch<cache_policy::EVICT_LAST>(rms_scale, g.*RmsPtr, {layer_idx, 0});
+                }
             }
 
-            pipeline::loader_loop(s, g);
+            pipeline::loader_loop<prefetch>(s, g);
         }
 
         // template <auto ActPtr, auto RmsPtr>
@@ -295,7 +331,7 @@ namespace kittens::prototype::vm
                 s.record(TEVENT_AT_GMEM_WAIT);
                 pipeline_specifics::gmem_wait(g, s);
                 s.record(TEVENT_DONE_GMEM_WAIT);
-                tma::load_async(activations, g.*ActPtr, {}, sem);
+                tma::load_async<cache_policy::EVICT_LAST>(activations, g.*ActPtr, {}, sem);
             }
         }
 

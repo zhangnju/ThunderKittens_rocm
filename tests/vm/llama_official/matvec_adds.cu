@@ -46,7 +46,12 @@ namespace kittens::prototype::vm
 
             static __device__ inline void load_iter(state<Config> &s, const globals &g, parsed_instruction &inst, int iter, int col_idx, st_bf<16, 512> &weight_chunk, semaphore &sem)
             {
-                tma::load_async(weight_chunk, g.*WeightsPtr, coord<>{inst.layer, (inst.start_block_idx + iter) * Globals::matvec_block_size, inst.start_reduction_col + 512 * col_idx}, sem);
+                tma::load_async<dim::ROW, cache_policy::EVICT_FIRST>(weight_chunk, g.*WeightsPtr, coord<>{inst.layer, (inst.start_block_idx + iter) * Globals::matvec_block_size, inst.start_reduction_col + 512 * col_idx}, sem);
+            }
+
+            static __device__ inline void prefetch_iter(state<Config> &s, const globals &g, parsed_instruction &inst, int iter, int col_idx, st_bf<16, 512> &weight_chunk)
+            {
+                tma::prefetch<dim::ROW, cache_policy::EVICT_FIRST>(weight_chunk, g.*WeightsPtr, coord<>{inst.layer, (inst.start_block_idx + iter) * Globals::matvec_block_size, inst.start_reduction_col + 512 * col_idx});
             }
 
             static __device__ inline void store(state<Config> &s, const globals &g, parsed_instruction &inst, int output_idx, int output_stage, semaphore &sem, int bit)
@@ -67,7 +72,7 @@ namespace kittens::prototype::vm
                 if (warp::laneid() == 0)
                 {
                     auto &OutputActivations = g.*OutputActivationsPtr; // object in global memory
-                    tma::store_add_async<cache_policy::NORMAL>(OutputActivations, output_smem_bf, {block_idx});
+                    tma::store_add_async<cache_policy::EVICT_LAST>(OutputActivations, output_smem_bf, {block_idx});
                     tma::store_async_wait();
                 }
 
@@ -100,6 +105,15 @@ namespace kittens::prototype::vm
                 pipeline::loader_loop(s, g);
             }
         };
+
+        struct prefetcher
+        {
+            static __device__ void run(const Globals &g, state<Config> &s)
+            {
+                pipeline::loader_loop<true>(s, g);
+            }
+        };
+
         struct sync_loader
         {
             static __device__ void run(const globals &g, state<Config> &s)

@@ -389,7 +389,7 @@ struct reduction_template {
             // if(args.iter == 1) group<12>::sync(8);
             if(warpgroup::warpid() == args.iter%4) {
                 // spinloop until we're ready
-                int load_uid = args.instruction[6+args.iter];
+                int load_uid = args.instruction[6+args.iter]
                 uint64_t start_clock = clock64(), cycle_trigger = 1000000;
                 if(laneid() == 0) while(*(volatile int*)&args.globals.semaphore[{load_uid, args.common.dst.seq_idx}] != args.globals.tic) {
                     uint64_t current_clock = clock64();

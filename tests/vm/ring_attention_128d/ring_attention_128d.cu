@@ -131,10 +131,9 @@ template<typename config=config> struct RingAttentionOp {
     // v 10 11
     // alternative 12 13
     __device__ static inline int get_q_page(state<config> &s, int id)    { return id; } // use PIDs for now
-    __device__ static inline int get_a_page(state<config> &s, int id)    { return 2 + id * 2; } // 32KB megapages
-    __device__ static inline int get_o_page(state<config> &s, int id)    { return 6 + id; }
-    __device__ static inline int get_k_page(state<config> &s, int stage) { return 8 + PIPELINE_STAGES * 0 + stage; }
-    __device__ static inline int get_v_page(state<config> &s, int stage) { return 8 + PIPELINE_STAGES * 1 + stage; }
+    __device__ static inline int get_ao_page(state<config> &s, int id)   { return 2 + id * 2; } // 32KB megapages
+    __device__ static inline int get_k_page(state<config> &s, int stage) { return 6 + PIPELINE_STAGES * 0 + stage; }
+    __device__ static inline int get_v_page(state<config> &s, int stage) { return 6 + PIPELINE_STAGES * 1 + stage; }
 
     struct controller {
         static __device__ int release_lid(const globals &g, typename config::instruction_t &instruction, int &query) {
@@ -231,15 +230,14 @@ template<typename config=config> struct RingAttentionOp {
                     update_phasebit<0>(phasebit, stage);
                 }
             } else if (laneid < 6) { // Load Os for the 2 consumer warpgroups
-                // printf("Shouldn't be here\n");
-                auto o_page = get_o_page(s, laneid-4);
-                auto &o = *reinterpret_cast<qo_tile *>(s.pages[o_page].data);
-                s.wait_page_ready(o_page);
+                auto ao_page = get_ao_page(s, laneid-4);
+                auto &out = *reinterpret_cast<qo_tile *>(s.pages[ao_page].data);
+                s.wait_page_ready(ao_page);
                 if (inst.ring_stage == 0) {
                     arrive(o_arrived(s, laneid-4));
                 } else {
-                    tma::expect(o_arrived(s, laneid-4), o);
-                    tma::load_async(o, g.O, {inst.B, inst.H, inst.QO_idx + laneid-4, 0}, o_arrived(s, laneid-4));
+                    tma::expect(o_arrived(s, laneid-4), out);
+                    tma::load_async(out, g.O, {inst.B, inst.H, inst.QO_idx + laneid-4, 0}, o_arrived(s, laneid-4));
                 }
             } else if (laneid < 8) { // Load Ls and Ms for the 2 consumer warpgroups
                 auto &l = *(reinterpret_cast<lm_vec *>(
@@ -255,7 +253,7 @@ template<typename config=config> struct RingAttentionOp {
                     tma::load_async(l, g.L, {inst.B, inst.H, inst.QO_idx + laneid-6}, lm_arrived(s, laneid-6));
                     tma::load_async(m, g.M, {inst.B, inst.H, inst.QO_idx + laneid-6}, lm_arrived(s, laneid-6));
                 }
-            } else if (12 <= laneid && laneid < config::NUM_PAGES) { // Finish unused pages
+            } else if (10 <= laneid && laneid < config::NUM_PAGES) { // Finish unused pages
                 s.wait_page_ready(laneid);
                 s.finish_page(laneid, config::NUM_CONSUMER_WARPS);
             }
@@ -306,8 +304,8 @@ template<typename config=config> struct RingAttentionOp {
                     // printf("qk launched %d - %d\n", laneid, i);
                 }
             } else if (laneid < 4) { // Launch ATT @ V for the 2 consumer warpgroups
-                auto att_page = get_a_page(s, laneid-2);
-                auto &att = *reinterpret_cast<a_tile *>(s.pages[att_page].data);
+                auto ao_page = get_ao_page(s, laneid-2);
+                auto &att = *reinterpret_cast<a_tile *>(s.pages[ao_page].data);
 
                 uint32_t phasebit = 0;
                 for (int i = 0; i < inst.num_kv_blocks; ++i) {
@@ -346,8 +344,9 @@ template<typename config=config> struct RingAttentionOp {
             col_vec<rt_fl<QO_BLOCK_SIZE / 4, KV_BLOCK_SIZE>> diff_scaled_max_vec;
             col_vec<rt_fl<QO_BLOCK_SIZE / 4, HEAD_DIM>> norm_vec;
 
-            auto o_page = get_o_page(s, groupid);
-            auto &out = *reinterpret_cast<qo_tile *>(s.pages[o_page].data);
+            auto ao_page = get_ao_page(s, groupid);
+            auto &out = *reinterpret_cast<qo_tile *>(s.pages[ao_page].data);
+            auto &att = *reinterpret_cast<a_tile *>(s.pages[ao_page].data);
             auto &l = *(reinterpret_cast<lm_vec *>(
                 reinterpret_cast<char *>(s.scratch()) + ((2*(groupid)+0)*sizeof(lm_vec))
             )); // share 1 page between 2 consumers for Ls and Ms
@@ -427,11 +426,7 @@ template<typename config=config> struct RingAttentionOp {
                 warp::row_sum(norm_vec, att_fl, norm_vec);
 
                 // Prepare for AV
-                auto att_page = get_a_page(s, groupid);
-                auto &att = *reinterpret_cast<a_tile *>(s.pages[att_page].data);
-                if (i == 0) {
-                    s.wait_page_ready(att_page);
-                } else {
+                if (i > 0) {
                     // printf("waiting for av finished %d - %d\n", groupid, i);
                     wait(av_finished(s, groupid), phasebit^1); // wait for the previous mma to finish
                     // printf("av finished %d - %d\n", groupid, i);
@@ -464,8 +459,6 @@ template<typename config=config> struct RingAttentionOp {
             wait(av_finished(s, groupid), phasebit^1);
             warp::arrive(v_finished(s, (inst.num_kv_blocks - 1) % PIPELINE_STAGES));
             warpgroup::load_async(out_fl, av_accumulator);
-            s.warp_finish_page(get_a_page(s, groupid), config::NUM_CONSUMER_WARPS / 4);
-            s.warp_finish_page(get_a_page(s, groupid) + 1, config::NUM_CONSUMER_WARPS / 4); // free 2 16KB pages
             tensor_load_wait();
             __syncwarp();
             warp::arrive(s.tensor_finished);
@@ -489,12 +482,13 @@ template<typename config=config> struct RingAttentionOp {
             parsed_instruction inst{s};
             int laneid = warp::laneid();
             if (laneid < 2) { // store Os
-                int out_page = get_o_page(s, laneid);
-                auto &out = *reinterpret_cast<qo_tile *>(s.pages[out_page].data);
+                int ao_page = get_ao_page(s, laneid);
+                auto &out = *reinterpret_cast<qo_tile *>(s.pages[ao_page].data);
                 wait(o_finished(s, laneid), 0);
                 tma::store_async(g.O, out, {inst.B, inst.H, inst.QO_idx + laneid, 0});
                 tma::store_async_read_wait(); // or wait until read complete
-                s.finish_page(out_page, config::NUM_CONSUMER_WARPS);
+                s.finish_page(ao_page, config::NUM_CONSUMER_WARPS);
+                s.finish_page(ao_page + 1, config::NUM_CONSUMER_WARPS); // 2 pages, 32KB total
             } else if (laneid < 4) { // store Ls and Ms
                 auto &l = *(reinterpret_cast<lm_vec *>(
                     reinterpret_cast<char *>(s.scratch()) + ((2*(laneid-2)+0)*sizeof(lm_vec))

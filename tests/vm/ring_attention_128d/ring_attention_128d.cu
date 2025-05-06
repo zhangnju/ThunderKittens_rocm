@@ -112,6 +112,7 @@ template<typename config=config> struct RingAttentionOp {
         __device__ inline parsed_instruction(state<config> &s): parsed_instruction(s.instruction()) {}
     };
 
+    // Semaphores
     __device__ static inline semaphore &lm_arrived(state<config> &s, int id)    { return s.semaphores()[0 + id]; }
     __device__ static inline semaphore &lm_finished(state<config> &s, int id)   { return s.semaphores()[2 + id]; }
     __device__ static inline semaphore &q_arrived(state<config> &s, int id)     { return s.semaphores()[4 + id]; }
@@ -130,10 +131,12 @@ template<typename config=config> struct RingAttentionOp {
     // k 8 9
     // v 10 11
     // alternative 12 13
-    __device__ static inline int get_q_page(state<config> &s, int id)    { return id; } // use PIDs for now
-    __device__ static inline int get_ao_page(state<config> &s, int id)   { return 2 + id * 2; } // 32KB megapages
-    __device__ static inline int get_k_page(state<config> &s, int stage) { return 6 + PIPELINE_STAGES * 0 + stage; }
-    __device__ static inline int get_v_page(state<config> &s, int stage) { return 6 + PIPELINE_STAGES * 1 + stage; }
+
+    // 32KB pages (each page takes up 2 -- uses PIDs)
+    __device__ static inline int get_q_page(state<config> &s, int id)     { return 0 + id*2; }
+    __device__ static inline int get_ao_page(state<config> &s, int id)    { return 4 + id*2; }
+    __device__ static inline int get_k_page(state<config> &s, int stage)  { return 8 + PIPELINE_STAGES * 0 + stage; }
+    __device__ static inline int get_v_page(state<config> &s, int stage)  { return 8 + PIPELINE_STAGES * 1 + stage; }
 
     struct controller {
         static __device__ int release_lid(const globals &g, typename config::instruction_t &instruction, int &query) {
@@ -253,7 +256,7 @@ template<typename config=config> struct RingAttentionOp {
                     tma::load_async(l, g.L, {inst.B, inst.H, inst.QO_idx + laneid-6}, lm_arrived(s, laneid-6));
                     tma::load_async(m, g.M, {inst.B, inst.H, inst.QO_idx + laneid-6}, lm_arrived(s, laneid-6));
                 }
-            } else if (10 <= laneid && laneid < config::NUM_PAGES) { // Finish unused pages
+            } else if (12 <= laneid && laneid < config::NUM_PAGES) { // Finish unused pages
                 s.wait_page_ready(laneid);
                 s.finish_page(laneid, config::NUM_CONSUMER_WARPS);
             }
@@ -387,6 +390,7 @@ template<typename config=config> struct RingAttentionOp {
                 // printf("QK finished %d - %d\n", groupid, i);
                 if (i == inst.num_kv_blocks - 1) {
                     s.warp_finish_page(get_q_page(s, groupid), config::NUM_CONSUMER_WARPS / 4);
+                    s.warp_finish_page(get_q_page(s, groupid) + 1, config::NUM_CONSUMER_WARPS / 4); // 32KB total
                 }
                 warpgroup::load_async(att_fl, qk_accumulator);
                 tensor_load_wait();

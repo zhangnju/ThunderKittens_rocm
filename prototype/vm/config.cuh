@@ -31,7 +31,7 @@ namespace kittens
 
                 // One controller warp, one load warp, one store warp, and one mma warp.
                 static constexpr int NUM_CONSUMER_WARPS = 16;
-                static constexpr int NUM_WARPS = 4 + NUM_CONSUMER_WARPS;
+                static constexpr int NUM_WARPS = 8 + NUM_CONSUMER_WARPS;
                 static constexpr int NUM_THREADS = NUM_WARPS * ::kittens::WARP_THREADS;
                 static constexpr int NUM_BLOCKS = 1;
                 static constexpr int CLUSTER_BLOCKS = 1;
@@ -47,13 +47,24 @@ namespace kittens
                 static constexpr int NUM_PAGES = DYNAMIC_SHARED_MEMORY / PAGE_SIZE;
                 static_assert(NUM_PAGES == 13, "NUM_PAGES must be 13");
 
-                static constexpr bool TIMING_RECORD_ENABLED = true;
+                static constexpr bool TIMING_RECORD_ENABLED = false;
 
-                static constexpr bool GMEM_SPIN_LOOP_SLEEP_NANOS = 20;
+                static constexpr bool GMEM_SPIN_LOOP_SLEEP_NANOS = 200;
+
+                static constexpr int NON_CONSUMER_REGISTERS = 32;
+
+                // static_assert(NUM_CONSUMER_WARPS % 4 == 0, "NUM_CONSUMER_WARPS must be divisible by 4");
+
+                // static constexpr auto _consumers_per_quadrant = NUM_CONSUMER_WARPS / 4;
+                // // 8 non-consumer warps total
+                // static constexpr auto _remaining_reg = 511 - 2 * NON_CONSUMER_REGISTERS;
+                // static constexpr auto _registers_per_consumer = _remaining_reg / _consumers_per_quadrant;
+                // static constexpr auto _restricted_registers_per_consumer = _registers_per_consumer > 255 ? 255 : _registers_per_consumer;
+                // static constexpr auto _rounded_down_to_8 = (_restricted_registers_per_consumer / 8) * 8;
 
                 static constexpr int CONSUMER_REGISTERS = 104;
-                static constexpr int NON_CONSUMER_REGISTERS = 64;
             };
+
             template <typename config>
             using instruction_layout = gl<int, 1, -1, -1, config::INSTRUCTION_WIDTH>;
             template <typename config>

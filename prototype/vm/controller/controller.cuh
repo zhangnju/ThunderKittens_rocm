@@ -32,7 +32,6 @@ namespace kittens
                          kvms.instruction_index < num_iters;
                          kvms.instruction_index++, kvms.instruction_ring = ring_advance<config::INSTRUCTION_PIPELINE_STAGES>(kvms.instruction_ring))
                     {
-
                         // Step 0. if the slot was used in the previous iteration, wait for the previous instruction to complete & invalidate its semaphores
                         if (kvms.instruction_index >= config::INSTRUCTION_PIPELINE_STAGES)
                         {
@@ -51,7 +50,8 @@ namespace kittens
 
                             if (laneid == 0)
                             {
-                                if constexpr(config::TIMING_RECORD_ENABLED) {
+                                if constexpr (config::TIMING_RECORD_ENABLED)
+                                {
                                     kvms.record(TEVENT_CONTROLLER_END);
                                     store_timings_and_reset<config, globals>(&kvms.all_instructions[kvms.instruction_ring].timings[0], last_slot_instruction_index, g);
                                 }

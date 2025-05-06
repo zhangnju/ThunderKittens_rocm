@@ -10,19 +10,17 @@ namespace kittens
         namespace vm
         {
 
-            template <typename config>
-            struct NoOp
+            template <typename config, typename globals>
+            struct BaseOp
             {
                 static constexpr int opcode = 0;
 
                 struct controller
                 {
-                    template <typename globals>
                     static __device__ int release_lid(const globals &g, typename config::instruction_t &instruction, int &query)
                     {
                         return query;
                     }
-                    template <typename globals>
                     static __device__ int init_semaphores(const globals &g, state<config> &s)
                     {
                         return 0;
@@ -30,7 +28,6 @@ namespace kittens
                 };
                 struct loader
                 {
-                    template <typename globals>
                     static __device__ void run(const globals &g, state<config> &s)
                     {
                         if (laneid() < config::NUM_PAGES)
@@ -41,10 +38,17 @@ namespace kittens
                         }
                     }
                 };
+                struct sync_loader
+                {
+                    static __device__ void run(const globals &g, state<config> &s) {}
+                };
+                struct prefetcher
+                {
+                    static __device__ void run(const globals &g, state<config> &s) {}
+                };
                 struct launcher
                 { // launches mma's
                     // launcher does nothing here, since this doesn't use tensor cores.
-                    template <typename globals>
                     static __device__ void run(const globals &g, state<config> &s)
                     {
                         s.wait_tensor_ready();
@@ -54,15 +58,28 @@ namespace kittens
                 };
                 struct consumer
                 {
-                    template <typename globals>
                     static __device__ void run(const globals &g, state<config> &s) {}
                 };
                 struct storer
                 {
-                    // Uses 4 full pages for outputs.
-                    template <typename globals>
                     static __device__ void run(const globals &g, state<config> &s) {}
                 };
+
+                struct greg
+                {
+                    static __device__ void run(const globals &g, state<config> &s) {}
+                };
+
+                struct greg2
+                {
+                    static __device__ void run(const globals &g, state<config> &s) {}
+                };
+            };
+
+            template <typename config, typename globals>
+            struct NoOp : BaseOp<config, globals>
+            {
+                static constexpr int opcode = 0;
             };
 
         } // namespace vm

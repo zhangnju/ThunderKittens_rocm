@@ -200,8 +200,11 @@ constexpr int TEVENT_CONTROLLER_END = 4;
 constexpr int TEVENT_LOADER_START = 5;
 constexpr int TEVENT_LAUNCHER_START = 7;
 constexpr int TEVENT_STORER_START = 9;
+constexpr int TEVENT_SYNC_LOADER_START = 11;
+constexpr int TEVENT_PREFETCHER_START = 13;
+
 // need NUM_CONSUMER_WARPS * 2 slots here
-constexpr int TEVENT_CONSUMER_START = 11;
+constexpr int TEVENT_CONSUMER_START = 15;
 
 constexpr int TEVENT_AT_GMEM_WAIT = 44;
 constexpr int TEVENT_DONE_GMEM_WAIT = 45;
@@ -249,18 +252,18 @@ template<typename config, typename globals, typename... ops> __device__ void mai
     int num_iters = g.instructions.rows(); \
     for(kvms.instruction_index = 0, kvms.instruction_ring = 0; kvms.instruction_index < num_iters; kvms.next_instruction()) { \
         kvms.await_instruction(); \
-        if (laneid() == 0) { \
+        if (laneid() == 0 && start_event != -1) { \
             if (is_consumer) { \
-                kvms.record(start_event + warpid()); \
+                kvms.record(start_event + 2 * warpid()); \
             } \
             else { \
                 kvms.record(start_event); \
             } \
         } \
         dispatch_op<name##_op_dispatcher<config, globals>::dispatcher, ops...>::template run<void, config, globals, ::kittens::prototype::vm::state<config>>(kvms.instruction()[0], g, kvms); \
-        if (laneid() == 0) { \
+        if (laneid() == 0 && start_event != -1) { \
             if (is_consumer) { \
-                kvms.record(start_event + config::NUM_CONSUMER_WARPS + warpid()); \
+                kvms.record(start_event + 2 * warpid() + 1); \
             } \
             else { \
                 kvms.record(start_event + 1); \

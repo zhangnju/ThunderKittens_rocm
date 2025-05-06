@@ -10,7 +10,8 @@
 #include "storer.cuh"
 #include "loader.cuh"
 #include "consumer.cuh"
-#include "noop.cuh"
+#include "greg.cuh"
+#include "op.cuh"
 
 namespace kittens
 {
@@ -115,20 +116,36 @@ namespace kittens
                 else
                 {
                     warpgroup::decrease_registers<config::NON_CONSUMER_REGISTERS>();
-                    switch (warpgroup::warpid())
+
+                    auto warp_id_minus_consumers = warpid() - config::NUM_CONSUMER_WARPS;
+
+                    switch (warp_id_minus_consumers)
                     {
                     case 0:
-                        ::kittens::prototype::vm::loader::main_loop<config, globals, ops...>(g, kvms);
-                        break;
-                    case 1:
-                        ::kittens::prototype::vm::storer::main_loop<config, globals, ops...>(g, kvms);
-                        break;
-                    case 2:
-                        ::kittens::prototype::vm::launcher::main_loop<config, globals, ops...>(g, kvms);
-                        break;
-                    case 3:
                         ::kittens::prototype::vm::controller::main_loop<config, globals, ops...>(g, kvms);
                         break;
+                    case 1:
+                        ::kittens::prototype::vm::loader::main_loop<config, globals, ops...>(g, kvms);
+                        break;
+                    case 2:
+                        ::kittens::prototype::vm::sync_loader::main_loop<config, globals, ops...>(g, kvms);
+                        break;
+                    case 3:
+                        ::kittens::prototype::vm::storer::main_loop<config, globals, ops...>(g, kvms);
+                        break;
+                    case 4:
+                        ::kittens::prototype::vm::prefetcher::main_loop<config, globals, ops...>(g, kvms);
+                        break;
+                    case 5:
+                        ::kittens::prototype::vm::launcher::main_loop<config, globals, ops...>(g, kvms);
+                        break;
+                    case 6:
+                        ::kittens::prototype::vm::greg::main_loop<config, globals, ops...>(g, kvms);
+                        break;
+                    case 7:
+                        ::kittens::prototype::vm::greg2::main_loop<config, globals, ops...>(g, kvms);
+                        break;
+
                     default:
                         asm volatile("trap;");
                     }
@@ -156,7 +173,7 @@ namespace kittens
             {
                 __device__ inline static void run(const globals &g)
                 {
-                    kvm_internal<config, globals, NoOp<config>, ops...>(g);
+                    kvm_internal<config, globals, NoOp<config, globals>, ops...>(g);
                 }
             };
 

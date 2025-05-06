@@ -9,10 +9,10 @@ import numpy as np
 ###
 NUM_DEVICES = 4
 NUM_COMMS = 8 # this is the magic number that works the best
-NUM_ITERS = 10
+NUM_ITERS = 5
 ATTN_OPCODE = 725
 COMM_OPCODE = 97
-B, H, N, D_h = 16, 16, 4096*NUM_DEVICES, 64
+B, H, N, D_h = 16, 16, 16384*NUM_DEVICES, 64
 
 assert N%NUM_DEVICES==0, "N must be divisible by NUM_DEVICES"
 assert (N//NUM_DEVICES)%256==0, "N_per_dev must be divisible by 256 (QO Block Size * 2)"
@@ -61,23 +61,23 @@ for torch_device in torch_devices:
     dev_instructions = [[] for _ in range(148)]
 
     # Comm Ops
-    num_comms_per_kv = NUM_COMMS // 2
-    num_chunks_N = N_per_dev // 128
-    total_chunks = B * H * num_chunks_N
-    num_chunks_per_comm = total_chunks // (num_comms_per_kv)
-    print('total_chunks:', total_chunks)
-    print('num_chunks_per_comm:', num_chunks_per_comm)
-    print('num_chunks_N:', num_chunks_N)
-    assert NUM_COMMS % 2 == 0, "NUM_COMMS must be even"
-    assert total_chunks % (num_comms_per_kv) == 0, "total_chunks must be divisible by NUM_COMMS / 2"
-    num_comps = B * H * num_qo_blocks
-    for i in range(NUM_COMMS):
-        k_or_v = i // (num_comms_per_kv)
-        comm_idx = i % (num_comms_per_kv)
-        dev_instructions[i].append(
-            [COMM_OPCODE, k_or_v, num_chunks_per_comm, comm_idx, NUM_COMMS, num_comps, num_chunks_N, H, dev_idx, prev_dev_idx, next_dev_idx] 
-            + [0]*21
-        )
+    # num_comms_per_kv = NUM_COMMS // 2
+    # num_chunks_N = N_per_dev // 128
+    # total_chunks = B * H * num_chunks_N
+    # num_chunks_per_comm = total_chunks // (num_comms_per_kv)
+    # print('total_chunks:', total_chunks)
+    # print('num_chunks_per_comm:', num_chunks_per_comm)
+    # print('num_chunks_N:', num_chunks_N)
+    # assert NUM_COMMS % 2 == 0, "NUM_COMMS must be even"
+    # assert total_chunks % (num_comms_per_kv) == 0, "total_chunks must be divisible by NUM_COMMS / 2"
+    # num_comps = B * H * num_qo_blocks
+    # for i in range(NUM_COMMS):
+    #     k_or_v = i // (num_comms_per_kv)
+    #     comm_idx = i % (num_comms_per_kv)
+    #     dev_instructions[i].append(
+    #         [COMM_OPCODE, k_or_v, num_chunks_per_comm, comm_idx, NUM_COMMS, num_comps, num_chunks_N, H, dev_idx, prev_dev_idx, next_dev_idx] 
+    #         + [0]*21
+    #     )
 
     # Compute Ops
     instruction_idx = 0
@@ -86,7 +86,7 @@ for torch_device in torch_devices:
             for head_idx in range(H):
                 for qo_idx in range(num_qo_blocks):
                     dev_instructions[NUM_COMMS+(instruction_idx%(148-NUM_COMMS))].append(
-                        [ATTN_OPCODE, batch_idx, head_idx, qo_idx*2, num_kv_blocks, ring_stage, NUM_COMMS, num_comps, dev_idx]
+                        [ATTN_OPCODE, batch_idx, head_idx, qo_idx*2, num_kv_blocks, ring_stage, 0, 0, dev_idx]
                         + [0]*23
                     )
                     instruction_idx += 1

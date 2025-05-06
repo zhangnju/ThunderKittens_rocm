@@ -18,7 +18,7 @@ namespace kittens::prototype::vm
     using o_final_sv = sv_bf<globals::head_dim>;
 
     template <typename Config, typename Globals>
-    struct attention_reduction
+    struct attention_reduction : BaseOp<Config, Globals>
     {
         static constexpr int opcode = OPCODE_AttentionReduction;
         static constexpr int prev_opcode = OPCODE_PartialAttention;

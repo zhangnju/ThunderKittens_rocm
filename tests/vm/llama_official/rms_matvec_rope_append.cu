@@ -11,7 +11,7 @@ namespace kittens::prototype::vm
     using globals = llama_1b_globals;
 
     template <typename Config, typename Globals>
-    struct rms_qkv_rope_append
+    struct rms_qkv_rope_append : BaseOp<Config, Globals>
     {
         static constexpr int opcode = OPCODE_RMS_QKV_MatVecRopeAppend; // Op index within the layer -- controls which barrier to listen to.
 
@@ -148,21 +148,21 @@ namespace kittens::prototype::vm
                 pipeline::loader_loop<&Globals::attn_norm_weights>(s, g, inst.layer_idx);
             }
         };
-        struct launcher
+        struct sync_loader
         {
             static __device__ void run(const Globals &g, state<Config> &s)
             {
-
                 parsed_instruction inst{s};
-                pipeline::launcher_loop<&Globals::hidden_states>(s, g);
+                pipeline::sync_loader<&Globals::hidden_states>(s, g);
             }
         };
         struct consumer
         {
             static __device__ void run(const Globals &g, state<Config> &s)
             {
+
                 pipeline::consumer_loop(s, g);
-            }
+            };
         };
         struct storer
         {
@@ -170,7 +170,7 @@ namespace kittens::prototype::vm
             static __device__ void run(const Globals &g, state<Config> &s)
             {
                 pipeline::storer_loop(s, g);
-            }
+            };
         };
     };
 }

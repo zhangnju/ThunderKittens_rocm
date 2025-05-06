@@ -20,7 +20,7 @@ namespace kittens::prototype::vm
         typename Config = kittens::prototype::vm::default_config,
         typename Globals = llama_1b_globals>
 
-    struct MatVecAddOp
+    struct MatVecAddOp : BaseOp<Config, Globals>
     {
         static constexpr int opcode = _opcode;
         static constexpr int prev_opcode = _prev_opcode;
@@ -100,7 +100,7 @@ namespace kittens::prototype::vm
                 pipeline::loader_loop(s, g);
             }
         };
-        struct launcher
+        struct sync_loader
         {
             static __device__ void run(const globals &g, state<Config> &s)
             {
@@ -108,8 +108,8 @@ namespace kittens::prototype::vm
                 {
                     parsed_instruction inst{s};
 
-                    s.wait_tensor_ready();
-                    arrive(s.tensor_finished, Config::NUM_CONSUMER_WARPS);
+                    // s.wait_tensor_ready();
+                    // arrive(s.tensor_finished, Config::NUM_CONSUMER_WARPS);
 
                     int activation_page = pipeline::get_activation_page(s);
                     s.wait_page_ready(activation_page);

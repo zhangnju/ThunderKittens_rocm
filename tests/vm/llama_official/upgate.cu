@@ -10,7 +10,7 @@ namespace kittens::prototype::vm
     using config = default_config;
 
     template <typename Config, typename Globals>
-    struct rms_upgate_silu
+    struct rms_upgate_silu : BaseOp<Config, Globals>
     {
         static constexpr int opcode = OPCODE_RMS_DoubleMatVecSiLU; // Op index within the layer -- controls which barrier to listen to.
         static constexpr int prev_opcode = OPCODE_O_ProjResidual;
@@ -137,13 +137,13 @@ namespace kittens::prototype::vm
             }
         };
 
-        struct launcher
+        struct sync_loader
         {
             // launcher does nothing here, since this doesn't use tensor cores.
             static __device__ void run(const Globals &g, state<Config> &s)
             {
                 parsed_instruction inst{s};
-                pipeline::launcher_loop<&Globals::hidden_states>(s, g);
+                pipeline::sync_loader<&Globals::hidden_states>(s, g);
             }
         };
 

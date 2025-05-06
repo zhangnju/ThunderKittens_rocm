@@ -11,7 +11,7 @@ namespace kittens::prototype::vm
     using globals = llama_1b_globals;
 
     template <typename Config, typename Globals>
-    struct rms_lm_head
+    struct rms_lm_head : BaseOp<Config, Globals>
     {
         static constexpr int opcode = OPCODE_RMS_LM_Head; // Op index within the layer -- controls which barrier to listen to.
         static constexpr int EXPECTED_ARRIVAL_COUNT = 512;
@@ -97,11 +97,11 @@ namespace kittens::prototype::vm
                 pipeline::loader_loop<&Globals::lm_head_norm_weights>(s, g, 0);
             }
         };
-        struct launcher
+        struct sync_loader
         {
             static __device__ void run(const Globals &g, state<Config> &s)
             {
-                pipeline::launcher_loop<&Globals::hidden_states>(s, g);
+                pipeline::sync_loader<&Globals::hidden_states>(s, g);
             }
         };
         struct consumer

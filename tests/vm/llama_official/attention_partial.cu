@@ -7,7 +7,7 @@ namespace kittens::prototype::vm
 {
 
     template <typename config, typename globals>
-    struct attention_partial
+    struct attention_partial : BaseOp<config, globals>
     {
         static constexpr int opcode = OPCODE_PartialAttention;
         static constexpr int NUM_STAGES = 3;
@@ -417,8 +417,7 @@ namespace kittens::prototype::vm
                         // Perform Q @ K.T
                         warp::zero(attn_fl_reg);
                         warp::wait(K_arrived(s, stage), (i / NUM_STAGES) % 2);
-                        if (laneid() == 0 && i < 16)
-                            s.record(TEVENT_CONSUMER_START + 32 + i);
+
                         warp::load(K_reg, K_smem);
                         warp::mma_ABt(attn_fl_reg, Q_reg, K_reg, attn_fl_reg);
                         warp::sync();
@@ -446,8 +445,7 @@ namespace kittens::prototype::vm
                         // Normalize and accumulate numerator (A @ V)
                         warp::mul_row(O_reg, O_reg, diff_scaled_max_vec_reg);
                         warp::wait(V_arrived(s, stage), (i / NUM_STAGES) % 2);
-                        if (laneid() == 0 && i < 16)
-                            s.record(TEVENT_CONSUMER_START + 48 + i);
+
                         warp::load(V_reg, V_smem);
                         warp::copy(attn_bf_reg, attn_fl_reg); // Convert to bf16 to do matmul
                         warp::mma_AB(O_reg, attn_bf_reg, V_reg, O_reg);
@@ -580,7 +578,6 @@ namespace kittens::prototype::vm
                 tma::store_async_wait();
                 if (laneid == 0)
                 {
-                    s.record(123 + laneid);
                     finish_QOL_page(s);
                 }
 

@@ -149,6 +149,7 @@ namespace kittens::prototype::vm
             int input_stage = 0, output_stage = 0;
             for (int i = 0; i < inst.iters; i++)
             {
+
                 int weight_page = get_weight_page(s, input_stage, page_index);
                 wait(weights_arrived(s, input_stage), (i % (2 * INPUT_PIPELINE_STAGES)) >= INPUT_PIPELINE_STAGES);
                 wait(outputs_finished(s, output_stage), (i % (2 * OUTPUT_PIPELINE_STAGES)) < OUTPUT_PIPELINE_STAGES);
@@ -171,7 +172,7 @@ namespace kittens::prototype::vm
                     }
                 }
 
-                group<Config::NUM_CONSUMER_WARPS>::sync(0);
+                group<Config::NUM_CONSUMER_WARPS>::sync(1);
 
                 input_stage = (input_stage + 1) % INPUT_PIPELINE_STAGES;
                 output_stage = (output_stage + 1) % OUTPUT_PIPELINE_STAGES;
@@ -272,12 +273,12 @@ namespace kittens::prototype::vm
         // }
 
         template <auto ActPtr>
-        __device__ static inline void launcher_loop(state<Config> &s, const Globals &g)
+        __device__ static inline void sync_loader(state<Config> &s, const Globals &g)
         {
             if (laneid() == 0)
             {
-                s.wait_tensor_ready();
-                arrive(s.tensor_finished, Config::NUM_CONSUMER_WARPS);
+                // s.wait_tensor_ready();
+                // arrive(s.tensor_finished, Config::NUM_CONSUMER_WARPS);
 
                 parsed_instruction inst{s};
 
@@ -300,6 +301,7 @@ namespace kittens::prototype::vm
 
         __device__ static inline void consumer_loop(state<Config> &s, const Globals &g)
         {
+
             auto activation_page = get_activation_page(s);
 
             wait(rms_scale_arrived(s), 0);

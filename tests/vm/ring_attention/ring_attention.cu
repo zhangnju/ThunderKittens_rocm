@@ -472,9 +472,11 @@ template<typename config=config> struct RingAttentionOp {
                 tma::store_async_read_wait();
                 s.finish_page(lm_page, config::NUM_CONSUMER_WARPS / 2);
             }
-            tma::store_async_wait();
-            __syncwarp(); // TODO maybe not the best place to increase the barrier
-            if (laneid == 0) atomicAdd_system(&g.barriers[inst.dev_idx][{inst.ring_stage}], 1); // signal the next ring stage comms
+            __syncwarp();
+            if (laneid == 0) {
+                tma::store_async_wait();
+                atomicAdd_system(&g.barriers[inst.dev_idx][{inst.ring_stage}], 1); // signal the next ring stage comms
+            }
         }
     };
 };

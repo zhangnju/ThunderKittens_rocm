@@ -3,7 +3,7 @@ NVCC?=nvcc
 GPU=B200
 
 TARGET=ring_attention
-SRC=ring_attention_64d.cu
+SRC=ring_attention_128d.cu
 
 # Python version configuration
 ifndef PYTHON_VERSION

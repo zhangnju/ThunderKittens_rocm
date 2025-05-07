@@ -101,7 +101,7 @@ template<typename config=config> struct RingAttentionOp {
 
     static_assert(NUM_CONSUMERS == 2);
     static_assert(WARPS_PER_CONSUMER == 8);
-    static_assert(config::NUM_CONSUMER_WARPS == WARPS_PER_CONSUMER*config::NUM_CONSUMERS, 
+    static_assert(config::NUM_CONSUMER_WARPS == WARPS_PER_CONSUMER*NUM_CONSUMERS, 
                   "RingAttentionOp requires 16 consumer warpgroups.");
 
     struct parsed_instruction {
@@ -187,7 +187,7 @@ template<typename config=config> struct RingAttentionOp {
             if (laneid < 2) { // Load Q for the 2 consumer warpgroups
                 int consumer_id = laneid;
                 auto q_page = get_q_page(s, consumer_id);
-                auto &q = *reinterpret_cast<qo_tile *>(s.pages[q_page].data);
+                auto &q = *reinterpret_cast<q_tile *>(s.pages[q_page].data);
                 s.wait_page_ready(q_page);
                 tma::cluster::expect(q_arrived(s, consumer_id), 0, q);
                 tma::cluster::load_async(q, g.Q, {inst.B, inst.H, inst.QO_idx + consumer_id, 0}, q_arrived(s, consumer_id), (uint16_t)(1<<ctarank), 0);
@@ -243,7 +243,7 @@ template<typename config=config> struct RingAttentionOp {
             } else if (laneid < 6) { // Load Os for the 2 consumer warpgroups
                 int consumer_id = laneid - 4;
                 auto ao_page = get_ao_page(s, consumer_id);
-                auto &out = *reinterpret_cast<qo_tile *>(s.pages[ao_page].data);
+                auto &out = *reinterpret_cast<o_tile *>(s.pages[ao_page].data);
                 s.wait_page_ready(ao_page);
                 if (inst.ring_stage == 0) {
                     arrive(o_arrived(s, consumer_id));
@@ -286,7 +286,7 @@ template<typename config=config> struct RingAttentionOp {
                 if (laneid < 2) { // Launch Q @ K^T for the 2 consumer warpgroups
                     int consumer_id = laneid;
                     auto q_page = get_q_page(s, consumer_id);
-                    auto &q = *reinterpret_cast<qo_tile *>(s.pages[q_page].data);
+                    auto &q = *reinterpret_cast<q_tile *>(s.pages[q_page].data);
                     wait(q_arrived(s, consumer_id), 0);
                     
                     uint32_t phasebit = 0;
@@ -297,10 +297,10 @@ template<typename config=config> struct RingAttentionOp {
                             update_phasebit<1>(phasebit, consumer_id);
                         }
                         auto k_page = get_k_page(s, stage);
-                        auto &k = *reinterpret_cast<kv_tile *>(s.pages[k_page].data);
+                        auto &k = *reinterpret_cast<k_tile *>(s.pages[k_page].data);
                         tma::cluster::wait(k_arrived(s, stage), get_phasebit<0>(phasebit, stage));
                         update_phasebit<0>(phasebit, stage);
-                        auto qk_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, KV_BLOCK_SIZE>>(0, consumer_id*KV_BLOCK_SIZE);
+                        auto qk_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, KV_BLOCK_SIZE>>(consumer_id*KV_BLOCK_SIZE);
                         mm2_ABt(qk_accumulator, q, k, qk_finished(s, consumer_id));
                     }
                 } else if (laneid < 4) { // Launch ATT @ V for the 2 consumer warpgroups
@@ -312,7 +312,7 @@ template<typename config=config> struct RingAttentionOp {
                     for (int i = 0; i < inst.num_kv_blocks; ++i) {
                         int stage = i % PIPELINE_STAGES;
                         auto v_page = get_v_page(s, stage);
-                        auto &v = *reinterpret_cast<kv_tile *>(s.pages[v_page].data);
+                        auto &v = *reinterpret_cast<v_tile *>(s.pages[v_page].data);
                         tma::cluster::wait(v_arrived(s, stage), get_phasebit<0>(phasebit, stage));
                         update_phasebit<0>(phasebit, stage);
                         tma::cluster::wait(av_ready(s, consumer_id), get_phasebit<1>(phasebit, consumer_id));
@@ -346,7 +346,7 @@ template<typename config=config> struct RingAttentionOp {
             col_vec<rt_fl<QO_BLOCK_SIZE / 8, HEAD_DIM>> norm_vec;
 
             auto ao_page = get_ao_page(s, consumer_id);
-            auto &out = *reinterpret_cast<qo_tile *>(s.pages[ao_page].data);
+            auto &out = *reinterpret_cast<o_tile *>(s.pages[ao_page].data);
             auto &att = *reinterpret_cast<a_tile *>(s.pages[ao_page].data);
             auto &l = *(reinterpret_cast<lm_vec *>(
                 reinterpret_cast<char *>(s.scratch()) + ((2*(consumer_id)+0)*sizeof(lm_vec))
@@ -418,7 +418,7 @@ template<typename config=config> struct RingAttentionOp {
                     tma::cluster::wait(av_finished(s, consumer_id), get_phasebit<1>(phasebit, 0));
                     update_phasebit<1>(phasebit, 0);
                     int prev_stage = (i + PIPELINE_STAGES - 1) % PIPELINE_STAGES;
-                    if (consumer::lanieid() == 0) arrive(v_finished(s, prev_stage));
+                    if (consumer::laneid() == 0) arrive(v_finished(s, prev_stage));
                     consumer::load_async(out_fl, av_accumulator);
                     tensor_load_wait(); // TODO: is this needed?
                     __syncwarp();       // TODO: is this needed?
@@ -434,7 +434,7 @@ template<typename config=config> struct RingAttentionOp {
 
             // Wait for the last AV matmul to finish and load the final output
             tma::cluster::wait(av_finished(s, consumer_id), get_phasebit<1>(phasebit, 0));
-            if (consumer::lanieid() == 0) arrive(v_finished(s, (inst.num_kv_blocks - 1) % PIPELINE_STAGES));
+            if (consumer::laneid() == 0) arrive(v_finished(s, (inst.num_kv_blocks - 1) % PIPELINE_STAGES));
             consumer::load_async(out_fl, av_accumulator);
             tensor_load_wait(); // TODO: is this needed?
             __syncwarp();       // TODO: is this needed?

@@ -22,43 +22,30 @@ using comm_tile = st_bf<COMM_CHUNK_LENGTH, HEAD_DIM>; // Full 16KB page
 
 struct ring_attention_config
 {
-    // Instruction pipeline
-    static constexpr int INSTRUCTION_PIPELINE_STAGES = 2; // No point in having more than 2 stages for ring attention
-
-    // num bits required to represent num pipeline stages
+    // Ring-attention specific
+    static constexpr int INSTRUCTION_PIPELINE_STAGES = 2; // 12 pages are used for ring attention
     static constexpr int INSTRUCTION_PIPELINE_STAGES_BITS = 1;
+    static constexpr int NUM_CONSUMER_WARPS = 16;
+    static constexpr int CLUSTER_BLOCKS = 2; // for 2-CTA cooperative matmuls
+    static constexpr int SCRATCH_BYTES = 4096; // Need at least 2048
+    static constexpr int CONSUMER_REGISTERS = 104;
+    static constexpr int NON_CONSUMER_REGISTERS = 64;
 
-    static constexpr int INSTRUCTION_WIDTH = 32; // 128 bytes per instruction.
+    // Same as default
+    static constexpr int INSTRUCTION_WIDTH = 32;
     using instruction_t = int[INSTRUCTION_WIDTH];
-
-    // Timing info
     static constexpr int TIMING_WIDTH = 128;
     using timing_t = int[TIMING_WIDTH];
-
-    // How many semaphores are available for dynamic use?
     static constexpr int DYNAMIC_SEMAPHORES = 32;
-
-    // One controller warp, one load warp, one store warp, and one mma warp.
-    static constexpr int NUM_CONSUMER_WARPS = 16;
     static constexpr int NUM_WARPS = 4 + NUM_CONSUMER_WARPS;
     static constexpr int NUM_THREADS = NUM_WARPS * ::kittens::WARP_THREADS;
     static constexpr int NUM_BLOCKS = 1; // unused
-    static constexpr int CLUSTER_BLOCKS = 2; // Use 2 CTAs for cooperative matmuls
     static constexpr int MAX_SHARED_MEMORY = kittens::MAX_SHARED_MEMORY;
-
-    // Shared memory declared statically
-    static constexpr int SCRATCH_BYTES = 4096; // Need at least 2048 for ring attention
     static constexpr int STATIC_SHARED_MEMORY = 1024 + INSTRUCTION_PIPELINE_STAGES * (SCRATCH_BYTES + (INSTRUCTION_WIDTH + TIMING_WIDTH) * 4 + DYNAMIC_SEMAPHORES * 8);
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
-
-    // Shared memory declared dynamically
     static constexpr int PAGE_SIZE = 16384;
     static constexpr int NUM_PAGES = DYNAMIC_SHARED_MEMORY / PAGE_SIZE;
     static_assert(NUM_PAGES == 13, "NUM_PAGES must be 13");
-
-    // Register usage
-    static constexpr int CONSUMER_REGISTERS = 104;
-    static constexpr int NON_CONSUMER_REGISTERS = 64;
 };
 using config = ring_attention_config;
 
@@ -107,7 +94,7 @@ template<typename config=config> struct RingAttentionOp {
     struct parsed_instruction {
         int B;             // batch index              (in units of 1)
         int H;             // head index               (in units of 1)
-        int QO_idx;        // local Q block index      (in units of `QO_BLOCK_SIZE * 2` tokens)
+        int QO_idx;        // Q block index      (in units of `QO_BLOCK_SIZE * 4` tokens)
         int num_kv_blocks; // # of KV blocks to handle (in units of `KV_BLOCK_SIZE` tokens)
         int ring_stage;    // current ring stage index (0, 1, ..., NUM_DEVS - 1)
         int num_comms;     // number of SMs doing comms
@@ -153,16 +140,23 @@ template<typename config=config> struct RingAttentionOp {
             return lids[query];
         }
         static __device__ int init_semaphores(const globals &g, state<config> &s) {
+
+            // parsed_instruction inst{s};
+            // auto clusterid = clusterIdx();
+            // int ctarank = cluster_ctarank();
+            // printf("blkidx: %d, ctarank: %d, inst.QO_idx: %d, inst.H: %d, inst.B: %d, inst.num_kv_blocks: %d, inst.ring_stage: %d, inst.num_comms: %d, inst.num_comps: %d, inst.dev_idx: %d, clusterid.x: %d, clusterid.y: %d, clusterid.z: %d\n",
+            //     blockIdx.x, ctarank, inst.QO_idx, inst.H, inst.B, inst.num_kv_blocks, inst.ring_stage, inst.num_comms, inst.num_comps, inst.dev_idx, clusterid.x, clusterid.y, clusterid.z);
+
             for (int i = 0; i < NUM_CONSUMERS; ++i) {
-                init_semaphore(q_arrived(s, i), 0, 2);    // 2 CTAs
-                init_semaphore(qk_unloaded(s, i), 0, 16); // 8 warps per consumer * 2 CTAs
-                init_semaphore(av_ready(s, i), 0, 16);    // 8 warps per consumer * 2 CTAs
+                init_semaphore(q_arrived(s, i), 0, 2); // 2 CTAs
+                init_semaphore(qk_unloaded(s, i), 0, WARPS_PER_CONSUMER * 2); // 8 warps per consumer * 2 CTAs
+                init_semaphore(av_ready(s, i), 0, WARPS_PER_CONSUMER * 2);    // 8 warps per consumer * 2 CTAs
                 init_semaphore(qk_finished(s, i), 0, 1);
                 init_semaphore(av_finished(s, i), 0, 1);
                 init_semaphore(o_arrived(s, i), 1);
                 init_semaphore(lm_arrived(s, i), 1);
-                init_semaphore(o_finished(s, i), 8);  // 8 warps per consumer
-                init_semaphore(lm_finished(s, i), 8); // 8 warps per consumer
+                init_semaphore(o_finished(s, i), WARPS_PER_CONSUMER);  // 8 warps per consumer
+                init_semaphore(lm_finished(s, i), WARPS_PER_CONSUMER); // 8 warps per consumer
             }
             for (int i = 0; i < PIPELINE_STAGES; ++i) {
                 init_semaphore(k_arrived(s, i), 0, 2);  // 2 CTAs
@@ -190,8 +184,7 @@ template<typename config=config> struct RingAttentionOp {
                 auto &q = *reinterpret_cast<q_tile *>(s.pages[q_page].data);
                 s.wait_page_ready(q_page);
                 tma::cluster::expect(q_arrived(s, consumer_id), 0, q);
-                tma::cluster::load_async(q, g.Q, {inst.B, inst.H, inst.QO_idx + consumer_id, 0}, q_arrived(s, consumer_id), (uint16_t)(1<<ctarank), 0);
-                // printf("Q load start %d\n", laneid);
+                tma::cluster::load_async(q, g.Q, {inst.B, inst.H, inst.QO_idx + NUM_CONSUMERS*ctarank + consumer_id, 0}, q_arrived(s, consumer_id), (uint16_t)(1<<ctarank), 0);
             } else if (laneid == 2) { // Load Ks
                 uint32_t phasebit = 0;
                 for (int i = 0; i < inst.num_kv_blocks; i++) {
@@ -327,8 +320,8 @@ template<typename config=config> struct RingAttentionOp {
 
     struct consumer {
         static __device__ void run(const globals &g, state<config> &s) {
-            using all_consumers = group<NUM_CONSUMERS*8>;
-            using consumer = group<8>;
+            using all_consumers = group<NUM_CONSUMERS*WARPS_PER_CONSUMER>;
+            using consumer = group<WARPS_PER_CONSUMER>;
             
             constexpr float softmax_scale = 0.08838834764831843f;          // 1 / sqrt(HEAD_DIM=128)
             constexpr float softmax_temp = softmax_scale * 1.44269504089f; // 1 / {sqrt(HEAD_DIM=128) * ln(2)}
@@ -337,13 +330,13 @@ template<typename config=config> struct RingAttentionOp {
             int ctarank = cluster_ctarank();
             int consumer_id = consumer::groupid();
 
-            rt_fl<QO_BLOCK_SIZE / 8, KV_BLOCK_SIZE> att_fl;
-            rt_fl<QO_BLOCK_SIZE / 8, HEAD_DIM> out_fl;
-            col_vec<rt_fl<QO_BLOCK_SIZE / 8, KV_BLOCK_SIZE>> max_vec;
-            col_vec<rt_fl<QO_BLOCK_SIZE / 8, KV_BLOCK_SIZE>> scaled_max_vec;
-            col_vec<rt_fl<QO_BLOCK_SIZE / 8, KV_BLOCK_SIZE>> last_scaled_max_vec;
-            col_vec<rt_fl<QO_BLOCK_SIZE / 8, KV_BLOCK_SIZE>> diff_scaled_max_vec;
-            col_vec<rt_fl<QO_BLOCK_SIZE / 8, HEAD_DIM>> norm_vec;
+            rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE> att_fl;
+            rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, HEAD_DIM> out_fl;
+            col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> max_vec;
+            col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> scaled_max_vec;
+            col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> last_scaled_max_vec;
+            col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> diff_scaled_max_vec;
+            col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, HEAD_DIM>> norm_vec;
 
             auto ao_page = get_ao_page(s, consumer_id);
             auto &out = *reinterpret_cast<o_tile *>(s.pages[ao_page].data);

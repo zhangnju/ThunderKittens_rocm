@@ -140,13 +140,6 @@ template<typename config=config> struct RingAttentionOp {
             return lids[query];
         }
         static __device__ int init_semaphores(const globals &g, state<config> &s) {
-
-            // parsed_instruction inst{s};
-            // auto clusterid = clusterIdx();
-            // int ctarank = cluster_ctarank();
-            // printf("blkidx: %d, ctarank: %d, inst.QO_idx: %d, inst.H: %d, inst.B: %d, inst.num_kv_blocks: %d, inst.ring_stage: %d, inst.num_comms: %d, inst.num_comps: %d, inst.dev_idx: %d, clusterid.x: %d, clusterid.y: %d, clusterid.z: %d\n",
-            //     blockIdx.x, ctarank, inst.QO_idx, inst.H, inst.B, inst.num_kv_blocks, inst.ring_stage, inst.num_comms, inst.num_comps, inst.dev_idx, clusterid.x, clusterid.y, clusterid.z);
-
             for (int i = 0; i < NUM_CONSUMERS; ++i) {
                 init_semaphore(q_arrived(s, i), 0, 2); // 2 CTAs
                 init_semaphore(qk_unloaded(s, i), 0, WARPS_PER_CONSUMER * 2); // 8 warps per consumer * 2 CTAs
@@ -178,7 +171,7 @@ template<typename config=config> struct RingAttentionOp {
                 __nanosleep(20);
 
             int laneid = warp::laneid();
-            if (laneid < 2) { // Load Q for the 2 consumer warpgroups
+            if (laneid < 2) { // Load Q for the 2 consumers
                 int consumer_id = laneid;
                 auto q_page = get_q_page(s, consumer_id);
                 auto &q = *reinterpret_cast<q_tile *>(s.pages[q_page].data);
@@ -233,7 +226,7 @@ template<typename config=config> struct RingAttentionOp {
                     s.finish_page(get_v_page(s, stage), config::NUM_CONSUMER_WARPS);
                     update_phasebit<0>(phasebit, stage);
                 }
-            } else if (laneid < 6) { // Load Os for the 2 consumer warpgroups
+            } else if (laneid < 6) { // Load Os for the 2 consumers
                 int consumer_id = laneid - 4;
                 auto ao_page = get_ao_page(s, consumer_id);
                 auto &out = *reinterpret_cast<o_tile *>(s.pages[ao_page].data);
@@ -244,7 +237,7 @@ template<typename config=config> struct RingAttentionOp {
                     tma::expect(o_arrived(s, consumer_id), out);
                     tma::load_async(out, g.O, {inst.B, inst.H, inst.QO_idx + consumer_id, 0}, o_arrived(s, consumer_id));
                 }
-            } else if (laneid < 8) { // Load Ls and Ms for the 2 consumer warpgroups
+            } else if (laneid < 8) { // Load Ls and Ms for the 2 consumers
                 int consumer_id = laneid - 6;
                 auto &l = *(reinterpret_cast<lm_vec *>(
                     reinterpret_cast<char *>(s.scratch()) + ((2*consumer_id+0)*sizeof(lm_vec))
@@ -276,7 +269,7 @@ template<typename config=config> struct RingAttentionOp {
             s.wait_tensor_ready();
 
             if (ctarank == 0) {
-                if (laneid < 2) { // Launch Q @ K^T for the 2 consumer warpgroups
+                if (laneid < 2) { // Launch Q @ K^T for the 2 consumers
                     int consumer_id = laneid;
                     auto q_page = get_q_page(s, consumer_id);
                     auto &q = *reinterpret_cast<q_tile *>(s.pages[q_page].data);
@@ -296,7 +289,7 @@ template<typename config=config> struct RingAttentionOp {
                         auto qk_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, KV_BLOCK_SIZE>>(consumer_id*KV_BLOCK_SIZE);
                         mm2_ABt(qk_accumulator, q, k, qk_finished(s, consumer_id));
                     }
-                } else if (laneid < 4) { // Launch ATT @ V for the 2 consumer warpgroups
+                } else if (laneid < 4) { // Launch ATT @ V for the 2 consumers
                     int consumer_id = laneid-2;
                     auto ao_page = get_ao_page(s, consumer_id);
                     auto &att = *reinterpret_cast<a_tile *>(s.pages[ao_page].data);
@@ -352,7 +345,6 @@ template<typename config=config> struct RingAttentionOp {
             wait(lm_arrived(s, consumer_id), 0);
 
             if (inst.ring_stage == 0) {
-                // printf("Should be here!\n");
                 warp::zero(out_fl);
                 warp::neg_infty(max_vec);
                 warp::zero(last_scaled_max_vec); // correct as long as not +-inf
@@ -385,7 +377,7 @@ template<typename config=config> struct RingAttentionOp {
                 consumer::load_async(att_fl, qk_accumulator);
                 tensor_load_wait();
                 __syncwarp();
-                if (warp::laneid() == 0) arrive(qk_unloaded(s, consumer_id)); // must arrive per warp
+                if (warp::laneid() == 0) tma::cluster::arrive(qk_unloaded(s, consumer_id), 0); // must arrive per warp
 
                 // Start softmax
                 // Get maximums and scale by softmax temp
@@ -421,7 +413,7 @@ template<typename config=config> struct RingAttentionOp {
                 consumer::store_async(av_accumulator, out_fl); // TODO: best order?
                 tensor_store_wait();
                 __syncwarp();
-                if (warp::laneid() == 0) arrive(av_ready(s, consumer_id)); // must arrive per warp
+                if (warp::laneid() == 0) tma::cluster::arrive(av_ready(s, consumer_id), 0); // must arrive per warp
                 consumer::sync(consumer_id); // TODO: is this needed?
             }
 

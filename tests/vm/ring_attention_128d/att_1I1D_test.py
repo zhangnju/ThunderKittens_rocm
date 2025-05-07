@@ -62,9 +62,9 @@ for torch_device in torch_devices:
 
     # Compute Ops
     instruction_idx = 0
-    assert instruction_idx%2 == 0, "instruction_idx must be even at start for CTA rank matching"
-    assert NUM_COMMS%2 == 0, "NUM_COMMS must be even for CTA rank matching"
-    assert SM_COUNT%2 == 0, "SM_COUNT must be even for CTA rank matching"
+    assert instruction_idx%2 == 0, "instruction_idx must be even at start for CTA cluster matching"
+    assert NUM_COMMS%2 == 0, "NUM_COMMS must be even for CTA cluster matching"
+    assert SM_COUNT%2 == 0, "SM_COUNT must be even for CTA cluster matching"
     for ring_stage in range(num_ring_stages):
         for batch_idx in range(B):
             for head_idx in range(H):

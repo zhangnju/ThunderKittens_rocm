@@ -51,9 +51,11 @@ namespace kittens
                     // launcher does nothing here, since this doesn't use tensor cores.
                     static __device__ void run(const globals &g, state<config> &s)
                     {
+#ifdef KITTENS_BLACKWELL
                         s.wait_tensor_ready();
                         if (laneid() == 0)
                             arrive(s.tensor_finished, config::NUM_CONSUMER_WARPS);
+#endif
                     }
                 };
                 struct consumer

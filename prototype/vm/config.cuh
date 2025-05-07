@@ -2,7 +2,6 @@
 
 #include "kittens.cuh"
 #include "../common/common.cuh"
-#include "templates.cuh"
 
 namespace kittens
 {

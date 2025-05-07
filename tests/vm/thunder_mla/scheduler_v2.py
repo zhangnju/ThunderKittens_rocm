@@ -2,7 +2,12 @@ import math
 import heapq
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict
-from mla_decode import __get_quality__
+
+try:
+    from mla_decode import __get_quality__
+except ImportError:
+    print("Failed to import __get_quality__ from mla_decode.py")
+    __get_quality__ = None
 
 # Timing constants (in microseconds)
 PARTIAL_STARTUP_TIME = 1.0         # Startup time for partial operations

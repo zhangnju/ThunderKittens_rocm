@@ -39,130 +39,92 @@ def init_arguments(seq_lengths: List[int], new_tokens: int, q_heads: int=16):
 
     return QRot, QV, K_cache, V_cache, Lengths, Table
 
-def create_thundermla_arguments(seq_lengths, new_tokens, q_heads = 16, block_size=128, prints=True):
-    # Processor assignment heuristic: assign processors proportionally to sequence lengths.
-    t0 = time.time()
-    scheduled_tasks = []
-    idx = 0
-
-    for i in range(len(seq_lengths)):
-        token_map = {
-            l: [] for l in range(new_tokens)
-        }
-
-        for j in range((seq_lengths[i] + block_size - 1) // block_size):
-            for k in range(0, new_tokens, 4):
-                write_scratch = True#(block_size < seq_lengths[i])
-                scheduled_tasks.append(
-                    Task(
-                        uid=idx,
-                        batch_id=i,
-                        tok_ids=[k + l for l in range(4) if k + l < new_tokens],
-                        name="Partial",
-                        task_type="partial",
-                        start=idx,
-                        finish=idx+1,
-                        dependencies=[],
-                        processor=(i+j+k) % NUM_PROCESSORS,
-                        args={
-                            "write_scratch": write_scratch,
-                            "start": j*block_size,
-                            "end": (j+1)*block_size,
-                            "length": seq_lengths[i],
-                        }
-                    )
-                )
-
-                if write_scratch:
-                    for l in range(4):
-                        if k + l < new_tokens:
-                            token_map[k + l].append(idx)
-                idx += 1
-
-        for k in range(0, new_tokens):
-            if len(token_map[k]) > 0:
-                scheduled_tasks.append(
-                    Task(
-                        uid=idx,
-                        batch_id=i,
-                        tok_ids=[k],
-                        name="Reduction",
-                        task_type="reduction",
-                        start=idx,
-                        finish=idx+1,
-                        next_input_time=new_tokens,
-                        dependencies=token_map[k],
-                        processor=(i+k) % NUM_PROCESSORS,
-                        args={"write_scratch": False}
-                    )
-                )
-                idx += 1
+def init_o_and_lvec_scratch(o_scratch, lvec_scratch, reduction_tasks):
+    all_dependencies = []
+    all_token_ids = []
+    for task in reduction_tasks:
+        all_dependencies.extend(task.dependencies)
+        all_token_ids.extend(task.tok_ids)
     
-    # token_maps = []
-    # for i in range(len(seq_lengths)):
-    #     token_map = {
-    #         l: [] for l in range(new_tokens)
-    #     }
+    all_dependencies = list(set(all_dependencies))
+    all_token_ids = list(set(all_token_ids))
+    
+    for dependency, token_id in zip(all_dependencies, all_token_ids):
+        o_scratch[dependency, token_id:token_id+4] = torch.randn((o_scratch.shape[2], o_scratch.shape[3]), dtype=torch.float32, device='cuda')
+        lvec_scratch[dependency, token_id:token_id+4] = torch.randn((lvec_scratch.shape[2],), dtype=torch.float32, device='cuda')
 
-    #     for j in range((seq_lengths[i] + block_size - 1) // block_size):
-    #         for k in range(0, new_tokens, 4):
-    #             write_scratch = True#(block_size < seq_lengths[i])
-    #             scheduled_tasks.append(
-    #                 Task(
-    #                     uid=idx,
-    #                     batch_id=i,
-    #                     tok_ids=[k + l for l in range(4) if k + l < new_tokens],
-    #                     name="Partial",
-    #                     task_type="partial",
-    #                     start=idx,
-    #                     finish=idx+1,
-    #                     dependencies=[],
-    #                     processor=(i+j+k) % NUM_PROCESSORS,
-    #                     args={
-    #                         "write_scratch": write_scratch,
-    #                         "start": j*block_size,
-    #                         "end": (j+1)*block_size,
-    #                         "length": seq_lengths[i],
-    #                     }
-    #                 )
-    #             )
+    return o_scratch, lvec_scratch
 
-    #             if write_scratch:
-    #                 for l in range(4):
-    #                     if k + l < new_tokens:
-    #                         token_map[k + l].append(idx)
-    #             idx += 1
+def get_correct_O_output(o_scratch, lvec_scratch, reduction_tasks, B, new_tokens, q_heads, D_Main):
+    O = torch.zeros((B, new_tokens, q_heads, D_Main), dtype=torch.bfloat16, device='cuda')
 
-    #     token_maps.append(token_map)
+    for task in reduction_tasks:
+        if not task.args["write_scratch"]:
+            relevant_lvecs = torch.clone(lvec_scratch[task.dependencies, task.tok_ids[0]])
+            max_lvec = torch.max(relevant_lvecs, dim=0).values
+            relevant_lvecs = relevant_lvecs - max_lvec
+            exp_relevant_lvecs = torch.exp2(relevant_lvecs)
+            l_block = torch.sum(exp_relevant_lvecs, dim=0)
+            normed_relevant_lvecs = exp_relevant_lvecs / l_block
 
-    # for i in range(len(seq_lengths)):
-    #     for k in range(0, new_tokens):
-    #         if len(token_maps[i][k]) > 0:
-    #             scheduled_tasks.append(
-    #                 Task(
-    #                     uid=idx,
-    #                     batch_id=i,
-    #                     tok_ids=[k],
-    #                     name="Reduction",
-    #                     task_type="reduction",
-    #                     start=idx,
-    #                     finish=idx+1,
-    #                     next_input_time=new_tokens,
-    #                     dependencies=token_maps[i][k],
-    #                     processor=(i+k) % NUM_PROCESSORS,
-    #                     args={"write_scratch": False}
-    #                 )
-    #             )
-    #             idx += 1
+            relevant_o_blocks = torch.clone(o_scratch[task.dependencies, task.tok_ids[0]])
+            relevant_o_blocks = relevant_o_blocks * normed_relevant_lvecs.unsqueeze(2)
+            O[task.batch_id, task.tok_ids[0]] = torch.sum(relevant_o_blocks, dim=0)
 
-    t1 = time.time()
-    if prints:
-        print(f'Time taken to create schedule: {(t1-t0)*1000} ms')
+    return O
+
+def get_correct_O_and_Lvec_scratch_output(o_scratch, lvec_scratch, reduction_tasks, B, new_tokens, q_heads, D_Main):
+    O_scratch = torch.zeros((B, new_tokens, q_heads, D_Main), dtype=torch.bfloat16, device='cuda')
+    Lvec_scratch = torch.zeros((B, new_tokens, q_heads), dtype=torch.bfloat16, device='cuda')
+
+    for task in reduction_tasks:
+        if task.args["write_scratch"]:
+            relevant_lvecs = torch.clone(lvec_scratch[task.dependencies, task.tok_ids[0]])
+            max_lvec = torch.max(relevant_lvecs, dim=0).values
+            relevant_lvecs = relevant_lvecs - max_lvec
+            exp_relevant_lvecs = torch.exp2(relevant_lvecs)
+            l_block = torch.sum(exp_relevant_lvecs, dim=0)
+            normed_relevant_lvecs = exp_relevant_lvecs / l_block
+
+            relevant_o_blocks = torch.clone(o_scratch[task.dependencies, task.tok_ids[0]])
+            relevant_o_blocks = relevant_o_blocks * normed_relevant_lvecs.unsqueeze(2)
+
+            O_scratch[task.uid, task.tok_ids[0]] = torch.sum(relevant_o_blocks, dim=0)
+            Lvec_scratch[task.uid, task.tok_ids[0]] = torch.log2(l_block) + max_lvec
+
+    return O_scratch, Lvec_scratch
+
+def get_correct_outputs(O_scratch, Lvec_scratch, reduction_tasks, B, new_tokens, q_heads, D_Main):
+    O = get_correct_O_output(O_scratch, Lvec_scratch, reduction_tasks, B, new_tokens, q_heads, D_Main)
+    O_scratch, Lvec_scratch = get_correct_O_and_Lvec_scratch_output(O_scratch, Lvec_scratch, reduction_tasks, B, new_tokens, q_heads, D_Main)
+
+    return O, O_scratch, Lvec_scratch
+
+def create_two_partial_reduction_task(new_tokens=1, q_heads = 16, write_scratch=False, prints=True):
+    scheduled_tasks = [
+        Task(
+            uid=2,
+            batch_id=0,
+            tok_ids=[0],
+            name="Reduction",
+            task_type="reduction",
+            start=0,
+            finish=1,
+            dependencies=[0, 1],
+            processor=0,
+            args={"write_scratch": write_scratch}
+        )
+    ]
 
     Instructions, O_scratch, Lvec_scratch, Semaphore, Timings = create_arguments_from_task_schedule(
-        scheduled_tasks, new_tokens, num_processors=NUM_PROCESSORS, enable_timings=ENABLE_TIMINGS, q_heads=q_heads, prints=prints
+        scheduled_tasks, 
+        new_tokens, 
+        num_processors=NUM_PROCESSORS, 
+        enable_timings=ENABLE_TIMINGS, 
+        q_heads=q_heads, 
+        prints=prints,
     )
-    # visualize_schedule(scheduled_tasks, NUM_PROCESSORS)
+
     return Instructions, O_scratch, Lvec_scratch, Semaphore, Timings
 
 def run_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_scratch, Lvec_scratch, Semaphore, Timings, tic=None, prints=True):
@@ -181,228 +143,36 @@ def run_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_s
         print('Starting mla_decode')
     if Timings is not None:
         mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, tic, Timings)
-        #mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1-tic, Timings)
+        mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1-tic, Timings)
     else:
         mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, tic)
-        #mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1-tic)
+        mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1-tic)
     torch.cuda.synchronize()
+
     if prints:
         print('Finished mla_decode')
-    return O, Timings
-
-def compute_thundermla_partials(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_scratch, Lvec_scratch, Semaphore, Timings, block_size, tic=None, prints=True):
-    q_heads = QRot.shape[2]
-    if tic is None:
-        Semaphore.zero_()
-        tic = 1
-    O = torch.zeros_like(QV)
-    Q_all = torch.concat([QV, QRot], dim=-1).contiguous()
-    KV_all = torch.cat([V_cache, K_cache], dim=-1).contiguous()
-    softmax_scale = 1.0 / math.sqrt(D_Main+D_Rot)
-    stream = torch.cuda.current_stream()
-    torch.cuda.synchronize()
-    mla_decode_fn = mla_decode.mla_decode_8_heads if q_heads == 8 else mla_decode.mla_decode
-    if prints:
-        print('Starting mla_decode')
-    if Timings is not None:
-        mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, tic, Timings)
-        #mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1-tic, Timings)
-    else:
-        mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, tic)
-        #mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1-tic)
-    torch.cuda.synchronize()
-    if prints:
-        print('Finished mla_decode')
-
-    Os = []
-    ls = []
-    idx = 0
-    for b, l in enumerate(Lengths):
-        Os.append([])
-        ls.append([])
-        for block_start in range(0, l, block_size):
-            Os[b].append([])
-            ls[b].append([])
-            for k in range(0, QRot.shape[1], 4):
-                O_block = O_scratch[idx, k:k+4]
-                L_block = Lvec_scratch[idx, k:k+4]
-
-                Os[b][-1].append(O_block)
-                ls[b][-1].append(L_block)
-                idx += 1
-            
-            Os[b][-1] = torch.cat(Os[b][-1], dim=0)
-            ls[b][-1] = torch.cat(ls[b][-1], dim=0)
-
-        idx += QRot.shape[1]
-        
-    return Os, ls, Timings
-
-def profile_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_scratch, Lvec_scratch, Semaphore, Timings, ITERS=100):
-    q_heads = QRot.shape[2]
-    Semaphore.zero_()
-    O = torch.zeros_like(QV)
-    softmax_scale = 1.0 / math.sqrt(D_Main+D_Rot)
-    stream = torch.cuda.current_stream()
-    # execute once to warm up
-    mla_decode_fn = mla_decode.mla_decode_8_heads if q_heads == 8 else mla_decode.mla_decode
-    if Timings is not None:
-        mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1, Timings, stream=stream)
-    else:
-        mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1, stream=stream)
-    torch.cuda.synchronize()
-    t0 = time.time()
-    for it in range(ITERS):
-        if Timings is not None:
-            mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, it%2, Timings, stream=stream)
-        else:
-            mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, it%2, stream=stream)
-    torch.cuda.synchronize()
-    t1 = time.time()
-    return (t1-t0) / ITERS
-
-def run_mla_torch(QRot, QV, K_cache, V_cache, Lengths, Table):
-    Q = torch.concat([QRot, QV], dim=-1)
-    q_heads = Q.shape[2]
-    full_K = torch.cat([K_cache, V_cache], dim=-1)[Table].reshape(Q.shape[0], -1, Q.shape[-1])
-    full_V = V_cache[Table].reshape(Q.shape[0], -1, QV.shape[-1])
-    softmax_scale = 1.0 / math.sqrt(D_Main+D_Rot)
-    O = torch.zeros_like(QV)
-    for b, l in enumerate(Lengths):
-        # assert Q.shape[1] == 1, "Q must have shape (B, 1, H, D) for the time being."
-        mask = torch.ones(Q.shape[1], l, dtype=torch.bool).tril(diagonal=l-Q.shape[1]).to(Q.device)
-        O[b:b+1] = torch.nn.functional.scaled_dot_product_attention(
-            Q[b:b+1].transpose(1, 2),
-            full_K[b:b+1, :l].unsqueeze(-2).repeat((1,1,q_heads,1)).transpose(1, 2),
-            full_V[b:b+1, :l].unsqueeze(-2).repeat((1,1,q_heads,1)).transpose(1, 2),
-            is_causal=False,
-            attn_mask=mask,
-            scale=softmax_scale
-        ).transpose(1, 2)
-    return O
-
-def compute_mla_partials_torch(QRot, QV, K_cache, V_cache, Lengths, Table, block_size):
-    Q = torch.concat([QRot, QV], dim=-1).to(torch.float32) # (B, LQ, H, D)
-    q_heads = Q.shape[2]
-    full_K = torch.cat([K_cache, V_cache], dim=-1)[Table].reshape(Q.shape[0], -1, Q.shape[-1])
-    full_V = V_cache[Table].reshape(Q.shape[0], -1, QV.shape[-1])
-    Q = Q.transpose(1, 2) # (B, H, LQ, D)
-
-    # pad K and V to be a multiple of block_size
-    full_K = torch.cat([full_K, torch.zeros(full_K.shape[0], block_size - full_K.shape[1] % block_size, full_K.shape[2], dtype=full_K.dtype, device=full_K.device)], dim=1)
-    full_V = torch.cat([full_V, torch.zeros(full_V.shape[0], block_size - full_V.shape[1] % block_size, full_V.shape[2], dtype=full_V.dtype, device=full_V.device)], dim=1)
-
-    softmax_scale = 1.0 / math.sqrt(D_Main+D_Rot)
-    Os = []
-    ls = []
-    for b, l in enumerate(Lengths):
-        Os.append([])
-        ls.append([])
-        for block_start in range(0, l, block_size):
-            Os[b].append([])
-            ls[b].append([])
-            for k in range(0, Q.shape[2], 4):
-                K_block = full_K[b, block_start:block_start+block_size].to(torch.float32) # (L, D)
-                V_block = full_V[b, block_start:block_start+block_size].to(torch.float32) # (L, D)
-
-                q_loc = torch.arange(l - Q.shape[2] + k, min(l, l - Q.shape[2] + k + 4), device=Q.device)
-                k_loc = torch.arange(block_start, block_start + block_size, device=Q.device)
-                mask = (q_loc[:, None] >= k_loc[None, :]).unsqueeze(0) # (1, LQ, L)
-
-                QK = Q[b, :, k:k+4] @ K_block.transpose(0, 1) # (H, LQ<=4, L)
-                QK = QK.masked_fill(~mask, -10000000)
-
-                max_vec = torch.max(QK, dim=-1, keepdim=True).values # (H, LQ<=4, 1)
-                QK = QK - max_vec
-                exp_QK = torch.exp(QK * softmax_scale) # (H, LQ<=4, L)
-
-                l_block = torch.sum(exp_QK, dim=-1, keepdim=True) # (H, LQ<=4, 1)
-
-                ls[b][-1].append((1.44269504089 * max_vec * softmax_scale + torch.log2(l_block)).transpose(0, 1)[..., 0])
-
-                O_block = exp_QK @ V_block / l_block # (H, LQ<=4, D)
-                Os[b][-1].append(O_block.transpose(0, 1))
-
-            Os[b][-1] = torch.cat(Os[b][-1], dim=0)
-            ls[b][-1] = torch.cat(ls[b][-1], dim=0)
-
-    return Os, ls
+    
+    return O, O_scratch, Lvec_scratch
 
 def main(seq_lengths, new_tokens, q_heads=16, block_size=128, prints=True):
     if prints:
         print(f' ----------- starting seq_lengths: {seq_lengths} new_tokens: {new_tokens} q_heads: {q_heads} block_size: {block_size} -----------')
     seq_lengths = sorted(seq_lengths)
     QRot, QV, K_cache, V_cache, Lengths, Table = init_arguments(seq_lengths, new_tokens, q_heads)
-    ref = run_mla_torch(QRot, QV, K_cache, V_cache, Lengths, Table)
-    Instructions, O_scratch, Lvec_scratch, Semaphore, Timings = create_thundermla_arguments(seq_lengths, new_tokens, q_heads, block_size, prints=prints)
-    O, Timings = run_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_scratch, Lvec_scratch, Semaphore, Timings, prints=prints)
+    Instructions, O_scratch, Lvec_scratch, Semaphore, Timings = create_two_partial_reduction_task(new_tokens, q_heads, prints=prints)
+    O_correct, O_scratch_correct, Lvec_scratch_correct = get_correct_outputs(O_scratch, Lvec_scratch, Instructions, Lengths, new_tokens, q_heads, D_Main)
+    O, O_scratch, Lvec_scratch = run_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_scratch, Lvec_scratch, Semaphore, Timings, prints=prints)
     torch.cuda.synchronize()
-    # save_gantt_chart(Timings, Instructions, f"gantt_chart_{round(time.time())}.png", verbose=True)
-    # print("ref mean:", torch.mean(ref.abs()))
-    # print("Kernel output mean", torch.mean(O.abs()))
-    # print("Max absolute diff", torch.max(torch.abs(O - ref)))
-    # print("Avg absolute diff", torch.mean(torch.abs(O - ref)))
+
     if prints:
         print('Finished!')
 
-    return {
-        "Ref mean\t\t": torch.mean(ref.abs()),
-        "Kernel output mean\t": torch.mean(O.abs()),
-        "Max absolute diff\t": torch.max(torch.abs(O - ref)),
-        "Avg absolute diff\t": torch.mean(torch.abs(O - ref)),
-    }
-
-def main_check_partials(seq_lengths, new_tokens, q_heads=16, block_size=128, prints=True):
-    if prints:
-        print(f' ----------- starting seq_lengths: {seq_lengths} new_tokens: {new_tokens} q_heads: {q_heads} block_size: {block_size} -----------')
-    seq_lengths = sorted(seq_lengths)
-    QRot, QV, K_cache, V_cache, Lengths, Table = init_arguments(seq_lengths, new_tokens, q_heads)
-    Os_torch, ls_torch = compute_mla_partials_torch(QRot, QV, K_cache, V_cache, Lengths, Table, block_size)
-    Instructions, O_scratch, Lvec_scratch, Semaphore, Timings = create_thundermla_arguments(seq_lengths, new_tokens, q_heads, block_size, prints=prints)
-    Os, ls, Timings = compute_thundermla_partials(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_scratch, Lvec_scratch, Semaphore, Timings, block_size, prints=prints)
-    torch.cuda.synchronize()
-    # print("ref mean:", torch.mean(ref.abs()))
-    # print("Kernel output mean", torch.mean(O.abs()))
-    # print("Max absolute diff", torch.max(torch.abs(O - ref)))
-    # print("Avg absolute diff", torch.mean(torch.abs(O - ref)))
-    if prints:
-        print('Finished!')
-    
-    # for i in range(len(Os)):
-    #     for j in range(len(Os[i])):
-    #         fig, axs = plt.subplots(Os[i][j].shape[0])
-    #         for k in range(Os_torch[i][j].shape[0]):
-    #             im = axs[k].imshow(Os_torch[i][j][k].cpu().numpy() - Os[i][j][k].cpu().numpy())
-    #             fig.colorbar(im, ax=axs[k])
-            
-    #         plt.savefig(f"Os[{i}][{j}].png")
-    #         plt.close()
-
-
-    stats_dict = {}
-
-    for i in range(len(Os)):
-        for j in range(len(Os[i])):
-            stats_dict[f"\nOs_torch[{i}][{j}] mean\t"] = torch.mean(Os_torch[i][j].abs())
-            stats_dict[f"Os[{i}][{j}] mean\t\t"] = torch.mean(Os[i][j].abs())
-
-            stats_dict[f"\nls_torch[{i}][{j}] mean\t"] = torch.mean(ls_torch[i][j].abs())
-            stats_dict[f"ls[{i}][{j}] mean\t\t"] = torch.mean(ls[i][j].abs())
-
-    for i in range(len(Os)):
-        for j in range(len(Os[i])):
-            if i == 0 and j == 0:
-                stats_dict[f"\n*************\nOs[{i}][{j}] max diff\t"] = torch.max(torch.abs(Os_torch[i][j] - Os[i][j]))
-            else:
-                stats_dict[f"\nOs[{i}][{j}] max diff\t"] = torch.max(torch.abs(Os_torch[i][j] - Os[i][j]))
-            
-            stats_dict[f"Os[{i}][{j}] mean diff\t"] = torch.mean(torch.abs(Os_torch[i][j] - Os[i][j]))
-
-            stats_dict[f"\nls[{i}][{j}] max diff\t"] = torch.max(torch.abs(ls_torch[i][j] - ls[i][j]))
-            stats_dict[f"ls[{i}][{j}] mean diff\t"] = torch.mean(torch.abs(ls_torch[i][j] - ls[i][j]))
-
-    return stats_dict
-
+    print("O max diff:", torch.max(torch.abs(O - O_correct)))
+    print("O mean diff:", torch.mean(torch.abs(O - O_correct)))
+    print("O_scratch max diff:", torch.max(torch.abs(O_scratch - O_scratch_correct)))
+    print("O_scratch mean diff:", torch.mean(torch.abs(O_scratch - O_scratch_correct)))
+    print("Lvec_scratch max diff:", torch.max(torch.abs(Lvec_scratch - Lvec_scratch_correct)))
+    print("Lvec_scratch mean diff:", torch.mean(torch.abs(Lvec_scratch - Lvec_scratch_correct)))
 
 def test_inputs(inputs, prints=False, check_partials=False):
     for input in inputs:
@@ -424,10 +194,7 @@ def test_inputs(inputs, prints=False, check_partials=False):
         print(f'\n\n----------- starting seq_lengths: {seq_lengths} new_tokens: {new_tokens} q_heads: {q_heads} block_size: {block_size} -----------')
         for i in range(num_trials):
             torch.manual_seed(0)
-            if check_partials:
-                out = main_check_partials(seq_lengths, new_tokens, q_heads, block_size, prints=prints)
-            else:
-                out = main(seq_lengths, new_tokens, q_heads, block_size, prints=prints)
+            out = main(seq_lengths, new_tokens, q_heads, block_size, prints=prints)
             combined_outs.append(out)
 
             if outs is None:
@@ -447,23 +214,4 @@ def test_inputs(inputs, prints=False, check_partials=False):
             print()
 
 if __name__ == "__main__":
-    # test_inputs([
-    #     ([1], 1, 16, 128, 10),
-    #     ([8], 8, 16, 128, 10),
-    #     ([100], 8, 16, 32, 10),
-    #     ([100], 1, 16, 32, 10),
-    #     ([32], 1, 16, 32, 10),
-    #     ([128], 1, 16, 32, 10),
-    #     ([128], 1, 16, 128, 10),
-    #     ([128, 256, 512, 1024, 2048], 1, 16, 128, 10),
-    #     ([423, 511, 245, 11, 2], 1, 16, 32, 10),
-    #     ([4230, 5110, 10230, 110, 20], 8, 16, 512, 10),
-    # ])
-
-    # test_inputs([
-    #     ([260, 310], 8, 16, 32, 2),
-    # ], check_partials=True)
-
-    test_inputs([
-        ([260, 310, 12, 8, 348, 332], 8, 16, 32, 2),
-    ])#, check_partials=True)
+    main([128], 1, 16, 128, prints=True)

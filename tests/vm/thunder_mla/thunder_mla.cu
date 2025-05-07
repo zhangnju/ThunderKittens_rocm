@@ -88,7 +88,7 @@ struct globals {
     gl<bf16, 1, -1, PAGE_SIZE, QVO_D, vcache_tile> V_cache; // 1, num_pages, PAGE_SIZE, QVO_D
 
     gl<int, 1, 1, -1, -1> Table; // B, num_pages
-    gl<bf16, -1, -1, -1, QVO_D, st_bf<16, QVO_Dd2>, st_bf<16, QVO_D/8>> O; // batch_size, new_tokens, q_heads, QVO_D
+    gl<bf16, -1, -1, -1, QVO_D, st_bf<16, QVO_Dd2>, st_bf<16, QVO_D/config::NUM_CONSUMER_WARPS>> O; // batch_size, new_tokens, q_heads, QVO_D
     
     gl<float, -1, -1, Q_HEADS, QVO_D, st_fl<16, QVO_D/config::NUM_CONSUMER_WARPS>, st_fl<16,256>> O_scratch; // num_instructions, new_tokens, q_heads, QVO_D
     gl<float,  1, -1, -1, Q_HEADS, sv_fl<16>> Lvec_scratch; // num_instructions, new_tokens, q_heads
@@ -112,6 +112,7 @@ struct ReductionOp
 {
     static constexpr int opcode = 2;
     static constexpr int OP_IDX = _OP_IDX; // Op index within the layer -- controls which barrier to listen to.
+    static constexpr int LOAD_UIDS_OFFSET = 6;
     struct parsed_instruction
     {
         int uid, num_iters;
@@ -129,59 +130,64 @@ struct ReductionOp
     };
     static __device__ inline parsed_instruction parse_instruction(const globals &g, state<config> &s)
     {
-        return parsed_instruction{s.instruction()[1], s.instruction()[2], {s.instruction()[3], s.instruction()[4]}, s.instruction()[5]};
+        return parsed_instruction{
+            s.instruction()[1], 
+            s.instruction()[2], 
+            {s.instruction()[3], s.instruction()[4]}, 
+            s.instruction()[5], 
+        };
     }
-
 
     static constexpr int NUM_PIPELINE_STAGES = 4;
     static constexpr int NUM_STAGES_PER_PAGE = 2;
+
     static constexpr int INPUT_PAGES = 2;
     static constexpr int AUX_PAGES = 1;
+    static constexpr int NUM_PAGES = 3;
+
+    static constexpr int NUM_CONSUMER_WARPS = config::NUM_CONSUMER_WARPS;
     //  semaphores 
     __device__ static inline semaphore &inputs_arrived(state<config> &s, int i) { return s.semaphores()[i]; }
     __device__ static inline semaphore &inputs_finished(state<config> &s, int i) { return s.semaphores()[NUM_PIPELINE_STAGES + i]; }
+    __device__ static inline semaphore &out_arrived(state<config> &s) { return s.semaphores()[2 * NUM_PIPELINE_STAGES]; }
 
     // getters
-    using o_st_type = st_fl<16, QVO_D/8>;
-    __device__ static inline o_st_type (&get_o_shared_tiles(state<config> &s))[NUM_PIPELINE_STAGES][NUM_CONSUMER_WARPS] {
-        o_st_type[NUM_PIPELINE_STAGES][NUM_CONSUMER_WARPS] *os;
-        
-        o_st_type[NUM_STAGES_PER_PAGE][NUM_CONSUMER_WARPS] os1 = reinterpret_cast<o_st_type[NUM_STAGES_PER_PAGE][NUM_CONSUMER_WARPS]&>(
-            s.pages[s.pid(0)]
-        )[pipeline_stage%NUM_STAGES_PER_PAGE];
+    using o_st_type = st_fl<16, QVO_D/NUM_CONSUMER_WARPS>;
+    // __device__ static inline o_st_type (&get_o_shared_tiles)(state<config> &s)[NUM_PIPELINE_STAGES][NUM_CONSUMER_WARPS] {
+    //     o_st_type **os = reinterpret_cast<o_st_type**>(s.pages[s.pid(0)].ptr());
+    //     o_st_type **os2 = reinterpret_cast<o_st_type**>(s.pages[s.pid(1)].ptr());
 
-        for (int i = 0; i < NUM_STAGES_PER_PAGE; i++) os[i] = os1[i];
+    //     for (int i = 0; i < NUM_STAGES_PER_PAGE; i++) os[i + NUM_STAGES_PER_PAGE] = os2[i];
 
-        st_o_tile_type[NUM_STAGES_PER_PAGE][NUM_CONSUMER_WARPS] os2 = reinterpret_cast<st_o_tile_type[NUM_STAGES_PER_PAGE][NUM_CONSUMER_WARPS]&>(
-            s.pages[s.pid(1)]
-        )[pipeline_stage%NUM_STAGES_PER_PAGE];
+    //     return os;
+    // }
 
-        for (int i = 0; i < NUM_STAGES_PER_PAGE; i++) os[i + NUM_STAGES_PER_PAGE] = os2[i];
-
-        return os;
+    __device__ static inline o_st_type &get_o_shared_tile(state<config> &s, int stage, int w) {
+        int offset = sizeof(o_st_type) * (NUM_CONSUMER_WARPS * stage + w);
+        if(offset < config::PAGE_SIZE) {
+            return *reinterpret_cast<o_st_type*>((uint8_t*)s.pages[s.pid(0)].ptr() + offset);
+        } else {
+            return *reinterpret_cast<o_st_type*>((uint8_t*)s.pages[s.pid(1)].ptr() + offset - config::PAGE_SIZE);
+        }
     }
 
-    using l_sv_type = st_fl<16>;
-    __device__ static inline l_sv_type (&get_l_shared_vecs(state<config> &s))[NUM_PIPELINE_STAGES] {
-        return reinterpret_cast<l_sv_type[NUM_PIPELINE_STAGES]&>(s.pages[s.pid(2)]);
+    using l_sv_type = sv_fl<16>;
+    __device__ static inline l_sv_type &get_l_shared_vec(state<config> &s, int stage) {
+        return reinterpret_cast<l_sv_type*>(s.pages[s.pid(2)].ptr())[stage];
     }
 
-    constexpr int L_VEC_SIZE = 4 * 16;
-    __device__ static inline o_st_type (&get_o_shared_scratch(state<config> &s))[NUM_CONSUMER_WARPS] {
-        return reinterpret_cast<o_st_type[NUM_CONSUMER_WARPS]&>(s.pages[s.pid(3)] + L_VEC_SIZE);
+    __device__ static inline o_st_type &get_o_shared_scratch(state<config> &s, int w) {
+        return reinterpret_cast<o_st_type*>(s.pages[s.pid(3)].ptr())[w];
     }
 
-    constexpr int O_SCRATCH_SIZE = 4 * 16 * QVO_D;
-    constexpr int LVEC_SCRATCH_POS = L_VEC_SIZE + O_SCRATCH_SIZE;
     __device__ static inline l_sv_type &get_l_shared_scratch(state<config> &s) {
-        return reinterpret_cast<l_sv_type&>(s.pages[s.pid(3)] + LVEC_SCRATCH_POS);
-    }
-    
-    using o_st_output_type = st_bf<16, QVO_D/8>;
-    __device__ static inline o_st_output_type (&get_o_shared_output(state<config> &s))[NUM_CONSUMER_WARPS] {
-        return reinterpret_cast<o_st_output_type[NUM_CONSUMER_WARPS]&>(s.pages[s.pid(3)] + L_VEC_SIZE);
+        return *reinterpret_cast<l_sv_type*>((uint8_t*)s.pages[s.pid(3)].ptr() + sizeof(l_sv_type) + sizeof(o_st_type) * config::NUM_CONSUMER_WARPS);
     }
 
+    using o_st_output_type = st_bf<16, QVO_D/NUM_CONSUMER_WARPS>;
+    __device__ static inline o_st_output_type &get_o_shared_output(state<config> &s, int w) {
+        return reinterpret_cast<o_st_output_type*>(s.pages[s.pid(3)].ptr())[w];
+    }
 
     struct controller
     {
@@ -192,15 +198,14 @@ struct ReductionOp
         }
         static __device__ int init_semaphores(const globals &g, state<config> &s)
         {
-            // each weight page and the input page needs exactly 1 “ready” signal
             for (int i = 0; i < NUM_PIPELINE_STAGES; i++) {
                 init_semaphore(inputs_arrived(s, i), 1);
                 init_semaphore(inputs_finished(s, i), NUM_CONSUMER_WARPS);
             }
-            // output must wait for all 4 consumer warps
-            init_semaphore(out_arrived(s),  16);
+            // output must wait for all consumer warps
+            init_semaphore(out_arrived(s),  NUM_CONSUMER_WARPS);
             
-            return 2 * Num;
+            return 2 * NUM_PIPELINE_STAGES + 1;
         }
     };
 
@@ -210,52 +215,46 @@ struct ReductionOp
         static __device__ void run(const globals &g, state<config> &s)
         {
             parsed_instruction inst{s};
-            int32_t bitfield = 0xFFFF0000; // 1 for arrived, 0 for finished
-
-            o_st_type[NUM_PIPELINE_STAGES][NUM_CONSUMER_WARPS] o_shared_inputs = get_o_shared_tiles(s);
-            l_sv_type[NUM_PIPELINE_STAGES] l_shared_vecs = get_l_shared_vecs(s);
-
-            if(laneid() == 0) while(
-                *(volatile int*)&
-                globals.Bar[{
-                    inst.load_uid, 
-                    inst.output_location.seq_idx
-                }] != args.globals.tic) __nanosleep(20);
-
-            asm volatile("fence.sc.gpu;\n");
-            __syncwarp();
+            uint32_t bitfield = 0xFFFF0000; // 1 for arrived, 0 for finished
             
             for (int i = 0; i < NUM_PAGES; i++) {
                 s.wait_page_ready(i);
             }
 
             for (int i = 0; i < inst.num_iters; i++) {
+                int load_uid = s.instruction()[LOAD_UIDS_OFFSET + i];
+
+                if(laneid() == 0) while(
+                    *(volatile int*)&
+                    g.Bar[{
+                        load_uid, 
+                        inst.output_location.seq_idx
+                    }] != g.tic) __nanosleep(20);
+
+                asm volatile("fence.sc.gpu;\n");
+                __syncwarp();
+
                 int pipeline_stage = i % NUM_PIPELINE_STAGES;
-
-                o_st_type[NUM_CONSUMER_WARPS] o_shared_input = o_shared_inputs[pipeline_stage];
-                l_sv_type l_shared_vec = l_shared_vecs[pipeline_stage];
-
-                semaphore &inputs_arrived = get_inputs_arrived(s, pipeline_stage);
 
                 wait(inputs_finished(s, pipeline_stage), prototype::get_phasebit<1>(bitfield, pipeline_stage));
                 prototype::update_phasebit<1>(bitfield, pipeline_stage);
                 
-                tma::expect(inputs_arrived, o_shared_input, l_shared_vec);
+                tma::expect_bytes(inputs_arrived(s, pipeline_stage), sizeof(o_st_type) * config::NUM_CONSUMER_WARPS + sizeof(l_sv_type));
 
                 for (int j = 0; j < NUM_CONSUMER_WARPS; j++) {
                     tma::load_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                        o_shared_input[j], 
+                        get_o_shared_tile(s, pipeline_stage, j), 
                         g.O_scratch,
-                        {inst.load_uid, inst.output_location.seq_idx, 0, j},
-                        inputs_arrived,
+                        {load_uid, inst.output_location.seq_idx, 0, j},
+                        inputs_arrived(s, pipeline_stage)
                     );
                 }
 
                 tma::load_async<cache_policy::EVICT_FIRST>(
-                    l_shared_vec,
+                    get_l_shared_vec(s, pipeline_stage),
                     g.Lvec_scratch,
-                    {inst.load_uid, inst.output_location.seq_idx, 0},
-                    inputs_arrived,
+                    {load_uid, inst.output_location.seq_idx, 0},
+                    inputs_arrived(s, pipeline_stage)
                 );
             }
         }
@@ -277,33 +276,31 @@ struct ReductionOp
         static __device__ void run(const globals &g, state<config> &s)
         {
             parsed_instruction inst{s};
-            int32_t bitfield = 0xFFFF0000; // 1 for arrived, 0 for finished
+            uint32_t bitfield = 0xFFFF0000; // 1 for arrived, 0 for finished
 
-            o_st_type[NUM_PIPELINE_STAGES][NUM_CONSUMER_WARPS] o_shared_inputs = get_o_shared_tiles(s);
-            l_sv_type[NUM_PIPELINE_STAGES] l_shared_vecs = get_l_shared_vecs(s);
-            o_st_type[NUM_CONSUMER_WARPS] o_shared_scratch = get_o_shared_scratch(s);
-            l_sv_type l_shared_scratch = get_l_shared_scratch(s);
+            o_st_type & o_shared_scratch = get_o_shared_scratch(s, group<NUM_CONSUMER_WARPS>::warpid());
+            l_sv_type & l_shared_scratch = get_l_shared_scratch(s);
 
             if(laneid() == 0) while(
                 *(volatile int*)&
-                globals.Bar[{
+                g.Bar[{
                     inst.src_uid, 
                     inst.output_location.seq_idx
-                }] != args.globals.tic) __nanosleep(20);
+                }] != g.tic) __nanosleep(20);
 
             asm volatile("fence.sc.gpu;\n");
             group<NUM_CONSUMER_WARPS>::sync(11); // all warps must sync here.
             
             warp::load_async(
-                o_shared_scratch[group<NUM_CONSUMER_WARPS>::warpid()], 
+                o_shared_scratch, 
                 g.O_scratch, 
                 {inst.src_uid, inst.output_location.seq_idx, 0, group<NUM_CONSUMER_WARPS>::warpid()}
             );
-            if(warpid() == 0) {
+            if(group<NUM_CONSUMER_WARPS>::warpid() == 0) { // only one warp needs to load the lvec, it is the same address for all warps.
                 warp::load_async(
                     l_shared_scratch, 
                     g.Lvec_scratch, 
-                    {inst.src_uid, inst.output_location.seq_idx, 0},
+                    {inst.src_uid, inst.output_location.seq_idx, 0}
                 );
             }
             warp::load_async_wait();
@@ -314,12 +311,12 @@ struct ReductionOp
             o_rt_type o_state;
             l_rv_type l_state;
 
-            warp::load(o_state, o_shared_scratch[group<NUM_CONSUMER_WARPS>::warpid()]);
+            warp::load(o_state, o_shared_scratch);
             
             group<NUM_CONSUMER_WARPS>::sync(11); // needed for l_shared_scratch to be loaded
             warp::load(l_state, l_shared_scratch);
             
-            warp::arrive(out_arrived(s));  // let the storer know we’re done 
+            warp::arrive(out_arrived(s));  // let the storer know we're done 
 
             l_rv_type lvec, max_lvec, sum_lvec;
             o_rt_type o_in;
@@ -330,8 +327,8 @@ struct ReductionOp
                 wait(inputs_arrived(s, pipeline_stage), prototype::get_phasebit<0>(bitfield, pipeline_stage));
                 prototype::update_phasebit<0>(bitfield, pipeline_stage);
 
-                warp::load(o, o_shared_inputs[pipeline_stage][group<NUM_CONSUMER_WARPS>::warpid()]);
-                warp::load(lvec, l_shared_vecs[pipeline_stage]);
+                warp::load(o_in, get_o_shared_tile(s, pipeline_stage, group<NUM_CONSUMER_WARPS>::warpid()));
+                warp::load(lvec, get_l_shared_vec(s, pipeline_stage));
                 
                 __syncwarp();
                 if(laneid() == 0) arrive(inputs_finished(s, pipeline_stage)); // done!
@@ -365,18 +362,21 @@ struct ReductionOp
             // store o_state and l_state
             
             if (inst.output_location.batch_idx >= 0) {
-                o_st_output_type o_out = get_o_shared_output(s);
+                o_st_output_type & o_out = get_o_shared_output(s, group<NUM_CONSUMER_WARPS>::warpid());
 
-                warp::store(o_out[group<NUM_CONSUMER_WARPS>::warpid()], o_state);
+                warp::store(o_out, o_state);
             }
             else {
-                warp::store(o_shared_scratch[group<NUM_CONSUMER_WARPS>::warpid()], o_state);
-                warp::store(l_shared_scratch, l_state);
+                warp::store(o_shared_scratch, o_state);
+
+                if(group<NUM_CONSUMER_WARPS>::warpid() == 0) {
+                    warp::store(l_shared_scratch, l_state);
+                }
             }
             __syncwarp();
-            if (laneid() == 0) arrive(out_finished(s));
+            if (laneid() == 0) arrive(out_arrived(s));
 
-            for (int i = 0; i < NUM_PAGES; i++) {
+            for (int i = 0; i < NUM_PAGES-1; i++) {
                 s.warp_finish_page(i, 1);
             }
         }
@@ -391,40 +391,41 @@ struct ReductionOp
             wait(out_arrived(s), 0);
 
             if (inst.output_location.batch_idx >= 0) {
-                o_st_output_type o_out = get_o_shared_output(s)[group<NUM_CONSUMER_WARPS>::warpid()];
-                tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                    g.O, 
-                    o_out, 
-                    {
-                        inst.output_location.batch_idx, 
-                        inst.output_location.seq_idx, 
-                        0,
-                        group<NUM_CONSUMER_WARPS>::warpid(),
-                    },
-                );
+                if (laneid() < NUM_CONSUMER_WARPS) {
+
+                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                        g.O, 
+                        get_o_shared_output(s, laneid()), 
+                        {
+                            inst.output_location.batch_idx, 
+                            inst.output_location.seq_idx, 
+                            0,
+                            laneid(),
+                        }
+                    );
+                }
             }
             else {
-                o_st_type o_shared_scratch = get_o_shared_scratch(s)[group<NUM_CONSUMER_WARPS>::warpid()];
-                l_sv_type l_shared_scratch = get_l_shared_scratch(s);
-                tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
-                    g.O_scratch,
-                    o_shared_scratch,
-                    {
-                        -inst.output_location.batch_idx-1, 
-                        inst.output_location.seq_idx, 
-                        0, 
-                        group<NUM_CONSUMER_WARPS>::warpid()
-                    },
-                );
-                if (group<NUM_CONSUMER_WARPS>::warpid() == 0) {
+                if (laneid() < NUM_CONSUMER_WARPS) {
+                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
+                        g.O_scratch,
+                        get_o_shared_scratch(s, laneid()),
+                        {
+                            -inst.output_location.batch_idx-1, 
+                            inst.output_location.seq_idx, 
+                            0, 
+                            laneid()
+                        }
+                    );
+                } else if (laneid() == NUM_CONSUMER_WARPS) {
                     tma::store_async<cache_policy::EVICT_LAST>(
                         g.Lvec_scratch,
-                        l_shared_scratch,
+                        get_l_shared_scratch(s),
                         {
                             -inst.output_location.batch_idx-1, 
                             inst.output_location.seq_idx, 
                             0,
-                        },
+                        }
                     );
                 }
             }
@@ -435,18 +436,20 @@ struct ReductionOp
             // Increment the semaphore for the next stage, if this is not the last one.
             if(inst.output_location.batch_idx < 0) {
                 if(group<8>::laneid() == 0) {
-                    globals.Bar[{-inst.output_location.batch_idx-1, inst.output_location.seq_idx}] = globals.tic;
+                    g.Bar[{-inst.output_location.batch_idx-1, inst.output_location.seq_idx}] = g.tic;
                 }
             }
+
+            s.warp_finish_page(NUM_PAGES-1, 1);
         }
     };
 };
 
 #include "pyutils/pyutils.cuh"
 
-PYBIND11_MODULE(thunder_mla, m)
+PYBIND11_MODULE(mla_decode, m)
 {
-    m.doc() = "thunder_mla python module";
+    m.doc() = "mla_decode python module";
     kittens::py::bind_kernel<kvm<config, globals, ReductionOp<config>>>(
         m, "reduction",
         &globals::instructions,

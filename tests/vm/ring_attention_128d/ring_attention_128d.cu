@@ -192,7 +192,7 @@ template<typename config=config> struct RingAttentionOp {
                         update_phasebit<0>(phasebit, stage);
                     }
                     tma::cluster::expect(k_arrived(s, stage), 0, k);
-                    if ((inst.ring_stage & 1) == 0)
+                    if ((inst.ring_stage & 1) == 0) // 64 x 128
                         tma::cluster::load_async(k, g.K0s[inst.dev_idx], {inst.B, inst.H, i*2 + ctarank, 0}, k_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
                     else
                         tma::cluster::load_async(k, g.K1s[inst.dev_idx], {inst.B, inst.H, i*2 + ctarank, 0}, k_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
@@ -216,10 +216,10 @@ template<typename config=config> struct RingAttentionOp {
                         update_phasebit<0>(phasebit, stage);
                     }
                     tma::cluster::expect(v_arrived(s, stage), 0, v);
-                    if ((inst.ring_stage & 1) == 0)
-                        tma::cluster::load_async(v, g.V0s[inst.dev_idx], {inst.B, inst.H, i*2 + ctarank, 0}, v_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
+                    if ((inst.ring_stage & 1) == 0) // 128 x 64
+                        tma::cluster::load_async(v, g.V0s[inst.dev_idx], {inst.B, inst.H, i, ctarank}, v_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
                     else
-                        tma::cluster::load_async(v, g.V1s[inst.dev_idx], {inst.B, inst.H, i*2 + ctarank, 0}, v_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
+                        tma::cluster::load_async(v, g.V1s[inst.dev_idx], {inst.B, inst.H, i, ctarank}, v_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
                 }
                 for (int i = 0; i < PIPELINE_STAGES; i++) {
                     int stage = (i + inst.num_kv_blocks) % PIPELINE_STAGES;

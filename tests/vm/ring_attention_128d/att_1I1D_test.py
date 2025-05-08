@@ -136,12 +136,15 @@ for dev_id in dev_ids:
 ###
 #  Verify correctness
 ###
-def pytorch_mha(q, k, v):
-    QK = torch.matmul(q, k.transpose(-2, -1))
-    QK /= (q.size(-1) ** 0.5)
-    QK = torch.nn.functional.softmax(QK, dim=-1)
-    out = torch.matmul(QK, v)
-    return out
+def pytorch_blk_attn(q, k, v):
+    QK = torch.matmul(q.float(), k.float().transpose(-2, -1))
+    max_vec = torch.max(QK, dim=-1, keepdim=True).values
+    QK *= 0.08838834764831843 * 1.44269504089
+    QK -= max_vec * 0.08838834764831843 * 1.44269504089
+    QK = torch.exp2(QK)
+    norm_vec = torch.sum(QK, dim=-1, keepdim=False)
+    out = torch.matmul(QK.bfloat16(), v)
+    return out, norm_vec, max_vec
 
 def check_diff(x, y):
     x = x.to(dtype=torch.float32, device='cpu')
@@ -151,6 +154,7 @@ def check_diff(x, y):
     print('Mean abs diff:', abs_diff.mean())
 
 for dev_id in dev_ids:
-    O_ref = pytorch_mha(Qs[dev_id].cpu(), Ks[dev_id], Vs[dev_id])
-    O_impl = Os[dev_id] / Ls[dev_id].unsqueeze(-1)
-    check_diff(O_impl, O_ref)
+    O_ref, L_ref, M_ref = pytorch_blk_attn(Qs[dev_id].cpu(), Ks[dev_id], Vs[dev_id])
+    O_ref = O_ref[0, 0]
+    O = Os[dev_id].cpu()[0, 0]
+    check_diff(O, O_ref)

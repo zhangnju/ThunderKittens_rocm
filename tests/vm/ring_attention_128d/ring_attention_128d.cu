@@ -146,10 +146,10 @@ template<typename config=config> struct RingAttentionOp {
                 init_semaphore(av_ready(s, i), 0, WARPS_PER_CONSUMER * 2);    // 8 warps per consumer * 2 CTAs
                 init_semaphore(qk_finished(s, i), 0, 1);
                 init_semaphore(av_finished(s, i), 0, 1);
-                init_semaphore(o_arrived(s, i), 1);
-                init_semaphore(lm_arrived(s, i), 1);
-                init_semaphore(o_finished(s, i), WARPS_PER_CONSUMER);  // 8 warps per consumer
-                init_semaphore(lm_finished(s, i), WARPS_PER_CONSUMER); // 8 warps per consumer
+                init_semaphore(o_arrived(s, i), 0, 1);
+                init_semaphore(lm_arrived(s, i), 0, 1);
+                init_semaphore(o_finished(s, i), 0, WARPS_PER_CONSUMER);  // 8 warps per consumer
+                init_semaphore(lm_finished(s, i), 0, WARPS_PER_CONSUMER); // 8 warps per consumer
             }
             for (int i = 0; i < PIPELINE_STAGES; ++i) {
                 init_semaphore(k_arrived(s, i), 0, 2);  // 2 CTAs
@@ -338,10 +338,10 @@ template<typename config=config> struct RingAttentionOp {
             auto &out = *reinterpret_cast<o_tile *>(s.pages[ao_page].data);
             auto &att = *reinterpret_cast<a_tile *>(s.pages[ao_page].data);
             auto &l = *(reinterpret_cast<lm_vec *>(
-                reinterpret_cast<char *>(s.scratch()) + ((2*(consumer_id)+0)*sizeof(lm_vec))
+                reinterpret_cast<char *>(s.scratch()) + ((2*consumer_id+0)*sizeof(lm_vec))
             )); // share 1 page between 2 consumers for Ls and Ms
             auto &m = *(reinterpret_cast<lm_vec *>(
-                reinterpret_cast<char *>(s.scratch()) + ((2*(consumer_id)+1)*sizeof(lm_vec))
+                reinterpret_cast<char *>(s.scratch()) + ((2*consumer_id+1)*sizeof(lm_vec))
             ));
 
             wait(o_arrived(s, consumer_id), 0);
@@ -411,9 +411,9 @@ template<typename config=config> struct RingAttentionOp {
                     tensor_load_wait(); // TODO: is this needed?
                     __syncwarp();       // TODO: is this needed?
                 }
-                consumer::store(att, att_fl); // <-- culprit
                 warp::mul_row(out_fl, out_fl, diff_scaled_max_vec); // normalize previous outputs
                 consumer::store_async(av_accumulator, out_fl); // TODO: best order?
+                consumer::store(att, att_fl); // <-- culprit
                 tensor_store_wait();
                 __syncwarp();
                 if (warp::laneid() == 0) tma::cluster::arrive(av_ready(s, consumer_id), 0); // must arrive per warp
@@ -464,10 +464,10 @@ template<typename config=config> struct RingAttentionOp {
                 int consumer_id = laneid-2;
                 int local_QO_idx = inst.QO_idx + NUM_CONSUMERS*ctarank + consumer_id;
                 auto &l = *(reinterpret_cast<lm_vec *>(
-                    reinterpret_cast<char *>(s.scratch()) + ((2*(consumer_id)+0)*sizeof(lm_vec))
+                    reinterpret_cast<char *>(s.scratch()) + ((2*consumer_id+0)*sizeof(lm_vec))
                 )); // share 1 page between 2 consumers for Ls and Ms
                 auto &m = *(reinterpret_cast<lm_vec *>(
-                    reinterpret_cast<char *>(s.scratch()) + ((2*(consumer_id)+1)*sizeof(lm_vec))
+                    reinterpret_cast<char *>(s.scratch()) + ((2*consumer_id+1)*sizeof(lm_vec))
                 ));
                 wait(lm_finished(s, consumer_id), 0);
                 tma::store_async(g.L, l, {inst.B, inst.H, local_QO_idx});

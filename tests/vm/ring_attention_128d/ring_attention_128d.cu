@@ -165,19 +165,20 @@ template<typename config=config> struct RingAttentionOp {
         static __device__ void run(const globals &g, state<config> &s) {
             parsed_instruction inst{s};
             int ctarank = cluster_ctarank();
+            int laneid = warp::laneid();
 
             // Wait for the previous ring stage to finish
             while (inst.ring_stage > 0 && *(volatile int *)&g.barriers[inst.dev_idx][{inst.ring_stage - 1}] < inst.num_comms + inst.num_comps)
                 __nanosleep(20);
 
-            int laneid = warp::laneid();
             if (laneid < 2) { // Load Q for the 2 consumers
                 int consumer_id = laneid;
+                int local_QO_idx = inst.QO_idx + NUM_CONSUMERS*ctarank + consumer_id; // inst.QO_idx is given by units of 512
                 auto q_page = get_q_page(s, consumer_id);
                 auto &q = *reinterpret_cast<q_tile *>(s.pages[q_page].data);
                 s.wait_page_ready(q_page);
                 tma::cluster::expect(q_arrived(s, consumer_id), 0, q);
-                tma::cluster::load_async(q, g.Q, {inst.B, inst.H, inst.QO_idx + NUM_CONSUMERS*ctarank + consumer_id, 0}, q_arrived(s, consumer_id), (uint16_t)(1<<ctarank), 0);
+                tma::cluster::load_async(q, g.Q, {inst.B, inst.H, local_QO_idx, 0}, q_arrived(s, consumer_id), (uint16_t)(1<<ctarank), 0);
             } else if (laneid == 2) { // Load Ks
                 uint32_t phasebit = 0;
                 for (int i = 0; i < inst.num_kv_blocks; i++) {
@@ -228,6 +229,7 @@ template<typename config=config> struct RingAttentionOp {
                 }
             } else if (laneid < 6) { // Load Os for the 2 consumers
                 int consumer_id = laneid - 4;
+                int local_QO_idx = inst.QO_idx + NUM_CONSUMERS*ctarank + consumer_id;
                 auto ao_page = get_ao_page(s, consumer_id);
                 auto &out = *reinterpret_cast<o_tile *>(s.pages[ao_page].data);
                 s.wait_page_ready(ao_page);
@@ -235,10 +237,11 @@ template<typename config=config> struct RingAttentionOp {
                     arrive(o_arrived(s, consumer_id));
                 } else {
                     tma::expect(o_arrived(s, consumer_id), out);
-                    tma::load_async(out, g.O, {inst.B, inst.H, inst.QO_idx + consumer_id, 0}, o_arrived(s, consumer_id));
+                    tma::load_async(out, g.O, {inst.B, inst.H, local_QO_idx, 0}, o_arrived(s, consumer_id));
                 }
             } else if (laneid < 8) { // Load Ls and Ms for the 2 consumers
                 int consumer_id = laneid - 6;
+                int local_QO_idx = inst.QO_idx + NUM_CONSUMERS*ctarank + consumer_id;
                 auto &l = *(reinterpret_cast<lm_vec *>(
                     reinterpret_cast<char *>(s.scratch()) + ((2*consumer_id+0)*sizeof(lm_vec))
                 )); // share 1 page between 2 consumers for Ls and Ms
@@ -249,8 +252,8 @@ template<typename config=config> struct RingAttentionOp {
                     arrive(lm_arrived(s, consumer_id));
                 } else {
                     tma::expect(lm_arrived(s, consumer_id), l, m);
-                    tma::load_async(l, g.L, {inst.B, inst.H, inst.QO_idx + consumer_id}, lm_arrived(s, consumer_id));
-                    tma::load_async(m, g.M, {inst.B, inst.H, inst.QO_idx + consumer_id}, lm_arrived(s, consumer_id));
+                    tma::load_async(l, g.L, {inst.B, inst.H, local_QO_idx}, lm_arrived(s, consumer_id));
+                    tma::load_async(m, g.M, {inst.B, inst.H, local_QO_idx}, lm_arrived(s, consumer_id));
                 }
             } else if (12 <= laneid && laneid < config::NUM_PAGES) { // Release unused pages
                 s.wait_page_ready(laneid);
@@ -444,18 +447,22 @@ template<typename config=config> struct RingAttentionOp {
     struct storer {
         static __device__ void run(const globals &g, state<config> &s) {
             parsed_instruction inst{s};
+            int ctarank = cluster_ctarank();
             int laneid = warp::laneid();
+
             if (laneid < 2) { // store Os
                 int consumer_id = laneid;
+                int local_QO_idx = inst.QO_idx + NUM_CONSUMERS*ctarank + consumer_id;
                 int ao_page = get_ao_page(s, consumer_id);
                 auto &out = *reinterpret_cast<o_tile *>(s.pages[ao_page].data);
                 wait(o_finished(s, consumer_id), 0);
-                tma::store_async(g.O, out, {inst.B, inst.H, inst.QO_idx + consumer_id, 0});
+                tma::store_async(g.O, out, {inst.B, inst.H, local_QO_idx, 0});
                 tma::store_async_read_wait();
                 s.finish_page(ao_page, config::NUM_CONSUMER_WARPS);
                 s.finish_page(ao_page + 1, config::NUM_CONSUMER_WARPS); // 2 pages, 32KB total
             } else if (laneid < 4) { // store Ls and Ms
                 int consumer_id = laneid-2;
+                int local_QO_idx = inst.QO_idx + NUM_CONSUMERS*ctarank + consumer_id;
                 auto &l = *(reinterpret_cast<lm_vec *>(
                     reinterpret_cast<char *>(s.scratch()) + ((2*(consumer_id)+0)*sizeof(lm_vec))
                 )); // share 1 page between 2 consumers for Ls and Ms
@@ -463,8 +470,8 @@ template<typename config=config> struct RingAttentionOp {
                     reinterpret_cast<char *>(s.scratch()) + ((2*(consumer_id)+1)*sizeof(lm_vec))
                 ));
                 wait(lm_finished(s, consumer_id), 0);
-                tma::store_async(g.L, l, {inst.B, inst.H, inst.QO_idx + consumer_id});
-                tma::store_async(g.M, m, {inst.B, inst.H, inst.QO_idx + consumer_id});
+                tma::store_async(g.L, l, {inst.B, inst.H, local_QO_idx});
+                tma::store_async(g.M, m, {inst.B, inst.H, local_QO_idx});
             }
             __syncwarp();
             if (laneid == 0) {

@@ -412,8 +412,8 @@ template<typename config=config> struct RingAttentionOp {
                     __syncwarp();       // TODO: is this needed?
                 }
                 warp::mul_row(out_fl, out_fl, diff_scaled_max_vec); // normalize previous outputs
-                consumer::store_async(av_accumulator, out_fl); // TODO: best order?
-                consumer::store(att, att_fl); // <-- culprit
+                consumer::store_async(av_accumulator, out_fl); // culprit: 800 tflops down
+                consumer::store(att, att_fl); // <-- culprit: 400 tflops down
                 tensor_store_wait();
                 __syncwarp();
                 if (warp::laneid() == 0) tma::cluster::arrive(av_ready(s, consumer_id), 0); // must arrive per warp
@@ -437,10 +437,10 @@ template<typename config=config> struct RingAttentionOp {
             }
 
             // Store the outputs and signal the storer
-            consumer::store(out, out_fl);
+            consumer::store(out, out_fl); // <-- culprit: 400 tflops down
             warp::arrive(o_finished(s, consumer_id));
-            consumer::store(l, norm_vec);
-            consumer::store(m, max_vec);
+            consumer::store(l, norm_vec); // <-- culprit: 400 tflops down
+            consumer::store(m, max_vec);   // <-- culprit: 100 tflops down
             warp::arrive(lm_finished(s, consumer_id));
         }
     };

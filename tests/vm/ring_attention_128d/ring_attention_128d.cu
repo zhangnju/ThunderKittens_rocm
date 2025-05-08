@@ -193,9 +193,9 @@ template<typename config=config> struct RingAttentionOp {
                     }
                     tma::cluster::expect(k_arrived(s, stage), 0, k);
                     if ((inst.ring_stage & 1) == 0)
-                        tma::cluster::load_async(k, g.K0s[inst.dev_idx], {inst.B, inst.H, i + ctarank, 0}, k_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
+                        tma::cluster::load_async(k, g.K0s[inst.dev_idx], {inst.B, inst.H, i*2 + ctarank, 0}, k_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
                     else
-                        tma::cluster::load_async(k, g.K1s[inst.dev_idx], {inst.B, inst.H, i + ctarank, 0}, k_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
+                        tma::cluster::load_async(k, g.K1s[inst.dev_idx], {inst.B, inst.H, i*2 + ctarank, 0}, k_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
                 }
                 for (int i = 0; i < PIPELINE_STAGES; i++) {
                     int stage = (i + inst.num_kv_blocks) % PIPELINE_STAGES;
@@ -217,9 +217,9 @@ template<typename config=config> struct RingAttentionOp {
                     }
                     tma::cluster::expect(v_arrived(s, stage), 0, v);
                     if ((inst.ring_stage & 1) == 0)
-                        tma::cluster::load_async(v, g.V0s[inst.dev_idx], {inst.B, inst.H, i + ctarank, 0}, v_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
+                        tma::cluster::load_async(v, g.V0s[inst.dev_idx], {inst.B, inst.H, i*2 + ctarank, 0}, v_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
                     else
-                        tma::cluster::load_async(v, g.V1s[inst.dev_idx], {inst.B, inst.H, i + ctarank, 0}, v_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
+                        tma::cluster::load_async(v, g.V1s[inst.dev_idx], {inst.B, inst.H, i*2 + ctarank, 0}, v_arrived(s, stage), (uint16_t)(1<<ctarank), 0);
                 }
                 for (int i = 0; i < PIPELINE_STAGES; i++) {
                     int stage = (i + inst.num_kv_blocks) % PIPELINE_STAGES;

@@ -7,19 +7,20 @@ import numpy as np
 ###
 #   Global Parameters
 ###
+SM_COUNT = 148
 NUM_DEVICES = 4
 NUM_COMMS = 8 # this is the magic number that works the best
 NUM_ITERS = 10
 ATTN_OPCODE = 725
 COMM_OPCODE = 97
-B, H, N, D_h = 16, 16, 4096*NUM_DEVICES, 64
+B, H, N, D_h = 16, 16, 512*NUM_DEVICES, 128
 
 assert N%NUM_DEVICES==0, "N must be divisible by NUM_DEVICES"
-assert (N//NUM_DEVICES)%256==0, "N_per_dev must be divisible by 256 (QO Block Size * 2)"
-assert D_h==64, "D_h must be 64"
+assert (N//NUM_DEVICES)%512==0, "N_per_dev must be divisible by 512 (QO Block Size * NUM_CONSUMERS * CTA Cluster Size)"
+assert D_h==128, "D_h must be 128"
 
 N_per_dev = N // NUM_DEVICES
-num_qo_blocks = N_per_dev // 256
+num_qo_blocks = N_per_dev // 512 # 128 * NUM_CONSUMERS * CTA Cluster Size
 num_kv_blocks = N_per_dev // 128
 num_comps = B * H * num_qo_blocks
 num_ring_stages = 1 # for unit testing
@@ -58,19 +59,23 @@ for torch_device in torch_devices:
     dev_idx = torch_device.index
     prev_dev_idx = (dev_idx + NUM_DEVICES - 1) % NUM_DEVICES
     next_dev_idx = (dev_idx + 1) % NUM_DEVICES
-    dev_instructions = [[] for _ in range(148)]
+    dev_instructions = [[] for _ in range(SM_COUNT)]
 
     # Compute Ops
     instruction_idx = 0
+    assert instruction_idx%2 == 0, "instruction_idx must be even at start for CTA cluster matching"
+    assert NUM_COMMS%2 == 0, "NUM_COMMS must be even for CTA cluster matching"
+    assert SM_COUNT%2 == 0, "SM_COUNT must be even for CTA cluster matching"
     for ring_stage in range(num_ring_stages):
         for batch_idx in range(B):
             for head_idx in range(H):
                 for qo_idx in range(num_qo_blocks):
-                    dev_instructions[NUM_COMMS+(instruction_idx%(148-NUM_COMMS))].append(
-                        [ATTN_OPCODE, batch_idx, head_idx, qo_idx*2, num_kv_blocks, ring_stage, NUM_COMMS, num_comps, dev_idx]
-                        + [0]*23
-                    )
-                    instruction_idx += 1
+                    for __cta_rank in range(2):
+                        dev_instructions[NUM_COMMS+(instruction_idx%(SM_COUNT-NUM_COMMS))].append(
+                            [ATTN_OPCODE, batch_idx, head_idx, qo_idx*4, num_kv_blocks, ring_stage, NUM_COMMS, num_comps, dev_idx]
+                            + [0]*23
+                        )
+                        instruction_idx += 1
     print('Number of QO blocks per device:', num_qo_blocks)
     print('Number of KV blocks per device:', num_kv_blocks)
     print('Number of compute instructions per device:', instruction_idx)
@@ -97,7 +102,7 @@ barriers = []
 timings = []
 for torch_device in torch_devices:
     barriers.append(torch.zeros((NUM_DEVICES,), dtype=torch.uint32, device=torch_device))
-    timings.append(torch.zeros((148, instructions[0].shape[1], 128), dtype=torch.int32, device=torch_device))
+    timings.append(torch.zeros((SM_COUNT, instructions[torch_device.index].shape[1], 128), dtype=torch.int32, device=torch_device))
 
 print(f'Barriers shape: {barriers[0].shape}')
 print(f'Timings shape: {timings[0].shape}')
@@ -149,8 +154,8 @@ def check_diff(x, y):
 print('\nChecking correctness...')
 for dev_id in dev_ids:
     O_ref = pytorch_mha(Qs[dev_id].cpu(), Ks[dev_id], Vs[dev_id])
-    O = Os[dev_id] / Ls[dev_id].unsqueeze(-1)
-    check_diff(O, O_ref)
+    O_impl = Os[dev_id] / Ls[dev_id].unsqueeze(-1)
+    check_diff(O_impl, O_ref)
 
 
 ###
@@ -172,7 +177,7 @@ for i in range(NUM_ITERS):
     end_time = time()
     times.append(end_time - start_time)
 avg_time = sum(times) / NUM_ITERS
-total_tflops = (4 * B * H * N * N * D_h + 5 * B * H * N * N) * 1e-12
+total_tflops = (4 * B * H * N * N * D_h + 5 * B * H * N * N) * 1e-12 / NUM_DEVICES # because we only did single ring stage
 print(f'Average time per iter: {avg_time * 1e6} us')
 print(f'Total TFLOP/s: {total_tflops / avg_time}')
 print(f'Per-device TFLOP/s: {(total_tflops / NUM_DEVICES) / avg_time}')

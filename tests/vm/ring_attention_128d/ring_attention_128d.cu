@@ -15,8 +15,7 @@ constexpr int COMM_CHUNK_LENGTH = 64;
 using q_tile = st_bf<QO_BLOCK_SIZE, HEAD_DIM>;
 using k_tile = st_bf<KV_BLOCK_SIZE/2, HEAD_DIM>; // Split for 2-CTA cooperative matmuls
 using v_tile = st_bf<KV_BLOCK_SIZE, HEAD_DIM/2>; // Split for 2-CTA cooperative matmuls
-using o_tile = st_bf<QO_BLOCK_SIZE, HEAD_DIM>;
-using a_tile = st_bf<QO_BLOCK_SIZE, KV_BLOCK_SIZE>;
+using ao_tile = st_bf<QO_BLOCK_SIZE, HEAD_DIM>; // Only possible since HEAD_DIM == KV_BLOCK_SIZE
 using lm_vec = col_vec<st_fl<QO_BLOCK_SIZE, HEAD_DIM>>;
 using comm_tile = st_bf<COMM_CHUNK_LENGTH, HEAD_DIM>; // Full 16KB page
 
@@ -25,10 +24,10 @@ struct ring_attention_config
     // Ring-attention specific
     static constexpr int INSTRUCTION_PIPELINE_STAGES = 2; // 12 pages are used for ring attention
     static constexpr int INSTRUCTION_PIPELINE_STAGES_BITS = 1;
-    static constexpr int NUM_CONSUMER_WARPS = 16;
+    static constexpr int NUM_CONSUMER_WARPS = 8;
     static constexpr int CLUSTER_BLOCKS = 2; // for 2-CTA cooperative matmuls
-    static constexpr int SCRATCH_BYTES = 4096; // Need at least 2048
-    static constexpr int CONSUMER_REGISTERS = 104;
+    static constexpr int SCRATCH_BYTES = 2048; // need at least 2048
+    static constexpr int CONSUMER_REGISTERS = 208;
     static constexpr int NON_CONSUMER_REGISTERS = 64;
 
     // Same as default
@@ -59,7 +58,7 @@ struct globals {
     using q_layout = gl<bf16, -1, -1, -1, HEAD_DIM, q_tile>; // Batch, Head, Seq, Dim (full MHA)
     using k_layout = gl<bf16, -1, -1, -1, HEAD_DIM, k_tile, comm_tile>;
     using v_layout = gl<bf16, -1, -1, -1, HEAD_DIM, v_tile, comm_tile>;
-    using o_layout = gl<bf16, -1, -1, -1, HEAD_DIM, o_tile>;
+    using o_layout = gl<bf16, -1, -1, -1, HEAD_DIM, ao_tile>;
     using lm_layout = gl<float, 1, -1, -1, -1, lm_vec>; // Batch, Head, Seq
 
     instruction_layout instructions;
@@ -84,12 +83,12 @@ template<typename config=config> struct RingAttentionOp {
     static constexpr int opcode = 725;
     static constexpr int PIPELINE_STAGES = 2;
     static constexpr int NUM_CONSUMERS = 2;
-    static constexpr int WARPS_PER_CONSUMER = 8;
+    static constexpr int WARPS_PER_CONSUMER = 4;
 
     static_assert(NUM_CONSUMERS == 2);
-    static_assert(WARPS_PER_CONSUMER == 8);
+    static_assert(WARPS_PER_CONSUMER == 4);
     static_assert(config::NUM_CONSUMER_WARPS == WARPS_PER_CONSUMER*NUM_CONSUMERS, 
-                  "RingAttentionOp requires 16 consumer warpgroups.");
+                  "RingAttentionOp requires 8 consumer warpgroups.");
 
     struct parsed_instruction {
         int B;             // batch index              (in units of 1)
@@ -231,7 +230,7 @@ template<typename config=config> struct RingAttentionOp {
                 int consumer_id = laneid - 4;
                 int local_QO_idx = inst.QO_idx + NUM_CONSUMERS*ctarank + consumer_id;
                 auto ao_page = get_ao_page(s, consumer_id);
-                auto &out = *reinterpret_cast<o_tile *>(s.pages[ao_page].data);
+                auto &out = *reinterpret_cast<ao_tile *>(s.pages[ao_page].data);
                 s.wait_page_ready(ao_page);
                 if (inst.ring_stage == 0) {
                     arrive(o_arrived(s, consumer_id));
@@ -295,7 +294,7 @@ template<typename config=config> struct RingAttentionOp {
                 } else if (laneid < 4) { // Launch ATT @ V for the 2 consumers
                     int consumer_id = laneid-2;
                     auto ao_page = get_ao_page(s, consumer_id);
-                    auto &att = *reinterpret_cast<a_tile *>(s.pages[ao_page].data);
+                    auto &att = *reinterpret_cast<ao_tile *>(s.pages[ao_page].data);
 
                     uint32_t phasebit = 0;
                     for (int i = 0; i < inst.num_kv_blocks; ++i) {
@@ -324,6 +323,7 @@ template<typename config=config> struct RingAttentionOp {
             parsed_instruction inst{s};
             int consumer_id = consumer::groupid();
 
+            rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE> att_fl;
             col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> max_vec;
             col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> scaled_max_vec;
             col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> last_scaled_max_vec;
@@ -331,8 +331,7 @@ template<typename config=config> struct RingAttentionOp {
             col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, HEAD_DIM>> norm_vec;
 
             auto ao_page = get_ao_page(s, consumer_id);
-            auto &out = *reinterpret_cast<o_tile *>(s.pages[ao_page].data);
-            auto &att = *reinterpret_cast<a_tile *>(s.pages[ao_page].data);
+            auto &att = *reinterpret_cast<ao_tile *>(s.pages[ao_page].data);
             auto &l = *(reinterpret_cast<lm_vec *>(
                 reinterpret_cast<char *>(s.scratch()) + ((2*consumer_id+0)*sizeof(lm_vec))
             )); // share 1 page between 2 consumers for Ls and Ms
@@ -343,6 +342,9 @@ template<typename config=config> struct RingAttentionOp {
             wait(o_arrived(s, consumer_id), 0);
             wait(lm_arrived(s, consumer_id), 0);
 
+            auto qk_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, KV_BLOCK_SIZE>>(consumer_id*KV_BLOCK_SIZE);
+            auto av_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, HEAD_DIM>>(2*KV_BLOCK_SIZE + consumer_id*HEAD_DIM);
+
             if (inst.ring_stage == 0) {
                 warp::neg_infty(max_vec);
                 warp::zero(last_scaled_max_vec); // correct as long as not +-inf
@@ -352,10 +354,11 @@ template<typename config=config> struct RingAttentionOp {
                 consumer::load(max_vec, m);
                 consumer::load(norm_vec, l); // note that l is not an LSE until the last stage
                 warp::mul(last_scaled_max_vec, max_vec, softmax_temp);
+                consumer::load(att_fl, att);
+                consumer::store_async(av_accumulator, att_fl); // culprit: 800 tflops down
+                tensor_store_wait();
+                __syncwarp();
             }
-
-            auto qk_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, KV_BLOCK_SIZE>>(consumer_id*KV_BLOCK_SIZE);
-            auto av_accumulator = s.tensor_alloc.template allocate<tt<float, QO_BLOCK_SIZE, HEAD_DIM>>(2*KV_BLOCK_SIZE + consumer_id*HEAD_DIM);
 
             uint32_t phasebit = 0;
             for (int i = 0; i < inst.num_kv_blocks; ++i) {
@@ -371,7 +374,6 @@ template<typename config=config> struct RingAttentionOp {
                         s.finish_page(get_q_page(s, consumer_id) + 1, config::NUM_CONSUMER_WARPS); // 32KB total
                     }
                 }
-                rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE> att_fl;
                 consumer::load_async(att_fl, qk_accumulator);
                 tensor_load_wait();
                 __syncwarp();
@@ -399,8 +401,13 @@ template<typename config=config> struct RingAttentionOp {
                 // Prepare for AV
                 if (i == 0) {
                     consumer::store(att, att_fl); // <-- culprit: 400 tflops down
-                    if (inst.ring_stage == 0) warp::zero(att_fl);
-                    else consumer::load(att_fl, out);
+                    if (inst.ring_stage == 0) {
+                        warp::zero(att_fl);
+                    } else {
+                        consumer::load_async(att_fl, av_accumulator);
+                        tensor_load_wait();
+                        __syncwarp();
+                    }
                 } else { // must accumulate on the previous AV matmul
                     tma::cluster::wait(av_finished(s, consumer_id), get_phasebit<1>(phasebit, 0));
                     update_phasebit<1>(phasebit, 0);
@@ -422,22 +429,21 @@ template<typename config=config> struct RingAttentionOp {
             // Wait for the last AV matmul to finish and load the final output
             tma::cluster::wait(av_finished(s, consumer_id), get_phasebit<1>(phasebit, 0));
             if (consumer::laneid() == 0) arrive(v_finished(s, (inst.num_kv_blocks - 1) % PIPELINE_STAGES));
-            rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, HEAD_DIM> out_fl;
-            consumer::load_async(out_fl, av_accumulator);
+            consumer::load_async(att_fl, av_accumulator);
             tensor_load_wait(); // TODO: is this needed?
             __syncwarp();       // TODO: is this needed?
             warp::arrive(s.tensor_finished);
 
             // Finish softmax if last ring stage
             if (inst.ring_stage == globals::num_devices - 1) {
-                warp::div_row(out_fl, out_fl, norm_vec);
+                warp::div_row(att_fl, att_fl, norm_vec);
                 // Make LSE
                 warp::log2(norm_vec, norm_vec);
                 warp::add(norm_vec, norm_vec, last_scaled_max_vec);
             }
 
             // Store the outputs and signal the storer
-            consumer::store(out, out_fl); // <-- culprit: 400 tflops down
+            consumer::store(att, att_fl); // <-- culprit: 400 tflops down
             warp::arrive(o_finished(s, consumer_id));
             consumer::store(l, norm_vec); // <-- culprit: 400 tflops down
             consumer::store(m, max_vec);   // <-- culprit: 100 tflops down
@@ -454,7 +460,7 @@ template<typename config=config> struct RingAttentionOp {
                 int consumer_id = laneid;
                 int local_QO_idx = inst.QO_idx + NUM_CONSUMERS*ctarank + consumer_id;
                 int ao_page = get_ao_page(s, consumer_id);
-                auto &out = *reinterpret_cast<o_tile *>(s.pages[ao_page].data);
+                auto &out = *reinterpret_cast<ao_tile *>(s.pages[ao_page].data);
                 wait(o_finished(s, consumer_id), 0);
                 tma::store_async(g.O, out, {inst.B, inst.H, local_QO_idx, 0});
                 tma::store_async_read_wait();
@@ -529,7 +535,17 @@ template<typename config=config> struct CommOp {
         }
     };
     struct loader {
+        static __device__ void run(const globals &g, state<config> &s) { }
+    };
+    struct launcher {
+        static __device__ void run(const globals &g, state<config> &s) { 
+            s.wait_tensor_ready();
+            if (laneid() == 0) arrive(s.tensor_finished, config::NUM_CONSUMER_WARPS);
+        }
+    };
+    struct consumer { // use consumer warps for more registers
         static __device__ void run(const globals &g, state<config> &s) {
+            if (group<config::NUM_CONSUMER_WARPS>::warpid() != 0) return;
             parsed_instruction inst{s};
             int laneid = warp::laneid();
             constexpr uint32_t membermask = 0xFFFFFFFF >> (32 - config::NUM_PAGES);
@@ -592,15 +608,6 @@ template<typename config=config> struct CommOp {
                 s.finish_page(page, config::NUM_CONSUMER_WARPS); 
             }
         }
-    };
-    struct launcher {
-        static __device__ void run(const globals &g, state<config> &s) { 
-            s.wait_tensor_ready();
-            if (laneid() == 0) arrive(s.tensor_finished, config::NUM_CONSUMER_WARPS);
-        }
-    };
-    struct consumer {
-        static __device__ void run(const globals &g, state<config> &s) { }
     };
     struct storer {
         static __device__ void run(const globals &g, state<config> &s) { }

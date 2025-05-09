@@ -154,7 +154,7 @@ def check_diff(x, y):
     print('Max abs diff:', abs_diff.max())
     print('Mean abs diff:', abs_diff.mean())
 
-# print('\nChecking correctness...')
+print('\nChecking correctness...')
 for dev_id in dev_ids:
     O_ref, L_ref, M_ref = pytorch_blk_attn(Qs[dev_id].cpu(), Ks[dev_id], Vs[dev_id])
     check_diff(Os[dev_id].cpu(), O_ref)

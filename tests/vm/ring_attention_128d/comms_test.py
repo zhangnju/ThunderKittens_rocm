@@ -22,7 +22,7 @@ assert D_h==128, "D_h must be 128"
 N_per_dev = N // NUM_DEVICES
 num_qo_blocks = N_per_dev // 512 # 128 * NUM_CONSUMERS * CTA Cluster Size
 num_kv_blocks = N_per_dev // 128
-num_comps = B * H * num_qo_blocks
+num_comps = 0 # for testing comms only
 num_ring_stages = NUM_DEVICES
 
 

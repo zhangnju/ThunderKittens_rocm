@@ -11,9 +11,10 @@ SM_COUNT = 148
 NUM_DEVICES = 4
 NUM_COMMS = 8 # this is the magic number that works the best
 NUM_ITERS = 5
+NUM_WARMUPS = 0
 ATTN_OPCODE = 725
 COMM_OPCODE = 97
-B, H, N, D_h = 16, 16, 4096*NUM_DEVICES, 128
+B, H, N, D_h = 8, 16, 16384*NUM_DEVICES, 128
 
 assert N%NUM_DEVICES==0, "N must be divisible by NUM_DEVICES"
 assert (N//NUM_DEVICES)%512==0, "N_per_dev must be divisible by 512 (QO Block Size * NUM_CONSUMERS * CTA Cluster Size)"
@@ -182,6 +183,16 @@ def check_diff(x, y):
 #  Check speed
 ###
 print('\nKernel finished, now benchmarking...')
+for i in range(NUM_WARMUPS):
+    for dev_id in dev_ids:
+        barriers[dev_id].zero_()
+        torch.cuda.synchronize(dev_id)
+    ring_attention(
+        instructions, barriers, timings,
+        Qs, K0s, K1s, V0s, V1s, Os, Ls, Ms
+    )
+    for dev_id in dev_ids: # can't use cudaEvent (which is device-specific)
+        torch.cuda.synchronize(dev_id)
 times = []
 for i in range(NUM_ITERS):
     for dev_id in dev_ids:

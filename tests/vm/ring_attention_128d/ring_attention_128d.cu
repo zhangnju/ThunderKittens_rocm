@@ -24,10 +24,10 @@ struct ring_attention_config
     // Ring-attention specific
     static constexpr int INSTRUCTION_PIPELINE_STAGES = 2; // 12 pages are used for ring attention
     static constexpr int INSTRUCTION_PIPELINE_STAGES_BITS = 1;
-    static constexpr int NUM_CONSUMER_WARPS = 8;
+    static constexpr int NUM_CONSUMER_WARPS = 16;
     static constexpr int CLUSTER_BLOCKS = 2; // for 2-CTA cooperative matmuls
     static constexpr int SCRATCH_BYTES = 2048; // need at least 2048
-    static constexpr int CONSUMER_REGISTERS = 208;
+    static constexpr int CONSUMER_REGISTERS = 104;
     static constexpr int NON_CONSUMER_REGISTERS = 64;
 
     // Same as default
@@ -83,12 +83,12 @@ template<typename config=config> struct RingAttentionOp {
     static constexpr int opcode = 725;
     static constexpr int PIPELINE_STAGES = 2;
     static constexpr int NUM_CONSUMERS = 2;
-    static constexpr int WARPS_PER_CONSUMER = 4;
+    static constexpr int WARPS_PER_CONSUMER = 8;
 
     static_assert(NUM_CONSUMERS == 2);
-    static_assert(WARPS_PER_CONSUMER == 4);
+    static_assert(WARPS_PER_CONSUMER == 8);
     static_assert(config::NUM_CONSUMER_WARPS == WARPS_PER_CONSUMER*NUM_CONSUMERS, 
-                  "RingAttentionOp requires 8 consumer warpgroups.");
+                  "RingAttentionOp requires 16 consumer warpgroups.");
 
     struct parsed_instruction {
         int B;             // batch index              (in units of 1)

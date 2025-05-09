@@ -5,7 +5,8 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec, NamedSharding
 from time import time
 
-from ringattention import ringattention # https://github.com/haoliuhl/ringattention
+# https://github.com/haoliuhl/ringattention
+from ringattention import ringattention, ringattention_inference
 
 
 ###
@@ -13,8 +14,9 @@ from ringattention import ringattention # https://github.com/haoliuhl/ringattent
 ###
 NUM_DEVICES = 4 
 NUM_ITERS = 5
-NUM_WARMUPS = 0
-B, H, N, D_h = 16, 16, 256*NUM_DEVICES, 64
+NUM_WARMUPS = 2
+B, H, N, D_h = 16, 16, 4096*NUM_DEVICES, 64
+CHECK_CORRECT = False
 
 assert NUM_DEVICES>=1, 'NUM_DEVICES must be >= 1'
 assert N%NUM_DEVICES==0, 'N must be divisible by NUM_DEVICES'
@@ -34,11 +36,12 @@ V = jax.random.normal(key_V, (B, H, N, D_h), dtype=jnp.bfloat16)
 ###
 #   Run the reference implementation
 ###
-print('\nRunning Reference Implementation...')
-_ = jnp.matmul(Q, K.transpose(0, 1, 3, 2)).astype(jnp.float32)
-_ /= (Q.shape[-1] ** 0.5)
-_ = jax.nn.softmax(_, axis=-1).astype(jnp.bfloat16)
-O_ref = jnp.matmul(_, V)
+if CHECK_CORRECT:
+    print('\nRunning Reference Implementation...')
+    _ = jnp.matmul(Q, K.transpose(0, 1, 3, 2)).astype(jnp.float32)
+    _ /= (Q.shape[-1] ** 0.5)
+    _ = jax.nn.softmax(_, axis=-1).astype(jnp.bfloat16)
+    O_ref = jnp.matmul(_, V)
 
 
 ###
@@ -60,10 +63,10 @@ ring_attn_sharded = shard_map( # shard_map automatically JITs the function
             deterministic=True,
             dropout_rng=None,
             attn_pdrop=0.0,
-            query_chunk_size=N//8, # or other value
-            key_chunk_size=N//8, # or other value
+            query_chunk_size=N//NUM_DEVICES, # as large as possible for speed
+            key_chunk_size=N//NUM_DEVICES,
             dtype=jax.numpy.bfloat16,
-            policy=jax.checkpoint_policies.nothing_saveable,
+            policy=None,
             precision=None,
             prevent_cse=True,
         )
@@ -109,8 +112,9 @@ def check_diff(x, y):
     print("Mean Abs Diff:", mean_abs_diff)
     print("Max Abs Diff:", max_abs_diff)
 
-print('\nChecking correctness...')
-check_diff(O, O_ref)
+if CHECK_CORRECT:
+    print('\nChecking correctness...')
+    check_diff(O, O_ref)
 
 
 ###
@@ -119,10 +123,12 @@ check_diff(O, O_ref)
 print('\nKernel finished, now benchmarking...')
 for i in range(NUM_WARMUPS):
     _ = ring_attn_sharded(Q, K, V, attn_bias, seg_ids)
+    jax.block_until_ready(_)
 times = []
 for i in range(NUM_ITERS):
     start_time = time()
     _ = ring_attn_sharded(Q, K, V, attn_bias, seg_ids)
+    jax.block_until_ready(_)
     end_time = time()
     times.append(end_time - start_time)
 avg_time = sum(times) / NUM_ITERS

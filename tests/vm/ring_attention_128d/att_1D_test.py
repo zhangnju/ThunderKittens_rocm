@@ -158,6 +158,8 @@ print('\nChecking correctness...')
 for dev_id in dev_ids:
     O_ref, L_ref, M_ref = pytorch_blk_attn(Qs[dev_id].cpu(), Ks[dev_id], Vs[dev_id])
     check_diff(Os[dev_id].cpu(), O_ref)
+    check_diff(Ls[dev_id].cpu(), L_ref)
+    check_diff(Ms[dev_id].cpu(), M_ref[:, :, :, 0])
 
 
 ###

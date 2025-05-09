@@ -3,6 +3,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec, NamedSharding
+from time import time
+
 from ringattention import ringattention # https://github.com/haoliuhl/ringattention
 
 
@@ -109,3 +111,22 @@ def check_diff(x, y):
 
 print('\nChecking correctness...')
 check_diff(O, O_ref)
+
+
+###
+#  Check speed
+###
+print('\nKernel finished, now benchmarking...')
+for i in range(NUM_WARMUPS):
+    _ = ring_attn_sharded(Q, K, V, attn_bias, seg_ids)
+times = []
+for i in range(NUM_ITERS):
+    start_time = time()
+    _ = ring_attn_sharded(Q, K, V, attn_bias, seg_ids)
+    end_time = time()
+    times.append(end_time - start_time)
+avg_time = sum(times) / NUM_ITERS
+total_tflops = (4 * B * H * N * N * D_h + 4 * B * H * N * N) * 1e-12
+print(f'Average time per iter: {avg_time * 1e6} us')
+print(f'Total TFLOP/s: {total_tflops / avg_time}')
+print(f'Per-device TFLOP/s: {(total_tflops / NUM_DEVICES) / avg_time}')

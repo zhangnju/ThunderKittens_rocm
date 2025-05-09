@@ -137,6 +137,13 @@ for dev_id in dev_ids:
 ###
 #  Verify correctness
 ###
+def pytorch_mha(q, k, v):
+    QK = torch.matmul(q, k.transpose(-2, -1))
+    QK /= (q.size(-1) ** 0.5)
+    QK = torch.nn.functional.softmax(QK, dim=-1)
+    out = torch.matmul(QK, v)
+    return out
+
 def pytorch_blk_attn(q, k, v):
     QK = torch.matmul(q.float(), k.float().transpose(-2, -1))
     max_vec = torch.max(QK, dim=-1, keepdim=True).values
@@ -160,7 +167,8 @@ for dev_id in dev_ids:
     check_diff(Os[dev_id].cpu(), O_ref)
     check_diff(Ls[dev_id].cpu(), L_ref)
     check_diff(Ms[dev_id].cpu(), M_ref[:, :, :, 0])
-
+    O_ref = pytorch_mha(Qs[dev_id], Ks[dev_id].to(Qs[dev_id].device), Vs[dev_id].to(Qs[dev_id].device))
+    check_diff(Os[dev_id] / Ls[dev_id].unsqueeze(-1), O_ref)
 
 ###
 #  Check speed

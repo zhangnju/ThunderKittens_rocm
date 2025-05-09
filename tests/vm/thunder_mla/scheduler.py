@@ -241,9 +241,6 @@ def sample_schedule_generator( new_tokens: int = 1, lengths: List[int] = None, c
         tasks.extend(seq_tasks)
     return tasks
 
-
-
-
 def visualize_schedule(tasks: List[Task], num_processors: int):
     """
     Plots a Gantt chart of the scheduled tasks.

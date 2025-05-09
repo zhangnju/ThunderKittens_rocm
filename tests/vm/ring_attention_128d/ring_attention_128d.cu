@@ -370,8 +370,7 @@ template<typename config=config> struct RingAttentionOp {
                 if (consumer::laneid() == 0) {
                     arrive(k_finished(s, stage));
                     if (i == inst.num_kv_blocks - 1) {
-                        s.finish_page(get_q_page(s, consumer_id), config::NUM_CONSUMER_WARPS);
-                        s.finish_page(get_q_page(s, consumer_id) + 1, config::NUM_CONSUMER_WARPS); // 32KB total
+                        s.finish_page(get_q_page(s, consumer_id), config::NUM_CONSUMER_WARPS); // use 1 page to signal 2 pages
                     }
                 }
                 rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE> att_fl;
@@ -466,8 +465,7 @@ template<typename config=config> struct RingAttentionOp {
                 wait(o_finished(s, consumer_id), 0);
                 tma::store_async(g.O, out, {inst.B, inst.H, local_QO_idx, 0});
                 tma::store_async_read_wait();
-                s.finish_page(ao_page, config::NUM_CONSUMER_WARPS);
-                s.finish_page(ao_page + 1, config::NUM_CONSUMER_WARPS); // 2 pages, 32KB total
+                s.finish_page(ao_page, config::NUM_CONSUMER_WARPS); // use 1 page to signal 2 pages
             } else if (laneid < 4) { // store Ls and Ms
                 int consumer_id = laneid-2;
                 int local_QO_idx = inst.QO_idx + NUM_CONSUMERS*ctarank + consumer_id;

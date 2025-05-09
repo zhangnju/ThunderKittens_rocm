@@ -319,15 +319,11 @@ template<typename config=config> struct RingAttentionOp {
             using all_consumers = group<NUM_CONSUMERS*WARPS_PER_CONSUMER>;
             using consumer = group<WARPS_PER_CONSUMER>;
             
-            constexpr float softmax_scale = 0.08838834764831843f;          // 1 / sqrt(HEAD_DIM=128)
-            constexpr float softmax_temp = softmax_scale * 1.44269504089f; // 1 / {sqrt(HEAD_DIM=128) * ln(2)}
+            constexpr float softmax_temp = 0.08838834764831843f * 1.44269504089f; // 1 / {sqrt(HEAD_DIM=128) * ln(2)}
 
             parsed_instruction inst{s};
-            int ctarank = cluster_ctarank();
             int consumer_id = consumer::groupid();
 
-            rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE> att_fl;
-            rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, HEAD_DIM> out_fl;
             col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> max_vec;
             col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> scaled_max_vec;
             col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> last_scaled_max_vec;
@@ -348,13 +344,11 @@ template<typename config=config> struct RingAttentionOp {
             wait(lm_arrived(s, consumer_id), 0);
 
             if (inst.ring_stage == 0) {
-                warp::zero(out_fl);
                 warp::neg_infty(max_vec);
                 warp::zero(last_scaled_max_vec); // correct as long as not +-inf
                 warp::zero(norm_vec);
             } else {
                 // Continue from the previous ring stage
-                consumer::load(out_fl, out);
                 consumer::load(max_vec, m);
                 consumer::load(norm_vec, l); // note that l is not an LSE until the last stage
                 warp::mul(last_scaled_max_vec, max_vec, softmax_temp);
@@ -377,6 +371,7 @@ template<typename config=config> struct RingAttentionOp {
                         s.finish_page(get_q_page(s, consumer_id) + 1, config::NUM_CONSUMER_WARPS); // 32KB total
                     }
                 }
+                rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE> att_fl;
                 consumer::load_async(att_fl, qk_accumulator);
                 tensor_load_wait();
                 __syncwarp();
@@ -402,7 +397,11 @@ template<typename config=config> struct RingAttentionOp {
                 warp::row_sum(norm_vec, att_fl, norm_vec);
 
                 // Prepare for AV
-                if (i > 0) { // must accumulate on the previous AV matmul
+                rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, HEAD_DIM> out_fl;
+                if (i == 0) {
+                    if (inst.ring_stage == 0) warp::zero(out_fl);
+                    else consumer::load(out_fl, out);
+                } else { // must accumulate on the previous AV matmul
                     tma::cluster::wait(av_finished(s, consumer_id), get_phasebit<1>(phasebit, 0));
                     update_phasebit<1>(phasebit, 0);
                     int prev_stage = (i + PIPELINE_STAGES - 1) % PIPELINE_STAGES;
@@ -423,6 +422,7 @@ template<typename config=config> struct RingAttentionOp {
             // Wait for the last AV matmul to finish and load the final output
             tma::cluster::wait(av_finished(s, consumer_id), get_phasebit<1>(phasebit, 0));
             if (consumer::laneid() == 0) arrive(v_finished(s, (inst.num_kv_blocks - 1) % PIPELINE_STAGES));
+            rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, HEAD_DIM> out_fl;
             consumer::load_async(out_fl, av_accumulator);
             tensor_load_wait(); // TODO: is this needed?
             __syncwarp();       // TODO: is this needed?

@@ -397,22 +397,22 @@ template<typename config=config> struct RingAttentionOp {
                 warp::row_sum(norm_vec, att_fl, norm_vec);
 
                 // Prepare for AV
-                rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, HEAD_DIM> out_fl;
                 if (i == 0) {
-                    if (inst.ring_stage == 0) warp::zero(out_fl);
-                    else consumer::load(out_fl, out);
+                    consumer::store(att, att_fl); // <-- culprit: 400 tflops down
+                    if (inst.ring_stage == 0) warp::zero(att_fl);
+                    else consumer::load(att_fl, out);
                 } else { // must accumulate on the previous AV matmul
                     tma::cluster::wait(av_finished(s, consumer_id), get_phasebit<1>(phasebit, 0));
                     update_phasebit<1>(phasebit, 0);
                     int prev_stage = (i + PIPELINE_STAGES - 1) % PIPELINE_STAGES;
                     if (consumer::laneid() == 0) arrive(v_finished(s, prev_stage));
-                    consumer::load_async(out_fl, av_accumulator);
+                    consumer::store(att, att_fl); // <-- culprit: 400 tflops down
+                    consumer::load_async(att_fl, av_accumulator);
                     tensor_load_wait(); // TODO: is this needed?
                     __syncwarp();       // TODO: is this needed?
                 }
-                warp::mul_row(out_fl, out_fl, diff_scaled_max_vec); // normalize previous outputs
-                consumer::store_async(av_accumulator, out_fl); // culprit: 800 tflops down
-                consumer::store(att, att_fl); // <-- culprit: 400 tflops down
+                warp::mul_row(att_fl, att_fl, diff_scaled_max_vec); // normalize previous outputs
+                consumer::store_async(av_accumulator, att_fl); // culprit: 800 tflops down
                 tensor_store_wait();
                 __syncwarp();
                 if (warp::laneid() == 0) tma::cluster::arrive(av_ready(s, consumer_id), 0); // must arrive per warp

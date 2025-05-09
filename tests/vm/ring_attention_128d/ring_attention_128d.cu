@@ -355,7 +355,7 @@ template<typename config=config> struct RingAttentionOp {
                 warp::mul(last_scaled_max_vec, max_vec, softmax_temp);
                 rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE> att_fl;
                 consumer::load(att_fl, att);
-                consumer::store_async(av_accumulator, att_fl); // culprit: 800 tflops down
+                consumer::store_async(av_accumulator, att_fl);
                 tensor_store_wait();
                 __syncwarp();
             }
@@ -401,7 +401,7 @@ template<typename config=config> struct RingAttentionOp {
 
                 // Prepare for AV
                 if (i == 0) {
-                    consumer::store(att, att_fl); // <-- culprit: 400 tflops down
+                    consumer::store(att, att_fl);
                     if (inst.ring_stage == 0) {
                         warp::zero(att_fl);
                     } else {
@@ -414,13 +414,13 @@ template<typename config=config> struct RingAttentionOp {
                     update_phasebit<1>(phasebit, 0);
                     int prev_stage = (i + PIPELINE_STAGES - 1) % PIPELINE_STAGES;
                     if (consumer::laneid() == 0) arrive(v_finished(s, prev_stage));
-                    consumer::store(att, att_fl); // <-- culprit: 400 tflops down
+                    consumer::store(att, att_fl);
                     consumer::load_async(att_fl, av_accumulator);
                     tensor_load_wait(); // TODO: is this needed?
                     __syncwarp();       // TODO: is this needed?
                 }
                 warp::mul_row(att_fl, att_fl, diff_scaled_max_vec); // normalize previous outputs
-                consumer::store_async(av_accumulator, att_fl); // culprit: 800 tflops down
+                consumer::store_async(av_accumulator, att_fl);
                 tensor_store_wait();
                 __syncwarp();
                 if (warp::laneid() == 0) tma::cluster::arrive(av_ready(s, consumer_id), 0); // must arrive per warp
@@ -445,10 +445,10 @@ template<typename config=config> struct RingAttentionOp {
             }
 
             // Store the outputs and signal the storer
-            consumer::store(att, att_fl); // <-- culprit: 400 tflops down
+            consumer::store(att, att_fl);
             warp::arrive(o_finished(s, consumer_id));
-            consumer::store(l, norm_vec); // <-- culprit: 400 tflops down
-            consumer::store(m, max_vec);   // <-- culprit: 100 tflops down
+            consumer::store(l, norm_vec);
+            consumer::store(m, max_vec);
             warp::arrive(lm_finished(s, consumer_id));
         }
     };

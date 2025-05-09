@@ -27,8 +27,8 @@ struct ring_attention_config
     static constexpr int NUM_CONSUMER_WARPS = 16;
     static constexpr int CLUSTER_BLOCKS = 2; // for 2-CTA cooperative matmuls
     static constexpr int SCRATCH_BYTES = 2048; // need at least 2048
-    static constexpr int CONSUMER_REGISTERS = 104;
-    static constexpr int NON_CONSUMER_REGISTERS = 64;
+    static constexpr int CONSUMER_REGISTERS = 96;
+    static constexpr int NON_CONSUMER_REGISTERS = 96;
 
     // Same as default
     static constexpr int INSTRUCTION_WIDTH = 32;
@@ -323,7 +323,6 @@ template<typename config=config> struct RingAttentionOp {
             parsed_instruction inst{s};
             int consumer_id = consumer::groupid();
 
-            rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE> att_fl;
             col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> max_vec;
             col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> scaled_max_vec;
             col_vec<rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE>> last_scaled_max_vec;
@@ -354,6 +353,7 @@ template<typename config=config> struct RingAttentionOp {
                 consumer::load(max_vec, m);
                 consumer::load(norm_vec, l); // note that l is not an LSE until the last stage
                 warp::mul(last_scaled_max_vec, max_vec, softmax_temp);
+                rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE> att_fl;
                 consumer::load(att_fl, att);
                 consumer::store_async(av_accumulator, att_fl); // culprit: 800 tflops down
                 tensor_store_wait();
@@ -374,6 +374,7 @@ template<typename config=config> struct RingAttentionOp {
                         s.finish_page(get_q_page(s, consumer_id) + 1, config::NUM_CONSUMER_WARPS); // 32KB total
                     }
                 }
+                rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE> att_fl;
                 consumer::load_async(att_fl, qk_accumulator);
                 tensor_load_wait();
                 __syncwarp();
@@ -429,6 +430,7 @@ template<typename config=config> struct RingAttentionOp {
             // Wait for the last AV matmul to finish and load the final output
             tma::cluster::wait(av_finished(s, consumer_id), get_phasebit<1>(phasebit, 0));
             if (consumer::laneid() == 0) arrive(v_finished(s, (inst.num_kv_blocks - 1) % PIPELINE_STAGES));
+            rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE> att_fl;
             consumer::load_async(att_fl, av_accumulator);
             tensor_load_wait(); // TODO: is this needed?
             __syncwarp();       // TODO: is this needed?

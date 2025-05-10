@@ -13,8 +13,8 @@ from ringattention import ringattention
 #   Global Parameters
 ###
 NUM_DEVICES = 4 
-NUM_ITERS = 1
-NUM_WARMUPS = 0
+NUM_ITERS = 5
+NUM_WARMUPS = 2
 B, H, N, D_h = 8, 8, 16384*16*NUM_DEVICES, 128
 CHECK_CORRECT = False
 

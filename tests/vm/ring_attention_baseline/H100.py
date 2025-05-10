@@ -6,7 +6,7 @@ from jax.sharding import PartitionSpec, NamedSharding
 from time import time
 
 # https://github.com/haoliuhl/ringattention
-from ringattention import ringattention, ringattention_inference
+from ringattention import ringattention
 
 
 ###
@@ -47,7 +47,7 @@ if CHECK_CORRECT:
 ###
 #   Run the original ring attention
 ###
-print('\nRunning Original Ring Attention...')
+print('\nPreparing for original ring attention...')
 mesh = jax.make_mesh((1, 1, NUM_DEVICES, 1), ("dp", "fsdp", "sp", "tp"))
 QKVO_ps = PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
 bias_ps = PartitionSpec(("dp", "fsdp"), None, None, None)
@@ -93,6 +93,7 @@ attn_bias = jax.device_put(jnp.zeros((B, 1, 1, N)), NamedSharding(mesh, bias_ps)
 seg_ids = jax.device_put(jnp.zeros((B, N), dtype=jnp.int32), NamedSharding(mesh, seg_ids_ps))
 
 # Calculate and reshape output
+print('\nRunning original ring attention...')
 O = ring_attn_sharded(Q, K, V, attn_bias, seg_ids)
 
 

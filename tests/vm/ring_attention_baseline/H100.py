@@ -13,9 +13,9 @@ from ringattention import ringattention, ringattention_inference
 #   Global Parameters
 ###
 NUM_DEVICES = 4 
-NUM_ITERS = 5
-NUM_WARMUPS = 2
-B, H, N, D_h = 16, 16, 4096*NUM_DEVICES, 64
+NUM_ITERS = 1
+NUM_WARMUPS = 0
+B, H, N, D_h = 8, 16, 16384*4*NUM_DEVICES, 128
 CHECK_CORRECT = False
 
 assert NUM_DEVICES>=1, 'NUM_DEVICES must be >= 1'
@@ -63,8 +63,8 @@ ring_attn_sharded = shard_map( # shard_map automatically JITs the function
             deterministic=True,
             dropout_rng=None,
             attn_pdrop=0.0,
-            query_chunk_size=N//NUM_DEVICES, # as large as possible for speed
-            key_chunk_size=N//NUM_DEVICES,
+            query_chunk_size=(N//NUM_DEVICES)//16, # should be as large as possible for speed
+            key_chunk_size=(N//NUM_DEVICES)//16,
             dtype=jax.numpy.bfloat16,
             policy=None,
             precision=None,
@@ -122,13 +122,11 @@ if CHECK_CORRECT:
 ###
 print('\nKernel finished, now benchmarking...')
 for i in range(NUM_WARMUPS):
-    _ = ring_attn_sharded(Q, K, V, attn_bias, seg_ids)
-    jax.block_until_ready(_)
+    _ = ring_attn_sharded(Q, K, V, attn_bias, seg_ids).block_until_ready()
 times = []
 for i in range(NUM_ITERS):
     start_time = time()
-    _ = ring_attn_sharded(Q, K, V, attn_bias, seg_ids)
-    jax.block_until_ready(_)
+    _ = ring_attn_sharded(Q, K, V, attn_bias, seg_ids).block_until_ready()
     end_time = time()
     times.append(end_time - start_time)
 avg_time = sum(times) / NUM_ITERS

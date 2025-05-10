@@ -1,0 +1,5 @@
+jax[cuda12]==0.5.3
+numpy==2.2.5
+einops==0.8.1
+flax==0.10.5
+ringattention==0.1.2 # https://github.com/haoliuhl/ringattention

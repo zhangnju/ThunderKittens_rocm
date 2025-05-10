@@ -176,6 +176,7 @@ template<typename config=config> struct RingAttentionOp {
                 auto q_page = get_q_page(s, consumer_id);
                 auto &q = *reinterpret_cast<q_tile *>(s.pages[q_page].data);
                 s.wait_page_ready(q_page);
+                s.wait_page_ready(q_page + 1);
                 tma::cluster::expect(q_arrived(s, consumer_id), 0, q);
                 tma::cluster::load_async(q, g.Q, {inst.B, inst.H, local_QO_idx, 0}, q_arrived(s, consumer_id), (uint16_t)(1<<ctarank), 0);
             } else if (laneid == 2) { // Load Ks
@@ -232,6 +233,7 @@ template<typename config=config> struct RingAttentionOp {
                 auto ao_page = get_ao_page(s, consumer_id);
                 auto &out = *reinterpret_cast<ao_tile *>(s.pages[ao_page].data);
                 s.wait_page_ready(ao_page);
+                s.wait_page_ready(ao_page + 1);
                 if (inst.ring_stage == 0) {
                     arrive(o_arrived(s, consumer_id));
                 } else {
@@ -370,7 +372,8 @@ template<typename config=config> struct RingAttentionOp {
                 if (consumer::laneid() == 0) {
                     arrive(k_finished(s, stage));
                     if (i == inst.num_kv_blocks - 1) {
-                        s.finish_page(get_q_page(s, consumer_id), config::NUM_CONSUMER_WARPS); // use 1 page to signal 2 pages
+                        s.finish_page(get_q_page(s, consumer_id), config::NUM_CONSUMER_WARPS);
+                        s.finish_page(get_q_page(s, consumer_id) + 1, config::NUM_CONSUMER_WARPS);
                     }
                 }
                 rt_fl<QO_BLOCK_SIZE / WARPS_PER_CONSUMER, KV_BLOCK_SIZE> att_fl;
@@ -465,7 +468,8 @@ template<typename config=config> struct RingAttentionOp {
                 wait(o_finished(s, consumer_id), 0);
                 tma::store_async(g.O, out, {inst.B, inst.H, local_QO_idx, 0});
                 tma::store_async_read_wait();
-                s.finish_page(ao_page, config::NUM_CONSUMER_WARPS); // use 1 page to signal 2 pages
+                s.finish_page(ao_page, config::NUM_CONSUMER_WARPS);
+                s.finish_page(ao_page + 1, config::NUM_CONSUMER_WARPS);
             } else if (laneid < 4) { // store Ls and Ms
                 int consumer_id = laneid-2;
                 int local_QO_idx = inst.QO_idx + NUM_CONSUMERS*ctarank + consumer_id;

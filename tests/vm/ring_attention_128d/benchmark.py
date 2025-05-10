@@ -11,10 +11,10 @@ SM_COUNT = 148
 NUM_DEVICES = 4
 NUM_COMMS = 8 # this is the magic number that works the best
 NUM_ITERS = 5
-NUM_WARMUPS = 0
+NUM_WARMUPS = 2
 ATTN_OPCODE = 725
 COMM_OPCODE = 97
-B, H, N, D_h = 8, 16, 16384*NUM_DEVICES, 128
+B, H, N, D_h = 1, 16, 16384*NUM_DEVICES*64, 128
 
 assert N%NUM_DEVICES==0, "N must be divisible by NUM_DEVICES"
 assert (N//NUM_DEVICES)%512==0, "N_per_dev must be divisible by 512 (QO Block Size * NUM_CONSUMERS * CTA Cluster Size)"

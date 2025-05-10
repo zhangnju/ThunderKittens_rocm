@@ -12,10 +12,10 @@ from ringattention import ringattention
 ###
 #   Global Parameters
 ###
-NUM_DEVICES = 4 
-NUM_ITERS = 5
-NUM_WARMUPS = 2
-B, H, N, D_h = 8, 8, 16384*16*NUM_DEVICES, 128
+NUM_DEVICES = 4
+NUM_ITERS = 1
+NUM_WARMUPS = 0
+B, H, N, D_h = 1, 16, 16384*NUM_DEVICES*64, 128
 CHECK_CORRECT = False
 
 assert NUM_DEVICES>=1, 'NUM_DEVICES must be >= 1'
@@ -63,8 +63,8 @@ ring_attn_sharded = shard_map( # shard_map automatically JITs the function
             deterministic=True,
             dropout_rng=None,
             attn_pdrop=0.0,
-            query_chunk_size=(N//NUM_DEVICES)//64, # should be as large as possible for speed
-            key_chunk_size=(N//NUM_DEVICES)//64,
+            query_chunk_size=(N//NUM_DEVICES)//32, # should be as large as possible for speed
+            key_chunk_size=(N//NUM_DEVICES)//32,
             dtype=jax.numpy.bfloat16,
             policy=None,
             precision=None,

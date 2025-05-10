@@ -28,9 +28,9 @@ assert N%NUM_DEVICES==0, 'N must be divisible by NUM_DEVICES'
 print(f'Starting test with B={B}, H={H}, N={N}, D_h={D_h}, NUM_DEVICES={NUM_DEVICES}')
 print('\nGenerating inputs...')
 key_Q, key_K, key_V = jax.random.split(jax.random.PRNGKey(42), 3)
-Q = jax.random.normal(key_Q, (B, H, N, D_h), dtype=jnp.bfloat16)
-K = jax.random.normal(key_K, (B, H, N, D_h), dtype=jnp.bfloat16)
-V = jax.random.normal(key_V, (B, H, N, D_h), dtype=jnp.bfloat16)
+Q = jax.random.normal(key_Q, (B, N, H, D_h), dtype=jnp.bfloat16) # original implementation uses (B, N, H, D)
+K = jax.random.normal(key_K, (B, N, H, D_h), dtype=jnp.bfloat16)
+V = jax.random.normal(key_V, (B, N, H, D_h), dtype=jnp.bfloat16)
 
 
 ###
@@ -38,10 +38,10 @@ V = jax.random.normal(key_V, (B, H, N, D_h), dtype=jnp.bfloat16)
 ###
 if CHECK_CORRECT:
     print('\nRunning Reference Implementation...')
-    _ = jnp.matmul(Q, K.transpose(0, 1, 3, 2)).astype(jnp.float32)
+    _ = jnp.matmul(Q.transpose(0, 2, 1, 3), K.transpose(0, 2, 3, 1)).astype(jnp.float32)
     _ /= (Q.shape[-1] ** 0.5)
     _ = jax.nn.softmax(_, axis=-1).astype(jnp.bfloat16)
-    O_ref = jnp.matmul(_, V)
+    O_ref = jnp.matmul(_, V.transpose(0, 2, 1, 3)).transpose(0, 2, 1, 3)
 
 
 ###
@@ -83,11 +83,10 @@ ring_attn_sharded = shard_map( # shard_map automatically JITs the function
     check_rep=False
 )
 
-# Reshape and shard inputs accordingly
-# The original implementation uses (B, N, H, D) format
-Q = jax.device_put(Q.transpose(0, 2, 1, 3), NamedSharding(mesh, QKVO_ps))
-K = jax.device_put(K.transpose(0, 2, 1, 3), NamedSharding(mesh, QKVO_ps))
-V = jax.device_put(V.transpose(0, 2, 1, 3), NamedSharding(mesh, QKVO_ps))
+# Shard inputs accordingly
+Q = jax.device_put(Q, NamedSharding(mesh, QKVO_ps))
+K = jax.device_put(K, NamedSharding(mesh, QKVO_ps))
+V = jax.device_put(V, NamedSharding(mesh, QKVO_ps))
 
 # We don't care about bias / segments
 attn_bias = jax.device_put(jnp.zeros((B, 1, 1, N)), NamedSharding(mesh, bias_ps))
@@ -95,7 +94,6 @@ seg_ids = jax.device_put(jnp.zeros((B, N), dtype=jnp.int32), NamedSharding(mesh,
 
 # Calculate and reshape output
 O = ring_attn_sharded(Q, K, V, attn_bias, seg_ids)
-O = O.transpose(0, 2, 1, 3) # back to (B, N, H, D)
 
 
 ###

@@ -506,6 +506,7 @@ template<typename config=config> struct CommOp {
         int dev_idx;
         int prev_dev_idx;
         int next_dev_idx;
+        int ring_stage;
         __device__ inline parsed_instruction(typename config::instruction_t &instruction) {
             k_or_v = instruction[1];
             num_chunks = instruction[2];
@@ -517,6 +518,7 @@ template<typename config=config> struct CommOp {
             dev_idx = instruction[8];
             prev_dev_idx = instruction[9];
             next_dev_idx = instruction[10];
+            ring_stage = instruction[11];
         }
         __device__ inline parsed_instruction(state<config> &s): parsed_instruction(s.instruction()) {}
     };
@@ -559,56 +561,57 @@ template<typename config=config> struct CommOp {
                 auto &data = reinterpret_cast<comm_tile &>(s.pages[page]);
                 int phasebit = 0;
                 int iters = (inst.num_chunks + config::NUM_PAGES - 1) / config::NUM_PAGES;
-                for (int ring_stage = 0; ring_stage < globals::num_devices - 1; ++ring_stage) {
-                    // Are we ready to move on? == previous device's store done + current device's compute done + next device's load done
-                    // TODO: technically, I can put the latter two conditions before the first store
-                    while (ring_stage > 0 && 
-                           (*(volatile int *)&g.barriers[inst.prev_dev_idx][{ring_stage - 1}] < inst.num_comms + inst.num_comps ||
-                            *(volatile int *)&g.barriers[inst.dev_idx     ][{ring_stage - 1}] < inst.num_comms + inst.num_comps ||
-                            *(volatile int *)&g.barriers[inst.next_dev_idx][{ring_stage - 1}] < inst.num_comms + inst.num_comps))
-                        __nanosleep(20);
-                    for (int i = 0; i < iters; ++i) {
-                        int local_index = i * config::NUM_PAGES + laneid;
-                        if (local_index < inst.num_chunks) {
-                            int index = inst.comm_idx * inst.num_chunks + local_index;
-                            int B_idx = (index / inst.num_chunks_N / inst.num_chunks_H);
-                            int H_idx = (index / inst.num_chunks_N) % inst.num_chunks_H;
-                            int N_idx = index % inst.num_chunks_N;
-                            kittens::tma::expect(data_arrived(s, laneid), data);
-                            if (inst.k_or_v == 0) {
-                                if (ring_stage % 2 == 0)
-                                    kittens::tma::load_async(data, g.K0s[inst.prev_dev_idx], {B_idx, H_idx, N_idx, 0}, data_arrived(s, laneid));
-                                else
-                                    kittens::tma::load_async(data, g.K1s[inst.prev_dev_idx], {B_idx, H_idx, N_idx, 0}, data_arrived(s, laneid));
-                            } else {
-                                if (ring_stage % 2 == 0)
-                                    kittens::tma::load_async(data, g.V0s[inst.prev_dev_idx], {B_idx, H_idx, N_idx, 0}, data_arrived(s, laneid));
-                                else
-                                    kittens::tma::load_async(data, g.V1s[inst.prev_dev_idx], {B_idx, H_idx, N_idx, 0}, data_arrived(s, laneid));
-                            }
-                            wait(data_arrived(s, laneid), phasebit);
-                            phasebit ^= 1;
-                            if (inst.k_or_v == 0) {
-                                if (ring_stage % 2 == 0)
-                                    kittens::tma::store_async(g.K1s[inst.dev_idx], data, {B_idx, H_idx, N_idx, 0});
-                                else
-                                    kittens::tma::store_async(g.K0s[inst.dev_idx], data, {B_idx, H_idx, N_idx, 0});
-                            } else {
-                                if (ring_stage % 2 == 0)
-                                    kittens::tma::store_async(g.V1s[inst.dev_idx], data, {B_idx, H_idx, N_idx, 0});
-                                else
-                                    kittens::tma::store_async(g.V0s[inst.dev_idx], data, {B_idx, H_idx, N_idx, 0});
-                            }
+
+                // Are we ready to move on? == previous device's store done + current device's compute done + next device's load done
+                // TODO: technically, I can put the latter two conditions before the first store
+                while (inst.ring_stage > 0 && 
+                        (*(volatile int *)&g.barriers[inst.prev_dev_idx][{inst.ring_stage - 1}] < inst.num_comms + inst.num_comps ||
+                        *(volatile int *)&g.barriers[inst.dev_idx     ][{inst.ring_stage - 1}] < inst.num_comms + inst.num_comps ||
+                        *(volatile int *)&g.barriers[inst.next_dev_idx][{inst.ring_stage - 1}] < inst.num_comms + inst.num_comps))
+                    __nanosleep(20);
+
+                for (int i = 0; i < iters; ++i) {
+                    int local_index = i * config::NUM_PAGES + laneid;
+                    if (local_index < inst.num_chunks) {
+                        int index = inst.comm_idx * inst.num_chunks + local_index;
+                        int B_idx = (index / inst.num_chunks_N / inst.num_chunks_H);
+                        int H_idx = (index / inst.num_chunks_N) % inst.num_chunks_H;
+                        int N_idx = index % inst.num_chunks_N;
+                        kittens::tma::expect(data_arrived(s, laneid), data);
+                        if (inst.k_or_v == 0) {
+                            if (inst.ring_stage % 2 == 0)
+                                kittens::tma::load_async(data, g.K0s[inst.prev_dev_idx], {B_idx, H_idx, N_idx, 0}, data_arrived(s, laneid));
+                            else
+                                kittens::tma::load_async(data, g.K1s[inst.prev_dev_idx], {B_idx, H_idx, N_idx, 0}, data_arrived(s, laneid));
+                        } else {
+                            if (inst.ring_stage % 2 == 0)
+                                kittens::tma::load_async(data, g.V0s[inst.prev_dev_idx], {B_idx, H_idx, N_idx, 0}, data_arrived(s, laneid));
+                            else
+                                kittens::tma::load_async(data, g.V1s[inst.prev_dev_idx], {B_idx, H_idx, N_idx, 0}, data_arrived(s, laneid));
                         }
-                        asm volatile("{bar.warp.sync %0;}" ::"n"(membermask));
-                        if (laneid == 0) asm volatile("{cp.async.bulk.wait_group 0;}");
-                        asm volatile("{bar.warp.sync %0;}" ::"n"(membermask));
+                        wait(data_arrived(s, laneid), phasebit);
+                        phasebit ^= 1;
+                        if (inst.k_or_v == 0) {
+                            if (inst.ring_stage % 2 == 0)
+                                kittens::tma::store_async(g.K1s[inst.dev_idx], data, {B_idx, H_idx, N_idx, 0});
+                            else
+                                kittens::tma::store_async(g.K0s[inst.dev_idx], data, {B_idx, H_idx, N_idx, 0});
+                        } else {
+                            if (inst.ring_stage % 2 == 0)
+                                kittens::tma::store_async(g.V1s[inst.dev_idx], data, {B_idx, H_idx, N_idx, 0});
+                            else
+                                kittens::tma::store_async(g.V0s[inst.dev_idx], data, {B_idx, H_idx, N_idx, 0});
+                        }
                     }
-                    if (laneid == 0) {
-                        asm volatile("{fence.acq_rel.sys;}");
-                        atomicAdd_system(&g.barriers[inst.dev_idx][{ring_stage}], 1); // mark store finished
-                    }
+                    asm volatile("{bar.warp.sync %0;}" ::"n"(membermask));
+                    if (laneid == 0) asm volatile("{cp.async.bulk.wait_group 0;}");
+                    asm volatile("{bar.warp.sync %0;}" ::"n"(membermask));
                 }
+                if (laneid == 0) {
+                    asm volatile("{fence.acq_rel.sys;}");
+                    atomicAdd_system(&g.barriers[inst.dev_idx][{inst.ring_stage}], 1); // mark store finished
+                }
+
                 s.finish_page(page, config::NUM_CONSUMER_WARPS); 
             }
         }

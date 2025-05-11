@@ -72,13 +72,14 @@ for torch_device in torch_devices:
     assert NUM_COMMS % 2 == 0, "NUM_COMMS must be even"
     assert total_chunks % (num_comms_per_kv) == 0, "total_chunks must be divisible by NUM_COMMS / 2"
     num_comps = 0 # for testing comms only
-    for i in range(NUM_COMMS):
-        k_or_v = i // (num_comms_per_kv)
-        comm_idx = i % (num_comms_per_kv)
-        dev_instructions[i].append(
-            [COMM_OPCODE, k_or_v, num_chunks_per_comm, comm_idx, NUM_COMMS, num_comps, num_chunks_N, H, dev_idx, prev_dev_idx, next_dev_idx] 
-            + [0]*21
-        )
+    for ring_stage in range(num_ring_stages - 1): # important to exclude the last stage in which only the compute happens
+        for i in range(NUM_COMMS):
+            k_or_v = i // (num_comms_per_kv)
+            comm_idx = i % (num_comms_per_kv)
+            dev_instructions[i].append(
+                [COMM_OPCODE, k_or_v, num_chunks_per_comm, comm_idx, NUM_COMMS, num_comps, num_chunks_N, H, dev_idx, prev_dev_idx, next_dev_idx, ring_stage] 
+                + [0]*20
+            )
 
     # Compute Ops
     # instruction_idx = 0

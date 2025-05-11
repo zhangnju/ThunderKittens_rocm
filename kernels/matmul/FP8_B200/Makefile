@@ -4,9 +4,10 @@ GPU_TARGET=B200
 # Compiler
 NVCC=nvcc
 
+THUNDERKITTENS_ROOT=../../../
 NVCCFLAGS=-DNDEBUG -Xcompiler=-fPIE -Xcompiler -fopenmp --expt-extended-lambda --expt-relaxed-constexpr -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing --use_fast_math -forward-unknown-to-host-compiler -O3  -Xnvlink=--verbose -Xptxas=--verbose -Xptxas=--warn-on-spills -std=c++20 -MD -MT -MF -x cu -lrt -lpthread -ldl -DKITTENS_BLACKWELL -DKITTENS_HOPPER -arch=sm_100a -lcuda -lcudadevrt -lcudart_static -lgomp -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype
 TARGET=matmul
-SRC=matmul_1cta.cu
+SRC=matmul_2cta_sweep_num_sms.cu
 
 # Default target
 all: $(TARGET)

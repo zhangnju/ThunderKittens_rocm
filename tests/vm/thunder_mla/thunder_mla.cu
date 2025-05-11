@@ -62,14 +62,15 @@ struct config {
 
     static constexpr bool GMEM_SPIN_LOOP_SLEEP_NANOS = 20;
 
-    static constexpr int CONSUMER_REGISTERS = 104;
+    static constexpr int CONSUMER_REGISTERS = 208;
     static constexpr int NON_CONSUMER_REGISTERS = 64;
 };
 
-static constexpr int QKRot_D = 64, QVO_D = 512, QVO_Dd2 = QVO_D/2, NUM_ROWS = 128, PAGE_SIZE = 256, Q_HEADS = 16, Q_STEP = 8;
+static constexpr int QKRot_D = 64, QVO_D = 512, NUM_ROWS = 128, PAGE_SIZE = 256, Q_HEADS = 16, Q_STEP = 8;
 
 template<int rows, int cols> using st_fp8 = st_fp8e4m3<rows, cols>;
 template<int rows, int cols> using rt_fp8 = rt_fp8e4m3<rows, cols>;
+template<int rows, int cols> using tt_fp8 = tt<fp8e4m3, rows, cols>;
 using fp8 = fp8e4m3;
 
 struct globals {
@@ -78,16 +79,22 @@ struct globals {
 
     instruction_layout instructions;
 
-    gl<fp8, -1, -1, -1, QKRot_D, typename PipelineOp::qrot_st_type> Q; // batch, new_tokens, q_heads, QKRot_D
-    gl<fp8, -1, -1, -1, QVO_D, typename PipelineOp::qvo_st_type> QV; // batch, new_tokens, q_heads, QVO_D
+    using qrot_st_type           = st_fp8<Q_STEP * Q_HEADS, QKRot_D>;
+    using qvo_st_type            = st_fp8<Q_STEP * Q_HEADS, QVO_D>;
 
-    gl<fp8, 1, -1, PAGE_SIZE, QKRot_D, typename PipelineOp::kcache_st_type> K_cache; // 1, num_pages, PAGE_SIZE, QKRot_D
-    gl<fp8, 1, -1, PAGE_SIZE, QVO_D, typename PipelineOp::vcache_st_type> V_cache; // 1, num_pages, PAGE_SIZE, QVO_D
+    gl<fp8, -1, -1, -1, QKRot_D, qrot_st_type> Q; // batch, new_tokens, q_heads, QKRot_D
+    gl<fp8, -1, -1, -1, QVO_D, qvo_st_type> QV; // batch, new_tokens, q_heads, QVO_D
+
+    using kcache_st_type         = st_fp8<NUM_ROWS, QKRot_D>;
+    using vcache_st_type         = st_fp8<NUM_ROWS, QVO_D>;
+
+    gl<fp8, 1, -1, PAGE_SIZE, QKRot_D, kcache_st_type> K_cache; // 1, num_pages, PAGE_SIZE, QKRot_D
+    gl<fp8, 1, -1, PAGE_SIZE, QVO_D, vcache_st_type> V_cache; // 1, num_pages, PAGE_SIZE, QVO_D
 
     gl<int, 1, 1, -1, -1> Table; // B, num_pages
-    gl<fp8, -1, -1, -1, QVO_D, st_fp8<16, QVO_Dd2>, st_fp8<16, QVO_D/config::NUM_CONSUMER_WARPS>> O; // batch_size, new_tokens, q_heads, QVO_D
+    gl<fp8, -1, -1, -1, QVO_D, st_fp8<16, QVO_D/config::NUM_CONSUMER_WARPS>, st_fp8<Q_STEP * Q_HEADS, QVO_D/4>> O; // batch_size, new_tokens, q_heads, QVO_D
     
-    gl<float, -1, -1, Q_HEADS, QVO_D, st_fl<16, QVO_D/config::NUM_CONSUMER_WARPS>, st_fl<16,256>> O_scratch; // num_instructions, new_tokens, q_heads, QVO_D
+    gl<float, -1, -1, Q_HEADS, QVO_D, st_fl<16, QVO_D/config::NUM_CONSUMER_WARPS>, st_fl<Q_STEP * Q_HEADS, QVO_D/4>> O_scratch; // num_instructions, new_tokens, q_heads, QVO_D
     gl<float,  1, -1, -1, Q_HEADS, sv_fl<16>> Lvec_scratch; // num_instructions, new_tokens, q_heads
 
     gl<int,    1,  1,  -1, -1> Bar; // 1, 1, num_instructions, new_tokens
@@ -137,141 +144,62 @@ struct PartialOp
             q_seq_idx = instruction[5];
             start_pos = instruction[6];
             end_pos = instruction[7];
-            length = get_length(length, q_seq_idx, q_depth);
+            length = get_length(instruction[8], q_seq_idx, q_depth);
             num_iters = get_num_iters(start_pos, end_pos);
         }
-        __device__ inline parsed_instruction(state<config> &s) : parsed_instruction(s.instruction()) {}
+        __device__ inline parsed_instruction(const globals &g, state<config> &s) : parsed_instruction(s.instruction(), g.Q.depth()) {}
     };
-    static __device__ inline parsed_instruction parse_instruction(const globals &g, state<config> &s)
-    {
-        return parsed_instruction{
-            s.instruction()[1], 
-            s.instruction()[2], 
-            {s.instruction()[3], s.instruction()[4]}, 
-            s.instruction()[5], 
-            s.instruction()[6], 
-            s.instruction()[7], 
-            parsed_instruction::get_length(s.instruction()[8], s.instruction()[5], g.Q.depth()),
-            parsed_instruction::get_num_iters(s.instruction()[6], s.instruction()[7]),
-        };
-    }
 
-    static constexpr int NUM_PIPELINE_STAGES = 2;
+    static constexpr int NUM_PIPELINE_STAGES = 1;
     static constexpr int NUM_CONSUMER_WARPS = config::NUM_CONSUMER_WARPS;
     static constexpr int NUM_PAGES = config::NUM_PAGES;
-    static constexpr int NUM_ATTN_ARITH_WARPS = NUM_CONSUMER_WARPS / 2;
-    static constexpr int NUM_ATTN_ARITH_WARPGROUPS = NUM_ATTN_ARITH_WARPS / 4;
-    static constexpr int NUM_CONSUMER_WARPGROUPS = NUM_CONSUMER_WARPS / 4;
 
     // Pipelined objects
-    using kcache_st_type         = st_fp8<NUM_ROWS, QKRot_D>;
+    using kcache_st_type         = globals::kcache_st_type;
     static constexpr int KCACHE_TILE_SIZE = sizeof(kcache_st_type::dtype) * kcache_st_type::rows * kcache_st_type::cols;
-    static constexpr int KCACHE_SIZE = NUM_PIPELINE_STAGES * KCACHE_TILE_SIZE;
-
-    using vcache_st_type         = st_fp8<NUM_ROWS, QVO_D>;
-    static constexpr int VCACHE_SIZE = NUM_PIPELINE_STAGES * sizeof(vcache_st_type::dtype) * vcache_st_type::rows * vcache_st_type::cols;
-
+    using vcache_st_type         = globals::vcache_st_type;
     using vcache_half_st_type         = st_fp8<NUM_ROWS, QVO_D/2>;
-    static constexpr int VCACHE_HALF_TILE_SIZE = sizeof(vcache_half_st_type::dtype) * vcache_half_st_type::rows * vcache_half_st_type::cols;
-
-    static_assert(KCACHE_SIZE + VCACHE_SIZE == NUM_PIPELINE_STAGES * config::PAGE_SIZE, "KCACHE_SIZE + VCACHE_SIZE must fit in NUM_PIPELINE_STAGES * config::PAGE_SIZE");
-    static_assert(NUM_PAGES >= NUM_PIPELINE_STAGES + 1, "NUM_PAGES must be greater than NUM_PIPELINE_STAGES");
 
     // Non-pipelined objects
-    using qrot_st_type           = st_fp8<Q_STEP * Q_HEADS, QKRot_D>;
+    using qrot_st_type           = globals::qrot_st_type;
     static constexpr int QROT_SIZE = sizeof(qrot_st_type::dtype) * qrot_st_type::rows * qrot_st_type::cols;
+    using qvo_st_type            = globals::qvo_st_type;
 
-    using qvo_st_type            = st_fp8<Q_STEP * Q_HEADS, QVO_D>;
-    static constexpr int QVO_SIZE = sizeof(qvo_st_type::dtype) * qvo_st_type::rows * qvo_st_type::cols;
+    using o_st_quarter_type = st_fl<Q_STEP * Q_HEADS, QVO_D / 4>;
+    using o_fp8_st_quarter_type = st_fp8<Q_STEP * Q_HEADS, QVO_D/4>;
 
-    static_assert(QROT_SIZE + QVO_SIZE == config::PAGE_SIZE, "QROT_SIZE + QVO_SIZE must fit in one page");
-
-    using o_st_type = st_fl<Q_STEP * Q_HEADS, QVO_D/NUM_CONSUMER_WARPS>;
-    static constexpr int O_SIZE = sizeof(o_st_type::dtype) * o_st_type::rows * o_st_type::cols;
-    static constexpr int NUM_O_SHARED_PAGES = (O_SIZE * NUM_CONSUMER_WARPS/2 + config::PAGE_SIZE - 1) / config::PAGE_SIZE;
-    static_assert(NUM_O_SHARED_PAGES <= NUM_PAGES, "NUM_O_SHARED_PAGES must be less than NUM_PAGES");
-    static constexpr int NUM_O_SHARED_BLOCKS_PER_PAGE = (NUM_CONSUMER_WARPS/2) / NUM_O_SHARED_PAGES;
-
-    using o_fp8_st_type = st_fp8<Q_STEP * Q_HEADS, QVO_D/(4*NUM_CONSUMER_WARPS)>;
-    static constexpr int O_FP8_SIZE = sizeof(o_fp8_st_type::dtype) * o_fp8_st_type::rows * o_fp8_st_type::cols;
-    static_assert(4 * O_FP8_SIZE <= config::PAGE_SIZE, "O_FP8_SIZE must be less than PAGE_SIZE/4");
-
-    using l_sv_type = sv_fl<Q_STEP * Q_HEADS / NUM_ATTN_ARITH_WARPS>;
-    static constexpr int L_SIZE = NUM_ATTN_ARITH_WARPS * sizeof(l_sv_type::dtype) * l_sv_type::length;
-    static_assert(L_SIZE <= config::SCRATCH_BYTES, "L_SIZE must be less than SCRATCH_BYTES");
+    using l_sv_type = sv_fl<16>;
 
     // Tensor objects
     using attn_tt_type = tt<float, Q_STEP*Q_HEADS, NUM_ROWS>;
-    static constexpr int ATTN_TT_SIZE = sizeof(attn_tt_type::dtype) * attn_tt_type::rows * attn_tt_type::cols;
-
+    using attn_tt_fp8_type = tt_fp8<Q_STEP*Q_HEADS, NUM_ROWS>;
     using o_tt_quarter_type = tt<float, Q_STEP*Q_HEADS, QVO_D/4>;
-    static constexpr int O_TT_QUARTER_SIZE = sizeof(o_tt_quarter_type::dtype) * o_tt_quarter_type::rows * o_tt_quarter_type::cols;
-
     using o_tt_half_type = tt<float, Q_STEP*Q_HEADS, QVO_D/2>;
-    static constexpr int O_TT_HALF_SIZE = sizeof(o_tt_half_type::dtype) * o_tt_half_type::rows * o_tt_half_type::cols;
 
     //  semaphores 
     __device__ static inline semaphore &inputs_arrived(state<config> &s, int i) { return s.semaphores()[i]; }
     __device__ static inline semaphore &inputs_finished(state<config> &s, int i) { return s.semaphores()[NUM_PIPELINE_STAGES + i]; }
     __device__ static inline semaphore &matmul_finished(state<config> &s) { return s.semaphores()[2 * NUM_PIPELINE_STAGES]; }
-    __device__ static inline semaphore &out_arrived(state<config> &s) { return s.semaphores()[2 * NUM_PIPELINE_STAGES + 1]; }
-    __device__ static inline semaphore &out_written(state<config> &s, int i) { return s.semaphores()[2 * NUM_PIPELINE_STAGES + 2 + i]; }
 
-    // getters
-    __device__ static inline kcache_st_type &get_kcache_tile(state<config> &s, int stage) {
-        return reinterpret_cast<kcache_st_type*>(s.pages[s.pid(stage)].ptr());
-    }
+    // kcache and vcache getters
+    __device__ static inline kcache_st_type &get_kcache_tile(state<config> &s, int stage) {return *reinterpret_cast<kcache_st_type*>(s.pages[s.pid(stage)].ptr());}
+    __device__ static inline vcache_st_type &get_vcache_tile(state<config> &s, int stage) {return *reinterpret_cast<vcache_st_type*>((uint8_t*) s.pages[s.pid(stage)].ptr() + KCACHE_TILE_SIZE);}
+    __device__ static inline vcache_half_st_type &get_vcache_half_tile(state<config> &s, int stage, int half) {printf("accessing vcache tile at page %d\n", stage);return reinterpret_cast<vcache_half_st_type*>((uint8_t*) s.pages[s.pid(stage)].ptr() + KCACHE_TILE_SIZE)[half];}
+    
+    // qrot and qvo getters
+    __device__ static inline qrot_st_type &get_qrot_tile(state<config> &s) {return *reinterpret_cast<qrot_st_type*>(s.pages[s.pid(NUM_PIPELINE_STAGES)].ptr());}
+    __device__ static inline qvo_st_type &get_qvo_tile(state<config> &s) {return *reinterpret_cast<qvo_st_type*>((uint8_t*) s.pages[s.pid(NUM_PIPELINE_STAGES)].ptr() + QROT_SIZE);}
+    
+    // o and l shared memory getters
+    __device__ static inline o_st_quarter_type &get_o_st_quarter_tile(state<config> &s, int page) {return *reinterpret_cast<o_st_quarter_type*>(s.pages[s.pid(page)].ptr());}
+    __device__ static inline o_fp8_st_quarter_type &get_o_fp8_st_quarter_tile(state<config> &s, int quarter) {return reinterpret_cast<o_fp8_st_quarter_type*>(s.pages[s.pid(0)].ptr())[quarter];}
+    __device__ static inline l_sv_type &get_l_vec(state<config> &s, int warp) {return reinterpret_cast<l_sv_type*>(s.scratch())[warp];}
 
-    __device__ static inline vcache_st_type &get_vcache_tile(state<config> &s, int stage) {
-        return reinterpret_cast<vcache_st_type*>(
-            (uint8_t*) s.pages[s.pid(stage)].ptr()
-            + KCACHE_TILE_SIZE
-        );
-    }
-
-    __device__ static inline vcache_half_st_type &get_vcache_half_tile(state<config> &s, int stage, int half) {
-        return reinterpret_cast<vcache_half_st_type(&)[2]>(
-            (uint8_t*) s.pages[s.pid(stage)].ptr()
-            + KCACHE_TILE_SIZE
-        )[half];
-    }
-
-    __device__ static inline qrot_st_type &get_qrot_tile(state<config> &s) {
-        return reinterpret_cast<qrot_st_type*>(s.pages[s.pid(NUM_PIPELINE_STAGES)].ptr());
-    }
-
-    __device__ static inline qvo_st_type &get_qvo_tile(state<config> &s) {
-        return reinterpret_cast<qvo_st_type*>(
-            (uint8_t*) s.pages[s.pid(NUM_PIPELINE_STAGES)].ptr()
-            + QROT_SIZE
-        );
-    }
-
-    __device__ static inline o_st_type &get_o_tile(state<config> &s, int page, int warp) {
-        return reinterpret_cast<o_st_type*>(
-            s.pages[s.pid(page)].ptr()
-        )[warp];
-    }
-
-    __device__ static inline o_fp8_st_type &get_o_fp8_tile(state<config> &s, int quarter, int warp) {
-        return reinterpret_cast<o_fp8_st_type*>(s.pages[s.pid(0)].ptr())[quarter * NUM_CONSUMER_WARPS + warp];
-    }
-
-    __device__ static inline l_sv_type &get_l_vec(state<config> &s, int i) {
-        return reinterpret_cast<l_sv_type*>(s.scratch.ptr())[i];
-    }
-
-    __device__ static inline attn_tt_type &get_attn_tt(state<config> &s) {
-        return s.tensor_alloc.template allocate<attn_tt_type>(0, 0);
-    }
-
-    __device__ static inline o_tt_quarter_type &get_o_tt_quarter(state<config> &s, int i) {
-        return s.tensor_alloc.template allocate<o_tt_quarter_type>(0, attn_tt_type::cols + i * o_tt_quarter_type::cols);
-    }
-
-    __device__ static inline o_tt_half_type &get_o_tt_half(state<config> &s, int i) {
-        return s.tensor_alloc.template allocate<o_tt_half_type>(0, attn_tt_type::cols + i * o_tt_quarter_type::cols);
-    }
+        // tensor allocators
+    __device__ static inline attn_tt_type get_attn_tt(state<config> &s) {return s.tensor_alloc.template allocate<attn_tt_type>(0);}
+    __device__ static inline attn_tt_fp8_type get_attn_tt_fp8(state<config> &s) {return s.tensor_alloc.template allocate<attn_tt_fp8_type>(0);}
+    __device__ static inline o_tt_quarter_type get_o_tt_quarter(state<config> &s, int i) { return s.tensor_alloc.template allocate<o_tt_quarter_type>(attn_tt_type::cols + i * o_tt_quarter_type::cols);}
+    __device__ static inline o_tt_half_type get_o_tt_half(state<config> &s, int i) { return s.tensor_alloc.template allocate<o_tt_half_type>(attn_tt_type::cols + i * o_tt_quarter_type::cols);}
 
     struct controller
     {
@@ -288,13 +216,8 @@ struct PartialOp
             }
 
             init_semaphore(matmul_finished(s), 2);
-            init_semaphore(out_arrived(s), 1);
 
-            for (int i = 0; i < NUM_PAGES; i++) {
-                init_semaphore(out_written(s, i), 1);
-            }
-
-            return 2 * NUM_PIPELINE_STAGES + 2 + NUM_PAGES;
+            return 2 * NUM_PIPELINE_STAGES + 1;
         }
     };
 
@@ -302,7 +225,7 @@ struct PartialOp
     {
         static __device__ void run(const globals &g, state<config> &s)
         {
-            parsed_instruction inst{s};
+            parsed_instruction inst{g, s};
             uint32_t bitfield = 0xFFFF0000; // 1 for arrived, 0 for finished
 
             for (int i = 0; i < NUM_PIPELINE_STAGES; i++) {
@@ -315,7 +238,7 @@ struct PartialOp
 
                 int pos = inst.start_pos + iter * NUM_ROWS;
                 int within_page_idx = (pos % PAGE_SIZE) / NUM_ROWS;
-                int next_page_id = s.globals.Table[coord<>{inst.q_batch_idx, pos/PAGE_SIZE}];
+                int next_page_id = g.Table[coord<>{inst.q_batch_idx, pos/PAGE_SIZE}];
                 
                 wait(inputs_arrived(s, pipeline_stage), prototype::get_phasebit<1>(bitfield, pipeline_stage));
                 prototype::update_phasebit<1>(bitfield, pipeline_stage);
@@ -324,20 +247,20 @@ struct PartialOp
                     kcache_st_type &k_cache = get_kcache_tile(s, pipeline_stage);
                     vcache_st_type &v_cache = get_vcache_tile(s, pipeline_stage);
 
-                    semaphore &inputs_arrived = inputs_arrived(s, pipeline_stage);
+                    semaphore &local_inputs_arrived = inputs_arrived(s, pipeline_stage);
 
-                    tma::expect(inputs_arrived, k_cache, v_cache);
+                    tma::expect(local_inputs_arrived, k_cache, v_cache);
                     tma::load_async<dim::ROW, cache_policy::EVICT_FIRST>(
                         k_cache, 
-                        s.globals.K_cache, 
+                        g.K_cache, 
                         {0, next_page_id, within_page_idx, 0}, 
-                        inputs_arrived
+                        local_inputs_arrived
                     );
                     tma::load_async<dim::ROW, cache_policy::EVICT_FIRST>(
                         v_cache, 
-                        s.globals.V_cache, 
+                        g.V_cache, 
                         {0, next_page_id, within_page_idx, 0}, 
-                        inputs_arrived
+                        local_inputs_arrived
                     );
                 }
 
@@ -355,31 +278,38 @@ struct PartialOp
     {
         static __device__ void run(const globals &g, state<config> &s)
         {
-            parsed_instruction inst{s};
+            parsed_instruction inst{g, s};
             uint32_t bitfield = 0xFFFF0000; // 1 for arrived, 0 for finished
 
             qrot_st_type &qrot = get_qrot_tile(s);
             qvo_st_type &qvo = get_qvo_tile(s);
 
-            auto qrot_subtile = qrot.template subtile<qrot_st_type::rows/NUM_CONSUMER_WARPS, qrot_st_type::cols>({group<NUM_CONSUMER_WARPGROUPS>::warpid(), 0});
-            auto qvo_subtile = qvo.template subtile<qvo_st_type::rows/NUM_CONSUMER_WARPS, qvo_st_type::cols>({group<NUM_CONSUMER_WARPGROUPS>::warpid(), 0});
+            auto qrot_subtile = qrot.template subtile<qrot_st_type::rows/NUM_CONSUMER_WARPS, qrot_st_type::cols>({group<NUM_CONSUMER_WARPS>::warpid(), 0});
+            auto qvo_subtile = qvo.template subtile<qvo_st_type::rows/NUM_CONSUMER_WARPS, qvo_st_type::cols>({group<NUM_CONSUMER_WARPS>::warpid(), 0});
 
             s.wait_page_ready(NUM_PIPELINE_STAGES);
             s.wait_tensor_ready();
-            group<NUM_CONSUMER_WARPGROUPS>::sync(9);
+            group<NUM_CONSUMER_WARPS>::sync(9);
 
-            using o_rt_quarter_type = rt_fl<o_tt_quarter_type::rows, o_tt_quarter_type::cols>;
-            o_rt_quarter_type o_quarter;
-            warp::zero(o_quarter);
-            group<NUM_CONSUMER_WARPGROUPS>::store(get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 0), o_quarter);
-            group<NUM_CONSUMER_WARPGROUPS>::store(get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 1), o_quarter);
-            group<NUM_CONSUMER_WARPGROUPS>::store(get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 2), o_quarter);
+            using o_rt_quarter_type = rt_fl<o_tt_quarter_type::rows/NUM_CONSUMER_WARPS, o_tt_quarter_type::cols>;
+            o_rt_quarter_type o_quarter_rt_1;
+            warp::zero(o_quarter_rt_1);
+            
+            attn_tt_type attn_tt = get_attn_tt(s);
+            o_tt_quarter_type o_quarter_tt_0 = get_o_tt_quarter(s, 0);
+            o_tt_quarter_type o_quarter_tt_1 = get_o_tt_quarter(s, 1);
+            o_tt_quarter_type o_quarter_tt_2 = get_o_tt_quarter(s, 2);
+
+            group<NUM_CONSUMER_WARPS>::store_async(attn_tt, o_quarter_rt_1);
+            group<NUM_CONSUMER_WARPS>::store_async(o_quarter_tt_0, o_quarter_rt_1);
+            group<NUM_CONSUMER_WARPS>::store_async(o_quarter_tt_1, o_quarter_rt_1);
+            group<NUM_CONSUMER_WARPS>::store_async(o_quarter_tt_2, o_quarter_rt_1);
 
             tensor_store_wait();
-            group<NUM_CONSUMER_WARPGROUPS>::sync(8);
+            group<NUM_CONSUMER_WARPS>::sync(8);
 
-            warp::load_async(qrot_subtile, g.Q, {inst.q_batch_idx, inst.q_seq_idx + group<NUM_CONSUMER_WARPGROUPS>::warpid(), 0, 0});
-            warp::load_async(qvo_subtile, g.QV, {inst.q_batch_idx, inst.q_seq_idx + group<NUM_CONSUMER_WARPGROUPS>::warpid(), 0, 0});
+            warp::load_async(qrot_subtile, g.Q, {inst.q_batch_idx, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 0});
+            warp::load_async(qvo_subtile, g.QV, {inst.q_batch_idx, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 0});
 
             load_async_wait();
 
@@ -396,18 +326,15 @@ struct PartialOp
             warp::zero(accumulated_norm_vec);
 
             attn_rt_type attn_rt;
-            warp::zero(attn_rt);
 
-            warp::store(accumulated_max_vec, accumulated_norm_vec, attn_rt);
-
-            const float SOFTMAX_TEMPERATURE = g.softmax_scale * 1.44269504089f;
+            // const float SOFTMAX_TEMPERATURE = g.softmax_scale * 1.44269504089f;
 
             group<NUM_CONSUMER_WARPS>::sync(10);
 
             // DEBUGGING MODE
             if (group<NUM_CONSUMER_WARPS>::warpid() == 0) {
-                warp::one(qrot_subtile);
-                warp::one(qvo_subtile);
+                warp::one(qrot);
+                warp::one(qvo);
             }
             group<NUM_CONSUMER_WARPS>::sync(10);
             // END DEBUGGING MODE
@@ -415,15 +342,56 @@ struct PartialOp
             for (int iter = 0; iter < inst.num_iters; iter++) {
                 int pipeline_stage = iter % NUM_PIPELINE_STAGES;
 
-
                 wait(inputs_arrived(s, pipeline_stage), prototype::get_phasebit<0>(bitfield, pipeline_stage));
                 prototype::update_phasebit<0>(bitfield, pipeline_stage);
 
-                attn_tt_type &attn_tt = get_attn_tt(s);
+                attn_tt_type attn_tt = get_attn_tt(s);
+                attn_tt_fp8_type attn_tt_fp8 = get_attn_tt_fp8(s);
                 kcache_st_type &kcache_st = get_kcache_tile(s, pipeline_stage);
                 vcache_st_type &vcache_st = get_vcache_tile(s, pipeline_stage);
-                group<NUM_CONSUMER_WARPS>::mm_ABt(attn_tt, qrot_subtile, kcache_st, matmul_finished(s));
-                group<NUM_CONSUMER_WARPS>::mma_ABt(attn_tt, qvo_subtile, vcache_st, matmul_finished(s));
+
+                // DEBUGGING MODE: set kcache_st and vcache_st to 1
+                if (group<NUM_CONSUMER_WARPS>::warpid() == 0) {
+                    warp::one(kcache_st);
+                    warp::one(vcache_st);
+
+                    // warp::mul(kcache_st, kcache_st, (fp8)iter);
+                    // warp::mul(vcache_st, vcache_st, (fp8)iter);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                // END DEBUGGING MODE
+
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // printf("printing qrot\n");
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     print(qrot);
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // printf("printing qvo\n");
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     print(qvo);
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // printf("printing kcache_st\n");
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     print(kcache_st);
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // printf("printing vcache_st\n");
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     print(vcache_st);
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+
+
+                group<NUM_CONSUMER_WARPS>::mm_ABt(attn_tt, qrot, kcache_st, matmul_finished(s));
+                group<NUM_CONSUMER_WARPS>::mma_ABt(attn_tt, qvo, vcache_st, matmul_finished(s));
 
                 // computation not needing matmul_finished
                 // warp::copy(current_tile_max_vec, accumulated_max_vec);
@@ -435,8 +403,7 @@ struct PartialOp
                     arrive(inputs_finished(s, pipeline_stage), 1);
                 }
                 attn_rt_type attn_rt;
-                group<NUM_ATTN_ARITH_WARPS>::load_async(attn_rt, attn_tt);
-                group<NUM_ATTN_ARITH_WARPS>::load_async_wait();
+                group<NUM_CONSUMER_WARPS>::load_async(attn_rt, attn_tt);
 
                 // if (inst.start_pos + NUM_ROWS * (iter + 1) >= inst.length) {
                 //     // warp::apply(
@@ -453,84 +420,521 @@ struct PartialOp
                 // }
 
                 warp::one(scaled_accumulated_max_vec);
-                warp::mul(attn_rt, attn_rt, 2.f);
 
-                group<NUM_CONSUMER_WARPGROUPS>::store_async(attn_tt, attn_rt);
+
+                // // DEBUG PRINTING
+                // using attn_st_type = st_fl<attn_tt_type::rows, attn_tt_type::cols>;
+                // printf("attn_st_size: %d\n", sizeof(attn_st_type::dtype) * attn_st_type::rows * attn_st_type::cols);
+                // attn_st_type & attn_st = *reinterpret_cast<attn_st_type*>(s.pages[s.pid(2)].ptr());
+                // group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
+
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // printf("printing attn_st\n");
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     print(attn_st);
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // // END DEBUG PRINTING
+
+                warp::mul(attn_rt, attn_rt, 1/576.f);
+                warp::sub(attn_rt, attn_rt, 1.f);
+
+                // group<NUM_CONSUMER_WARPS>::store_async(attn_tt, attn_rt);
+                // tensor_store_wait();
+
+                // // DEBUG PRINTING
+                // group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
+
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // printf("printing attn_st after mul\n");
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     print(attn_st);
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // // END DEBUG PRINTING
+
+                rt_fp8e4m3<attn_tt_type::rows / NUM_CONSUMER_WARPS, attn_tt_type::cols> attn_rt_fp8;
+                warp::copy(attn_rt_fp8, attn_rt);
+
+                group<NUM_CONSUMER_WARPS>::store_async(attn_tt_fp8, attn_rt_fp8);
                 tensor_store_wait();
 
-                group<NUM_CONSUMER_WARPGROUPS>::sync(11);
+                group<NUM_CONSUMER_WARPS>::sync(11);
+
+                group<NUM_CONSUMER_WARPS>::load_async(attn_rt_fp8, attn_tt_fp8);
+
+
+                // DEBUG PRINTING
+                using attn_st_type_fp8 = st_fp8<attn_tt_type::rows, attn_tt_type::cols>;
+                printf("attn_st_size: %d\n", sizeof(attn_st_type_fp8::dtype) * attn_st_type_fp8::rows * attn_st_type_fp8::cols);
+                attn_st_type_fp8 & attn_st_fp8 = *reinterpret_cast<attn_st_type_fp8*>(s.pages[s.pid(2)].ptr());
+                group<NUM_CONSUMER_WARPS>::load_async(attn_rt_fp8, attn_tt_fp8);
+                group<NUM_CONSUMER_WARPS>::store(attn_st_fp8, attn_rt_fp8);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing attn_st_fp8_after_load\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(attn_st_fp8);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                // END DEBUG PRINTING
+
+
 
                 // shuffle o around, normalize, and mma
-                // constant is that before/after shuffling, o_quarter_rt = o[2], o_quarter_tt[0] = o[0], o_quarter_tt[1] = o[1], o_quarter_tt[2] = o[3]
-                o_rt_quarter_type o_quarter_scratch;
+                // constant is that before/after shuffling, o_quarter_rt_1 = o[2], o_quarter_tt[0] = o[0], o_quarter_tt[1] = o[1], o_quarter_tt[2] = o[3]
+                o_rt_quarter_type o_quarter_rt_2;
 
-                // normalize o[2], swap with o[1]
-                warp::mul(o_quarter, o_quarter, 3);
-                group<NUM_CONSUMER_WARPGROUPS>::load_async(o_quarter_scratch, get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 1));
-                group<NUM_CONSUMER_WARPGROUPS>::store_async(get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 1), o_quarter);
-                warp::copy(o_quarter, o_quarter_scratch);
-                tensor_store_wait();
+                o_tt_quarter_type o_quarter_tt_0 = get_o_tt_quarter(s, 0);
+                o_tt_quarter_type o_quarter_tt_1 = get_o_tt_quarter(s, 1);
+                o_tt_quarter_type o_quarter_tt_2 = get_o_tt_quarter(s, 2);
 
-                // normalize o[1], swap with o[3]
-                warp::mul(o_quarter, o_quarter, 2);
-                group<NUM_CONSUMER_WARPGROUPS>::load_async(o_quarter_scratch, get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 2));
-                group<NUM_CONSUMER_WARPGROUPS>::store_async(get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 2), o_quarter);
-                warp::copy(o_quarter, o_quarter_scratch);
-                tensor_store_wait();
 
-                // normalize o[3], swap with o[1]
-                warp::mul(o_quarter, o_quarter, 4);
-                group<NUM_CONSUMER_WARPGROUPS>::load_async(o_quarter_scratch, get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 2));
-                group<NUM_CONSUMER_WARPGROUPS>::store_async(get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 2), o_quarter);
-                warp::copy(o_quarter, o_quarter_scratch);
-                tensor_store_wait();
-
-                // second half of mma
-                group<NUM_CONSUMER_WARPGROUPS>::mma_AB(get_o_tt_half(s, 1), get_attn_tt(s), get_vcache_half_tile(s, pipeline_stage, 1), matmul_finished(s));
-
-                // swap o[1] and o[2]
-                group<NUM_CONSUMER_WARPGROUPS>::load_async(o_quarter_scratch, get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 1));
-                group<NUM_CONSUMER_WARPGROUPS>::store_async(get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 1), o_quarter);
-                warp::copy(o_quarter, o_quarter_scratch);
-                tensor_store_wait();
-
-                // write o[2] to o_tile[2]
-                if (inst.batch_idx >= 0) {
-                    warp::store(get_o_tile(s, 2, group<NUM_CONSUMER_WARPGROUPS>::warpid()), o_quarter);
-                } else {
-                    rt_fp8<o_rt_quarter_type::rows, o_rt_quarter_type::cols> o_quarter_fp8;
-                    warp::copy(o_quarter_fp8, o_quarter);
-                    warp::store(get_o_fp8_tile(s, 2, group<NUM_CONSUMER_WARPGROUPS>::warpid()), o_quarter_fp8);
-                }
-
-                // swap o[2] and o[0]
-                group<NUM_CONSUMER_WARPGROUPS>::load_async(o_quarter_scratch, get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 0));
-                group<NUM_CONSUMER_WARPGROUPS>::store_async(get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 0), o_quarter);
-                warp::copy(o_quarter, o_quarter_scratch);
-                tensor_store_wait();
-
-                // normalize o[0] and swap with o[2]
-                warp::mul(o_quarter, o_quarter, 1);
-                group<NUM_CONSUMER_WARPGROUPS>::load_async(o_quarter_scratch, get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 0));
-                group<NUM_CONSUMER_WARPGROUPS>::store_async(get_o_tt_warp_split_quarter(s, group<NUM_CONSUMER_WARPGROUPS>::warpid(), 0), o_quarter);
-                warp::copy(o_quarter, o_quarter_scratch);
-                tensor_store_wait();
-
-                // first half of mma
-                group<NUM_CONSUMER_WARPGROUPS>::mma_AB(get_o_tt_half(s, 0), get_attn_tt(s), get_vcache_half_tile(s, pipeline_stage, 0), matmul_finished(s));
+                // // DEBUG PRINTING
+                using o_st_type = st_fl<o_tt_quarter_type::rows, o_tt_quarter_type::cols>;
+                o_st_type & o_st = *reinterpret_cast<o_st_type*>(s.pages[s.pid(2)].ptr());
                 
-                // end of shuffle
+                // group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_0);
+                // group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
 
-                if (inst.batch_idx < 0) {
-                    warp::store(get_l_shared_scratch(s, group<NUM_CONSUMER_WARPGROUPS>::warpid()), accumulated_norm_vec);
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // printf("printing o0 before mma\n");
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     print(o_st);
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_1);
+                // group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // printf("printing o1 before mma\n");
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     print(o_st);
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_1);
+
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // printf("printing o2 before mma\n");
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     print(o_st);
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_2);
+                // group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // printf("printing o3 before mma\n");
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     print(o_st);
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // printf("printing vcache_st_0 before mma\n");
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     print(get_vcache_half_tile(s, pipeline_stage, 0));
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+                // printf("printing vcache_st_1 before mma\n");
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     print(get_vcache_half_tile(s, pipeline_stage, 1));
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // DEBUG PRINTING
+                using attn_st_type = st_fl<attn_tt_type::rows, attn_tt_type::cols>;
+                printf("attn_st_size: %d\n", sizeof(attn_st_type::dtype) * attn_st_type::rows * attn_st_type::cols);
+                attn_st_type & attn_st = *reinterpret_cast<attn_st_type*>(s.pages[s.pid(2)].ptr());
+                group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing attn_st\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(attn_st);
                 }
-        
-                wait(matmul_finished(s), 1);
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                // END DEBUG PRINTING
 
-                group<NUM_CONSUMER_WARPS>::sync(12);
+                // // END DEBUG PRINTING
+
+                printf("vcache entry is %a\n", get_vcache_half_tile(s, pipeline_stage, 0)[0]);
+                printf("attn_fp8 entry is %a\n", attn_rt_fp8.tiles[0][0].data[0]);
+
+                using debug_tt_type = tt<float, o_tt_quarter_type::rows, o_tt_quarter_type::cols>;
+                debug_tt_type tt_0 = s.tensor_alloc.template allocate<debug_tt_type>(0);
+                debug_tt_type tt_1 = s.tensor_alloc.template allocate<debug_tt_type>(debug_tt_type::cols);
+                debug_tt_type tt_2 = s.tensor_alloc.template allocate<debug_tt_type>(2 * debug_tt_type::cols);
+                debug_tt_type tt_3 = s.tensor_alloc.template allocate<debug_tt_type>(3 * debug_tt_type::cols);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_0);
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing tt_0 before mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_1);
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing tt_1 before mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_2);
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing tt_2 before mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_3);
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing tt_3 before mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // test!!!!!!
+                o_tt_half_type o_half_1 = get_o_tt_half(s, 0);
+                auto &vcache_half_tile_1 = get_vcache_half_tile(s, pipeline_stage, 1);
+                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) mma_AB(o_half_1, attn_tt_fp8, vcache_half_tile_1, matmul_finished(s));
 
                 if (group<NUM_CONSUMER_WARPS>::laneid() == 1) {
-                    arrive(out_arrived(s), 1);
+                    arrive(matmul_finished(s));
+                }
+                wait(matmul_finished(s), 1);
+                // end test!!!!!!
+
+                // DEBUG PRINTING
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_0);
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing tt_0 after mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_1);
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing tt_1 after mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_2);
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing tt_2 after mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_3);
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing tt_3 after mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // END DEBUG PRINTING
+
+                /*
+                // DEBUG PRINTING
+                using attn_st_type = st_fp8<attn_tt_type::rows, attn_tt_type::cols>;
+                printf("attn_st_size: %d\n", sizeof(attn_st_type::dtype) * attn_st_type::rows * attn_st_type::cols);
+                attn_st_type & attn_st = *reinterpret_cast<attn_st_type*>(s.pages[s.pid(2)].ptr());
+                group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt_fp8);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing attn_st_fp8\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(attn_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                // END DEBUG PRINTING
+
+
+
+                // load o[3] from o_quarter_tt_2 to o_quarter_rt_2, normalize o[2] and o[3]
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_2);
+                warp::mul(o_quarter_rt_1, o_quarter_rt_1, 1.f);
+                warp::mul(o_quarter_rt_2, o_quarter_rt_2, 1.f);
+
+                // put o[2] and o[3] back, launch mma
+                group<NUM_CONSUMER_WARPS>::store_async(o_quarter_tt_2, o_quarter_rt_2);
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_1);
+                group<NUM_CONSUMER_WARPS>::store_async(o_quarter_tt_1, o_quarter_rt_1);
+                tensor_store_wait();
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                o_tt_half_type o_half_1 = get_o_tt_half(s, 1);
+                auto &vcache_half_tile_1 = get_vcache_half_tile(s, pipeline_stage, 1);
+                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) mma_AB(o_half_1, attn_tt_fp8, vcache_half_tile_1, matmul_finished(s));
+                
+                // load o[0] from o_quarter_tt_1 to o_quarter_rt_1, normalize o[0] and o[1], put o[0] back
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_0);
+                warp::mul(o_quarter_rt_1, o_quarter_rt_1, 1.f);
+                warp::mul(o_quarter_rt_2, o_quarter_rt_2, 1.f);
+                group<NUM_CONSUMER_WARPS>::store_async(o_quarter_tt_0, o_quarter_rt_1);
+
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 1) {
+                    arrive(matmul_finished(s));
+                }
+                wait(matmul_finished(s), 1);
+
+                // swap o[1] and o[2], launch mma
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_1);
+                group<NUM_CONSUMER_WARPS>::store_async(o_quarter_tt_1, o_quarter_rt_2);
+                tensor_store_wait();
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // DEBUG PRINTING
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_1);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing o2 after first mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                // END DEBUG PRINTING
+
+                o_tt_half_type o_half_0 = get_o_tt_half(s, 0);
+                auto &vcache_half_tile_0 = get_vcache_half_tile(s, pipeline_stage, 0);
+                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) mma_AB(o_half_0, attn_tt_fp8, vcache_half_tile_0, matmul_finished(s));
+
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 1) {
+                    arrive(matmul_finished(s), 1);
+                }
+                wait(matmul_finished(s), 0);
+
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 1) {
+                    arrive(matmul_finished(s), 2);
+                }
+
+
+                // DEBUG PRINTING
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_0);
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing o0 after mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_1);
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing o1 after mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_1);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing o2 after mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_2);
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing o3 after mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+
+                // END DEBUG PRINTING
+                */
+            }
+
+            // store outputs
+            if (inst.q_batch_idx >= 0) {
+                using o_rt_quarter_fp8_type = rt_fp8<o_tt_quarter_type::rows/NUM_CONSUMER_WARPS, o_tt_quarter_type::cols>;
+                o_rt_quarter_fp8_type o_quarter_fp8;
+
+                warp::copy(o_quarter_fp8, o_quarter_rt_1);
+                group<NUM_CONSUMER_WARPS>::store(get_o_fp8_st_quarter_tile(s, 2), o_quarter_fp8);
+
+                o_tt_quarter_type o_quarter_tt_0 = get_o_tt_quarter(s, 0);
+                o_tt_quarter_type o_quarter_tt_1 = get_o_tt_quarter(s, 1);
+                o_tt_quarter_type o_quarter_tt_2 = get_o_tt_quarter(s, 2);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_0);
+                warp::copy(o_quarter_fp8, o_quarter_rt_1);
+                group<NUM_CONSUMER_WARPS>::store(get_o_fp8_st_quarter_tile(s, 0), o_quarter_fp8);
+                
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_1);
+                warp::copy(o_quarter_fp8, o_quarter_rt_1);
+                group<NUM_CONSUMER_WARPS>::store(get_o_fp8_st_quarter_tile(s, 1), o_quarter_fp8);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_2);
+                warp::copy(o_quarter_fp8, o_quarter_rt_1);
+                group<NUM_CONSUMER_WARPS>::store(get_o_fp8_st_quarter_tile(s, 3), o_quarter_fp8);
+
+                group<NUM_CONSUMER_WARPS>::sync(2);
+                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                        g.O,
+                        get_o_fp8_st_quarter_tile(s, 0),
+                        {
+                            inst.q_batch_idx, 
+                            inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
+                            0, 
+                            0
+                        }
+                    );
+
+                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                        g.O,
+                        get_o_fp8_st_quarter_tile(s, 1),
+                        {
+                            inst.q_batch_idx, 
+                            inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
+                            0, 
+                            QVO_D/4
+                        }
+                    );
+
+                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                        g.O,
+                        get_o_fp8_st_quarter_tile(s, 2),
+                        {
+                            inst.q_batch_idx, 
+                            inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
+                            0, 
+                            QVO_D/2
+                        }
+                    );
+
+                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                        g.O,
+                        get_o_fp8_st_quarter_tile(s, 3),
+                        {
+                            inst.q_batch_idx, 
+                            inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
+                            0, 
+                            3*QVO_D/4
+                        }
+                    );
+                }
+                group<NUM_CONSUMER_WARPS>::tma::store_async_wait();
+            } else {
+                o_tt_quarter_type o_quarter_tt_0 = get_o_tt_quarter(s, 0);
+                o_tt_quarter_type o_quarter_tt_1 = get_o_tt_quarter(s, 1);
+                o_tt_quarter_type o_quarter_tt_2 = get_o_tt_quarter(s, 2);
+                
+                group<NUM_CONSUMER_WARPS>::store(get_o_st_quarter_tile(s, 0), o_quarter_rt_1);
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_2);
+                group<NUM_CONSUMER_WARPS>::store(get_o_st_quarter_tile(s, 1), o_quarter_rt_1);
+                
+                group<NUM_CONSUMER_WARPS>::sync(2);
+                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
+                        g.O_scratch,
+                        get_o_st_quarter_tile(s, 0),
+                        {-inst.q_batch_idx-1, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, QVO_D/2}
+                    );
+
+                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
+                        g.O_scratch,
+                        get_o_st_quarter_tile(s, 1),
+                        {-inst.q_batch_idx-1, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 3 * QVO_D / 4}
+                    );
+                }
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_0);
+                group<NUM_CONSUMER_WARPS>::store(get_o_st_quarter_tile(s, 2), o_quarter_rt_1);
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_1);
+
+                group<NUM_CONSUMER_WARPS>::tma::store_async_wait();
+
+                group<NUM_CONSUMER_WARPS>::store(get_o_st_quarter_tile(s, 0), o_quarter_rt_1);
+
+                group<NUM_CONSUMER_WARPS>::sync(3);
+                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
+                        g.O_scratch,
+                        get_o_st_quarter_tile(s, 2),
+                        {-inst.q_batch_idx-1, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 0}
+                    );
+
+                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
+                        g.O_scratch,
+                        get_o_st_quarter_tile(s, 0),
+                        {-inst.q_batch_idx-1, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, QVO_D/4}
+                    );
+                }
+
+                // transform lvec before storing
+
+                warp::store(get_l_vec(s, group<NUM_CONSUMER_WARPS>::warpid()), current_tile_norm_vec);
+
+                warp::tma::store_async<cache_policy::EVICT_LAST>(
+                    g.Lvec_scratch,
+                    get_l_vec(s, group<NUM_CONSUMER_WARPS>::warpid()),
+                    {-inst.q_batch_idx-1, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0}
+                );
+
+                group<NUM_CONSUMER_WARPS>::tma::store_async_wait();
+
+                asm volatile("fence.sc.gpu;\n"); // Can't reorder across this boundary
+                __syncwarp();
+                if(inst.q_batch_idx < 0) {
+                    if(warp::laneid() < Q_STEP && inst.q_seq_idx + warp::laneid() < g.O_scratch.depth()) {
+                        // Todo: this can probably replaced by a st.async, which may prevent an expensive wait on the final finish barrier.
+                        g.Bar[{-inst.q_batch_idx-1, inst.q_seq_idx + warp::laneid()}] = g.tic;
+                        // For blackwell
+                        // asm volatile(
+                        //     "st.async.global.b32 [%0], %1;\n"
+                        // ::  "l"(&args.globals.semaphore[{-args.common.dst.batch_idx-1, args.common.dst.seq_idx + group<8>::laneid()}]), "r"(args.globals.tic)
+                        // :   "memory"
+                        // );
+                    }
+                }
+            }
+
+            if (laneid() == 0) {
+                for (int i = 0; i < NUM_PAGES; i++) {
+                    s.finish_page(i, NUM_CONSUMER_WARPS);
                 }
             }
         }
@@ -540,55 +944,7 @@ struct PartialOp
     struct storer
     {
         // Uses 4 full pages for outputs.
-        static __device__ void run(const globals &g, state<config> &s) {
-            parsed_instruction inst{s};
-            uint32_t bitfield = 0xFFFF0000; // 1 for arrived, 0 for finished
-
-            if (inst.batch_idx < 0) {
-                if (warp::laneid() == 0) {
-                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
-                        get_o_shared_scratch(s, 2),
-                        s.globals.O_shared,
-                        {0, 0, 0, 0}
-                    );
-
-
-                }
-                warp::tma::load_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                    get_o_shared_scratch(s, 2),
-                    s.globals.O_shared,
-                    {0, 0, 0, 0},
-                    out_written(s, 2)
-                );
-            } else {
-                
-            }
-            
-            wait(out_written(s, 0), 0);
-            wait(out_written(s, 1), 0);
-            wait(out_written(s, 2), 1);
-
-            if (laneid() == 0) {
-                for (int i = 0; i < NUM_PAGES; i++) {
-                    s.finish_page(i, NUM_CONSUMER_WARPS);
-                }
-            }
-
-            asm volatile("fence.sc.gpu;\n"); // Can't reorder across this boundary
-            __syncwarp();
-            if(inst.batch_idx < 0) {
-                if(warp::laneid() < Q_STEP && inst.seq_idx + warp::laneid() < g.O_scratch.depth()) {
-                    // Todo: this can probably replaced by a st.async, which may prevent an expensive wait on the final finish barrier.
-                    g.Bar[{-inst.batch_idx-1, inst.seq_idx + warp::laneid()}] = g.tic;
-                    // For blackwell
-                    // asm volatile(
-                    //     "st.async.global.b32 [%0], %1;\n"
-                    // ::  "l"(&args.globals.semaphore[{-args.common.dst.batch_idx-1, args.common.dst.seq_idx + group<8>::laneid()}]), "r"(args.globals.tic)
-                    // :   "memory"
-                    // );
-                }
-            }
-        }
+        static __device__ void run(const globals &g, state<config> &s) {}
     };
 };
 
@@ -1118,7 +1474,7 @@ struct ReductionOp
 PYBIND11_MODULE(mla_decode, m)
 {
     m.doc() = "mla_decode python module";
-    kittens::py::bind_kernel<kvm<config, globals, ReductionOp<config>>>(
+    kittens::py::bind_kernel<kvm<config, globals, PartialOp<config>, ReductionOp<config>>>(
         m, "mla_decode",
         &globals::instructions,
         &globals::Q,
@@ -1136,3 +1492,4 @@ PYBIND11_MODULE(mla_decode, m)
     );
     cudaGetLastError();
 }
+

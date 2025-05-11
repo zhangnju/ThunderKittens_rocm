@@ -52,7 +52,7 @@ def create_thundermla_arguments(seq_lengths, new_tokens, q_heads = 16, block_siz
 
         for j in range((seq_lengths[i] + block_size - 1) // block_size):
             for k in range(0, new_tokens, 4):
-                write_scratch = True#(block_size < seq_lengths[i])
+                write_scratch = (block_size < seq_lengths[i])
                 scheduled_tasks.append(
                     Task(
                         uid=idx,
@@ -86,6 +86,8 @@ def create_thundermla_arguments(seq_lengths, new_tokens, q_heads = 16, block_siz
     Instructions, O_scratch, Lvec_scratch, Semaphore, Timings = create_arguments_from_task_schedule(
         scheduled_tasks, new_tokens, num_processors=NUM_PROCESSORS, enable_timings=ENABLE_TIMINGS, q_heads=q_heads, prints=prints
     )
+
+    print(Instructions[0][0])
     # visualize_schedule(scheduled_tasks, NUM_PROCESSORS)
     return Instructions, O_scratch, Lvec_scratch, Semaphore, Timings
 
@@ -103,6 +105,8 @@ def run_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_s
     mla_decode_fn = mla_decode.mla_decode_8_heads if q_heads == 8 else mla_decode.mla_decode
     if prints:
         print('Starting mla_decode')
+
+    O = O.to(torch.float8_e4m3fn)
     if Timings is not None:
         mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, tic, Timings)
         #mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1-tic, Timings)
@@ -110,6 +114,8 @@ def run_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_s
         mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, tic)
         #mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1-tic)
     torch.cuda.synchronize()
+
+    print(O)
     if prints:
         print('Finished mla_decode')
     return O, Timings
@@ -129,7 +135,21 @@ def compute_thundermla_partials(QRot, QV, K_cache, V_cache, Lengths, Table, Inst
     if prints:
         print('Starting mla_decode')
     if Timings is not None:
-        mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, tic, Timings)
+        mla_decode_fn(
+            Instructions, 
+            QRot, 
+            QV,
+            K_cache, 
+            V_cache, 
+            Table, 
+            O, 
+            O_scratch, 
+            Lvec_scratch, 
+            Semaphore, 
+            softmax_scale, 
+            tic, 
+            Timings,
+        )
         #mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1-tic, Timings)
     else:
         mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, tic)
@@ -137,6 +157,9 @@ def compute_thundermla_partials(QRot, QV, K_cache, V_cache, Lengths, Table, Inst
     torch.cuda.synchronize()
     if prints:
         print('Finished mla_decode')
+
+    print(O_scratch[0, 0])
+    print(Lvec_scratch[0, 0])
 
     Os = []
     ls = []
@@ -305,6 +328,12 @@ def main_check_partials(seq_lengths, new_tokens, q_heads=16, block_size=128, pri
             
     #         plt.savefig(f"Os[{i}][{j}].png")
     #         plt.close()
+
+    print(len(Os))
+    print(len(Os[0]))
+    print(Os[0][0][0].shape)
+    for i in range(len(Os[0][0][0])):
+        print(Os[0][0][0][i].cpu().tolist())
 
 
     stats_dict = {}

@@ -170,6 +170,10 @@ struct PartialOp
 
     using l_sv_type = sv_fl<16>;
 
+    using o_rt_quarter_type = rt_fl<Q_STEP * Q_HEADS / NUM_CONSUMER_WARPS, QVO_D / 4>;
+    using attn_rt_type = rt_fl<Q_STEP * Q_HEADS / NUM_CONSUMER_WARPS, NUM_ROWS>;
+    using rv_type = col_vec<attn_rt_type>;
+
     // Tensor objects
     using attn_tt_type = tt<float, Q_STEP*Q_HEADS, NUM_ROWS>;
     using attn_tt_fp8_type = tt_fp8<Q_STEP*Q_HEADS, NUM_ROWS>;
@@ -184,7 +188,7 @@ struct PartialOp
     // kcache and vcache getters
     __device__ static inline kcache_st_type &get_kcache_tile(state<config> &s, int stage) {return *reinterpret_cast<kcache_st_type*>(s.pages[s.pid(stage)].ptr());}
     __device__ static inline vcache_st_type &get_vcache_tile(state<config> &s, int stage) {return *reinterpret_cast<vcache_st_type*>((uint8_t*) s.pages[s.pid(stage)].ptr() + KCACHE_TILE_SIZE);}
-    __device__ static inline vcache_half_st_type &get_vcache_half_tile(state<config> &s, int stage, int half) {printf("accessing vcache tile at page %d\n", stage);return reinterpret_cast<vcache_half_st_type*>((uint8_t*) s.pages[s.pid(stage)].ptr() + KCACHE_TILE_SIZE)[half];}
+    __device__ static inline vcache_half_st_type &get_vcache_half_tile(state<config> &s, int stage, int half) {return reinterpret_cast<vcache_half_st_type*>((uint8_t*) s.pages[s.pid(stage)].ptr() + KCACHE_TILE_SIZE)[half];}
     
     // qrot and qvo getters
     __device__ static inline qrot_st_type &get_qrot_tile(state<config> &s) {return *reinterpret_cast<qrot_st_type*>(s.pages[s.pid(NUM_PIPELINE_STAGES)].ptr());}
@@ -276,58 +280,220 @@ struct PartialOp
 
     struct consumer
     {
+        static __device__ void store_outputs(const globals &g, state<config> &s, o_rt_quarter_type &o_quarter_rt_1, rv_type &current_tile_norm_vec) 
+        {
+            parsed_instruction inst{g, s};
+
+            // store outputs
+            printf("inst.q_batch_idx: %d\n", inst.q_batch_idx);
+            if (inst.output_location.batch_idx >= 0) {
+                using o_rt_quarter_fp8_type = rt_fp8<o_tt_quarter_type::rows/NUM_CONSUMER_WARPS, o_tt_quarter_type::cols>;
+                o_rt_quarter_fp8_type o_quarter_fp8;
+
+                warp::copy(o_quarter_fp8, o_quarter_rt_1);
+                group<NUM_CONSUMER_WARPS>::store(get_o_fp8_st_quarter_tile(s, 2), o_quarter_fp8);
+
+                o_tt_quarter_type o_quarter_tt_0 = get_o_tt_quarter(s, 0);
+                o_tt_quarter_type o_quarter_tt_1 = get_o_tt_quarter(s, 1);
+                o_tt_quarter_type o_quarter_tt_2 = get_o_tt_quarter(s, 2);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_0);
+                warp::copy(o_quarter_fp8, o_quarter_rt_1);
+                group<NUM_CONSUMER_WARPS>::store(get_o_fp8_st_quarter_tile(s, 0), o_quarter_fp8);
+                
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_1);
+                warp::copy(o_quarter_fp8, o_quarter_rt_1);
+                group<NUM_CONSUMER_WARPS>::store(get_o_fp8_st_quarter_tile(s, 1), o_quarter_fp8);
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_2);
+                warp::copy(o_quarter_fp8, o_quarter_rt_1);
+                group<NUM_CONSUMER_WARPS>::store(get_o_fp8_st_quarter_tile(s, 3), o_quarter_fp8);
+
+                group<NUM_CONSUMER_WARPS>::sync(2);
+                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    printf("storing to g.O\n");
+                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                        g.O,
+                        get_o_fp8_st_quarter_tile(s, 0),
+                        {
+                            inst.output_location.batch_idx, 
+                            inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
+                            0, 
+                            0
+                        }
+                    );
+
+                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                        g.O,
+                        get_o_fp8_st_quarter_tile(s, 1),
+                        {
+                            inst.output_location.batch_idx, 
+                            inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
+                            0, 
+                            1
+                        }
+                    );
+
+                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                        g.O,
+                        get_o_fp8_st_quarter_tile(s, 2),
+                        {
+                            inst.output_location.batch_idx, 
+                            inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
+                            0, 
+                            2
+                        }
+                    );
+
+                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
+                        g.O,
+                        get_o_fp8_st_quarter_tile(s, 3),
+                        {
+                            inst.output_location.batch_idx, 
+                            inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
+                            0, 
+                            3
+                        }
+                    );
+                }
+                group<NUM_CONSUMER_WARPS>::tma::store_async_wait();
+            } else {
+                printf("storing to g.O_scratch and g.Lvec_scratch\n");
+                o_rt_quarter_type o_quarter_rt_2;
+                o_tt_quarter_type o_quarter_tt_0 = get_o_tt_quarter(s, 0);
+                o_tt_quarter_type o_quarter_tt_1 = get_o_tt_quarter(s, 1);
+                o_tt_quarter_type o_quarter_tt_2 = get_o_tt_quarter(s, 2);
+                
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_2);
+                group<NUM_CONSUMER_WARPS>::store(get_o_st_quarter_tile(s, 0), o_quarter_rt_1);
+                group<NUM_CONSUMER_WARPS>::store(get_o_st_quarter_tile(s, 1), o_quarter_rt_2);
+                
+                group<NUM_CONSUMER_WARPS>::sync(2);
+                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
+                        g.O_scratch,
+                        get_o_st_quarter_tile(s, 0),
+                        {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 2}
+                    );
+
+                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
+                        g.O_scratch,
+                        get_o_st_quarter_tile(s, 1),
+                        {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 3}
+                    );
+                }
+
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_0);
+                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_1);
+                group<NUM_CONSUMER_WARPS>::store(get_o_st_quarter_tile(s, 2), o_quarter_rt_1);
+
+                group<NUM_CONSUMER_WARPS>::tma::store_async_wait();
+
+                group<NUM_CONSUMER_WARPS>::store(get_o_st_quarter_tile(s, 0), o_quarter_rt_2);
+
+                group<NUM_CONSUMER_WARPS>::sync(3);
+                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
+                        g.O_scratch,
+                        get_o_st_quarter_tile(s, 2),
+                        {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 0}
+                    );
+
+                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
+                        g.O_scratch,
+                        get_o_st_quarter_tile(s, 0),
+                        {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 1}
+                    );
+                }
+
+                // transform lvec before storing
+
+                warp::store(get_l_vec(s, group<NUM_CONSUMER_WARPS>::warpid()), current_tile_norm_vec);
+
+                warp::tma::store_async<cache_policy::EVICT_LAST>(
+                    g.Lvec_scratch,
+                    get_l_vec(s, group<NUM_CONSUMER_WARPS>::warpid()),
+                    {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0}
+                );
+
+                group<NUM_CONSUMER_WARPS>::tma::store_async_wait();
+
+                asm volatile("fence.sc.gpu;\n"); // Can't reorder across this boundary
+                __syncwarp();
+                if(warp::laneid() < Q_STEP && inst.output_location.seq_idx + warp::laneid() < g.O_scratch.depth()) {
+                    // Todo: this can probably replaced by a st.async, which may prevent an expensive wait on the final finish barrier.
+                    g.Bar[{-inst.output_location.batch_idx-1, inst.output_location.seq_idx + warp::laneid()}] = g.tic;
+                    // For blackwell
+                    // asm volatile(
+                    //     "st.async.global.b32 [%0], %1;\n"
+                    // ::  "l"(&args.globals.semaphore[{-args.common.dst.batch_idx-1, args.common.dst.seq_idx + group<8>::laneid()}]), "r"(args.globals.tic)
+                    // :   "memory"
+                    // );
+                }
+            }
+        }
+
         static __device__ void run(const globals &g, state<config> &s)
         {
             parsed_instruction inst{g, s};
             uint32_t bitfield = 0xFFFF0000; // 1 for arrived, 0 for finished
 
+            // allocate memory for qrot, qvo, attn_tt, o_quarter_tt_0, o_quarter_tt_1, o_quarter_tt_2
             qrot_st_type &qrot = get_qrot_tile(s);
             qvo_st_type &qvo = get_qvo_tile(s);
-
-            auto qrot_subtile = qrot.template subtile<qrot_st_type::rows/NUM_CONSUMER_WARPS, qrot_st_type::cols>({group<NUM_CONSUMER_WARPS>::warpid(), 0});
-            auto qvo_subtile = qvo.template subtile<qvo_st_type::rows/NUM_CONSUMER_WARPS, qvo_st_type::cols>({group<NUM_CONSUMER_WARPS>::warpid(), 0});
-
-            s.wait_page_ready(NUM_PIPELINE_STAGES);
-            s.wait_tensor_ready();
-            group<NUM_CONSUMER_WARPS>::sync(9);
-
-            using o_rt_quarter_type = rt_fl<o_tt_quarter_type::rows/NUM_CONSUMER_WARPS, o_tt_quarter_type::cols>;
-            o_rt_quarter_type o_quarter_rt_1;
-            warp::zero(o_quarter_rt_1);
-            
             attn_tt_type attn_tt = get_attn_tt(s);
             o_tt_quarter_type o_quarter_tt_0 = get_o_tt_quarter(s, 0);
             o_tt_quarter_type o_quarter_tt_1 = get_o_tt_quarter(s, 1);
             o_tt_quarter_type o_quarter_tt_2 = get_o_tt_quarter(s, 2);
+            // end of allocation of memory for qrot, qvo, attn_tt, o_quarter_tt_0, o_quarter_tt_1, o_quarter_tt_2
 
+            // store o_quarter_rt_1=0
+            o_rt_quarter_type o_quarter_rt_1;
+            warp::zero(o_quarter_rt_1);
+            // end of storing o_quarter_rt_1=0
+
+            auto qrot_subtile = qrot.template subtile<qrot_st_type::rows/NUM_CONSUMER_WARPS, qrot_st_type::cols>({group<NUM_CONSUMER_WARPS>::warpid(), 0});
+            auto qvo_subtile = qvo.template subtile<qvo_st_type::rows/NUM_CONSUMER_WARPS, qvo_st_type::cols>({group<NUM_CONSUMER_WARPS>::warpid(), 0});
+
+            // wait for pages and tensors to be ready
+            s.wait_page_ready(NUM_PIPELINE_STAGES);
+            s.wait_tensor_ready();
+            group<NUM_CONSUMER_WARPS>::sync(9);
+            // end of waiting for pages and tensors to be ready
+
+            // zero tensor memory
             group<NUM_CONSUMER_WARPS>::store_async(attn_tt, o_quarter_rt_1);
             group<NUM_CONSUMER_WARPS>::store_async(o_quarter_tt_0, o_quarter_rt_1);
             group<NUM_CONSUMER_WARPS>::store_async(o_quarter_tt_1, o_quarter_rt_1);
             group<NUM_CONSUMER_WARPS>::store_async(o_quarter_tt_2, o_quarter_rt_1);
+            // end of zero tensor memory
 
-            tensor_store_wait();
-            group<NUM_CONSUMER_WARPS>::sync(8);
-
+            // load qrot and qvo
             warp::load_async(qrot_subtile, g.Q, {inst.q_batch_idx, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 0});
             warp::load_async(qvo_subtile, g.QV, {inst.q_batch_idx, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 0});
+            // end of loading qrot and qvo
 
+
+            tensor_store_wait();
             load_async_wait();
+            group<NUM_CONSUMER_WARPS>::sync(8);
+            // end of waiting for pages and tensors to be ready
 
-            using attn_rt_type = rt_fl<attn_tt_type::rows/NUM_CONSUMER_WARPS, attn_tt_type::cols>;
-            using rv_type = col_vec<attn_rt_type>;
 
-            rv_type accumulated_max_vec, accumulated_norm_vec,
+            // initialize max and norm vectors
+            rv_type                       accumulated_norm_vec,
                     current_tile_max_vec, current_tile_norm_vec,
                     scaled_accumulated_max_vec, scaled_current_tile_max_vec;
 
             if(inst.num_iters > 0) warp::neg_infty(accumulated_max_vec);
             else { warp::one(accumulated_max_vec); warp::mul(accumulated_max_vec, accumulated_max_vec, -999999.f); }
-
             warp::zero(accumulated_norm_vec);
 
-            attn_rt_type attn_rt;
+            warp::neg_infty(current_tile_max_vec);
+            warp::zero(current_tile_norm_vec);
+            // end of initialization of max and norm vectors
 
-            // const float SOFTMAX_TEMPERATURE = g.softmax_scale * 1.44269504089f;
+            const float SOFTMAX_TEMPERATURE = g.softmax_scale * 1.44269504089f;
 
             group<NUM_CONSUMER_WARPS>::sync(10);
 
@@ -361,41 +527,11 @@ struct PartialOp
                 group<NUM_CONSUMER_WARPS>::sync(10);
                 // END DEBUGGING MODE
 
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // printf("printing qrot\n");
-                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                //     print(qrot);
-                // }
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // printf("printing qvo\n");
-                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                //     print(qvo);
-                // }
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // printf("printing kcache_st\n");
-                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                //     print(kcache_st);
-                // }
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // printf("printing vcache_st\n");
-                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                //     print(vcache_st);
-                // }
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-
-
                 group<NUM_CONSUMER_WARPS>::mm_ABt(attn_tt, qrot, kcache_st, matmul_finished(s));
                 group<NUM_CONSUMER_WARPS>::mma_ABt(attn_tt, qvo, vcache_st, matmul_finished(s));
 
                 // computation not needing matmul_finished
-                // warp::copy(current_tile_max_vec, accumulated_max_vec);
-                // warp::copy(current_tile_norm_vec, accumulated_norm_vec);
+                warp::mul(scaled_accumulated_max_vec, current_tile_max_vec, SOFTMAX_TEMPERATURE);
 
                 // wait for matmul to finish and trigger inputs_finished
                 wait(matmul_finished(s), 0);
@@ -405,79 +541,78 @@ struct PartialOp
                 attn_rt_type attn_rt;
                 group<NUM_CONSUMER_WARPS>::load_async(attn_rt, attn_tt);
 
+                // DEBUG PRINTING
+                using attn_st_type = st_fl<attn_tt_type::rows, attn_tt_type::cols>;
+                attn_st_type & attn_st = *reinterpret_cast<attn_st_type*>(s.pages[s.pid(2)].ptr());
+                
+                group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    printf("attn_st before mask\n");
+                    print(attn_st);
+                }
+
+                // printf("inst.start_pos: %d, inst.length: %d, NUM_ROWS: %d, iter: %d, start_pos + NUM_ROWS * (iter + 1): %d\n", inst.start_pos, inst.length, NUM_ROWS, iter, inst.start_pos + NUM_ROWS * (iter + 1));
                 // if (inst.start_pos + NUM_ROWS * (iter + 1) >= inst.length) {
-                //     // warp::apply(
-                //     //     att_block_fp32_rt,
-                //     //     att_block_fp32_rt,
-                //     //     [length] __device__ (
-                //     //         int r,
-                //     //         int c,
-                //     //         const float &x
-                //     //     ) -> float {
-                //     //         return (c >= length ? -9999999999.f : x);
-                //     //     }
-                //     // );
+                //     const int length = inst.length - inst.start_pos - NUM_ROWS * iter;
+                //     group<NUM_CONSUMER_WARPS>::apply(
+                //         attn_rt,
+                //         attn_rt,
+                //         [length] __device__ (
+                //             int r,
+                //             int c,
+                //             const float &x
+                //         ) -> float {
+                //             return (c >= length ? -9999999999.f : x);
+                //         }
+                //     );
                 // }
 
-                warp::one(scaled_accumulated_max_vec);
+                // Update current tile max and scaled current tile max
+                warp::row_max(current_tile_max_vec, attn_rt, current_tile_max_vec);
+                warp::mul(scaled_current_tile_max_vec, current_tile_max_vec, SOFTMAX_TEMPERATURE);
 
+                // Subtract scaled current tile max from scaled attn_rt and exponentiate
+                warp::mul(attn_rt, attn_rt, SOFTMAX_TEMPERATURE);
+                warp::sub_row(attn_rt, attn_rt, scaled_current_tile_max_vec);
+                warp::exp2(attn_rt, attn_rt);
 
-                // // DEBUG PRINTING
-                // using attn_st_type = st_fl<attn_tt_type::rows, attn_tt_type::cols>;
-                // printf("attn_st_size: %d\n", sizeof(attn_st_type::dtype) * attn_st_type::rows * attn_st_type::cols);
-                // attn_st_type & attn_st = *reinterpret_cast<attn_st_type*>(s.pages[s.pid(2)].ptr());
-                // group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
-
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // printf("printing attn_st\n");
-                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                //     print(attn_st);
-                // }
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // // END DEBUG PRINTING
-
-                warp::mul(attn_rt, attn_rt, 1/576.f);
-                warp::sub(attn_rt, attn_rt, 1.f);
-
-                // group<NUM_CONSUMER_WARPS>::store_async(attn_tt, attn_rt);
-                // tensor_store_wait();
-
-                // // DEBUG PRINTING
-                // group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
-
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // printf("printing attn_st after mul\n");
-                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                //     print(attn_st);
-                // }
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // // END DEBUG PRINTING
-
-                rt_fp8e4m3<attn_tt_type::rows / NUM_CONSUMER_WARPS, attn_tt_type::cols> attn_rt_fp8;
-                warp::copy(attn_rt_fp8, attn_rt);
-
-                group<NUM_CONSUMER_WARPS>::store_async(attn_tt_fp8, attn_rt_fp8);
-                tensor_store_wait();
-
-                group<NUM_CONSUMER_WARPS>::sync(11);
-
-                group<NUM_CONSUMER_WARPS>::load_async(attn_rt_fp8, attn_tt_fp8);
+                // Compute scale factor from last step (to normalize o for next step)
+                warp::sub(scaled_accumulated_max_vec, scaled_accumulated_max_vec, scaled_current_tile_max_vec);
+                warp::exp2(scaled_accumulated_max_vec, scaled_accumulated_max_vec);
+                
+                // Update norm_vec
+                warp::mul(current_tile_norm_vec, current_tile_norm_vec, scaled_accumulated_max_vec);
+                warp::row_sum(current_tile_norm_vec, attn_rt, current_tile_norm_vec);
 
 
                 // DEBUG PRINTING
-                using attn_st_type_fp8 = st_fp8<attn_tt_type::rows, attn_tt_type::cols>;
-                printf("attn_st_size: %d\n", sizeof(attn_st_type_fp8::dtype) * attn_st_type_fp8::rows * attn_st_type_fp8::cols);
-                attn_st_type_fp8 & attn_st_fp8 = *reinterpret_cast<attn_st_type_fp8*>(s.pages[s.pid(2)].ptr());
-                group<NUM_CONSUMER_WARPS>::load_async(attn_rt_fp8, attn_tt_fp8);
-                group<NUM_CONSUMER_WARPS>::store(attn_st_fp8, attn_rt_fp8);
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    printf("attn_st after mask\n");
+                    print(attn_st);
+                }
+                // END DEBUG PRINTING
+
+                warp::mul(attn_rt, attn_rt, 1/576.f);
+
+                group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
 
                 group<NUM_CONSUMER_WARPS>::sync(10);
-                printf("printing attn_st_fp8_after_load\n");
+                printf("printing attn_st after div\n");
                 if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    print(attn_st_fp8);
+                    print(attn_st);
                 }
                 group<NUM_CONSUMER_WARPS>::sync(10);
-                // END DEBUG PRINTING
+
+                // Convert attn_rt to fp8 and store in attn_tt_fp8
+                rt_fp8e4m3<attn_tt_type::rows / NUM_CONSUMER_WARPS, attn_tt_type::cols> attn_rt_fp8;
+                warp::copy(attn_rt_fp8, attn_rt);
+                group<NUM_CONSUMER_WARPS>::store_async(attn_tt_fp8, attn_rt_fp8);
+                tensor_store_wait();
+                group<NUM_CONSUMER_WARPS>::sync(11);
 
 
 
@@ -489,200 +624,9 @@ struct PartialOp
                 o_tt_quarter_type o_quarter_tt_1 = get_o_tt_quarter(s, 1);
                 o_tt_quarter_type o_quarter_tt_2 = get_o_tt_quarter(s, 2);
 
-
-                // // DEBUG PRINTING
+                // DEBUG PRINTING
                 using o_st_type = st_fl<o_tt_quarter_type::rows, o_tt_quarter_type::cols>;
                 o_st_type & o_st = *reinterpret_cast<o_st_type*>(s.pages[s.pid(2)].ptr());
-                
-                // group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_0);
-                // group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
-
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // printf("printing o0 before mma\n");
-                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                //     print(o_st);
-                // }
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-
-                // group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_1);
-                // group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
-
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // printf("printing o1 before mma\n");
-                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                //     print(o_st);
-                // }
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-
-                // group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_1);
-
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // printf("printing o2 before mma\n");
-                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                //     print(o_st);
-                // }
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-
-                // group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_2);
-                // group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
-
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // printf("printing o3 before mma\n");
-                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                //     print(o_st);
-                // }
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // printf("printing vcache_st_0 before mma\n");
-                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                //     print(get_vcache_half_tile(s, pipeline_stage, 0));
-                // }
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-                // printf("printing vcache_st_1 before mma\n");
-                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                //     print(get_vcache_half_tile(s, pipeline_stage, 1));
-                // }
-                // group<NUM_CONSUMER_WARPS>::sync(10);
-
-                // DEBUG PRINTING
-                using attn_st_type = st_fl<attn_tt_type::rows, attn_tt_type::cols>;
-                printf("attn_st_size: %d\n", sizeof(attn_st_type::dtype) * attn_st_type::rows * attn_st_type::cols);
-                attn_st_type & attn_st = *reinterpret_cast<attn_st_type*>(s.pages[s.pid(2)].ptr());
-                group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
-
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                printf("printing attn_st\n");
-                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    print(attn_st);
-                }
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                // END DEBUG PRINTING
-
-                // // END DEBUG PRINTING
-
-                printf("vcache entry is %a\n", get_vcache_half_tile(s, pipeline_stage, 0)[0]);
-                printf("attn_fp8 entry is %a\n", attn_rt_fp8.tiles[0][0].data[0]);
-
-                using debug_tt_type = tt<float, o_tt_quarter_type::rows, o_tt_quarter_type::cols>;
-                debug_tt_type tt_0 = s.tensor_alloc.template allocate<debug_tt_type>(0);
-                debug_tt_type tt_1 = s.tensor_alloc.template allocate<debug_tt_type>(debug_tt_type::cols);
-                debug_tt_type tt_2 = s.tensor_alloc.template allocate<debug_tt_type>(2 * debug_tt_type::cols);
-                debug_tt_type tt_3 = s.tensor_alloc.template allocate<debug_tt_type>(3 * debug_tt_type::cols);
-
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_0);
-                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
-
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                printf("printing tt_0 before mma\n");
-                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    print(o_st);
-                }
-                group<NUM_CONSUMER_WARPS>::sync(10);
-
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_1);
-                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
-
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                printf("printing tt_1 before mma\n");
-                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    print(o_st);
-                }
-                group<NUM_CONSUMER_WARPS>::sync(10);
-
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_2);
-                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
-
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                printf("printing tt_2 before mma\n");
-                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    print(o_st);
-                }
-                group<NUM_CONSUMER_WARPS>::sync(10);
-
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_3);
-                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
-
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                printf("printing tt_3 before mma\n");
-                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    print(o_st);
-                }
-                group<NUM_CONSUMER_WARPS>::sync(10);
-
-                // test!!!!!!
-                o_tt_half_type o_half_1 = get_o_tt_half(s, 0);
-                auto &vcache_half_tile_1 = get_vcache_half_tile(s, pipeline_stage, 1);
-                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) mma_AB(o_half_1, attn_tt_fp8, vcache_half_tile_1, matmul_finished(s));
-
-                if (group<NUM_CONSUMER_WARPS>::laneid() == 1) {
-                    arrive(matmul_finished(s));
-                }
-                wait(matmul_finished(s), 1);
-                // end test!!!!!!
-
-                // DEBUG PRINTING
-
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_0);
-                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
-
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                printf("printing tt_0 after mma\n");
-                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    print(o_st);
-                }
-                group<NUM_CONSUMER_WARPS>::sync(10);
-
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_1);
-                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
-
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                printf("printing tt_1 after mma\n");
-                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    print(o_st);
-                }
-                group<NUM_CONSUMER_WARPS>::sync(10);
-
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_2);
-                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
-
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                printf("printing tt_2 after mma\n");
-                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    print(o_st);
-                }
-                group<NUM_CONSUMER_WARPS>::sync(10);
-
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, tt_3);
-                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_2);
-
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                printf("printing tt_3 after mma\n");
-                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    print(o_st);
-                }
-                group<NUM_CONSUMER_WARPS>::sync(10);
-
-                // END DEBUG PRINTING
-
-                /*
-                // DEBUG PRINTING
-                using attn_st_type = st_fp8<attn_tt_type::rows, attn_tt_type::cols>;
-                printf("attn_st_size: %d\n", sizeof(attn_st_type::dtype) * attn_st_type::rows * attn_st_type::cols);
-                attn_st_type & attn_st = *reinterpret_cast<attn_st_type*>(s.pages[s.pid(2)].ptr());
-                group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt_fp8);
-
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                printf("printing attn_st_fp8\n");
-                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    print(attn_st);
-                }
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                // END DEBUG PRINTING
-
-
 
                 // load o[3] from o_quarter_tt_2 to o_quarter_rt_2, normalize o[2] and o[3]
                 group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_2);
@@ -698,6 +642,7 @@ struct PartialOp
 
                 o_tt_half_type o_half_1 = get_o_tt_half(s, 1);
                 auto &vcache_half_tile_1 = get_vcache_half_tile(s, pipeline_stage, 1);
+                printf("starting mma\n");
                 if(group<NUM_CONSUMER_WARPS>::laneid() == 0) mma_AB(o_half_1, attn_tt_fp8, vcache_half_tile_1, matmul_finished(s));
                 
                 // load o[0] from o_quarter_tt_1 to o_quarter_rt_1, normalize o[0] and o[1], put o[0] back
@@ -707,26 +652,18 @@ struct PartialOp
                 group<NUM_CONSUMER_WARPS>::store_async(o_quarter_tt_0, o_quarter_rt_1);
 
                 if (group<NUM_CONSUMER_WARPS>::laneid() == 1) {
+                    printf("arriving matmul_finished(s)\n");
                     arrive(matmul_finished(s));
                 }
+                printf("waiting for matmul_finished(s)\n");
                 wait(matmul_finished(s), 1);
+                printf("matmul_finished(s) arrived\n");
 
                 // swap o[1] and o[2], launch mma
                 group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_1);
                 group<NUM_CONSUMER_WARPS>::store_async(o_quarter_tt_1, o_quarter_rt_2);
                 tensor_store_wait();
                 group<NUM_CONSUMER_WARPS>::sync(10);
-
-                // DEBUG PRINTING
-                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_1);
-
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                printf("printing o2 after first mma\n");
-                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    print(o_st);
-                }
-                group<NUM_CONSUMER_WARPS>::sync(10);
-                // END DEBUG PRINTING
 
                 o_tt_half_type o_half_0 = get_o_tt_half(s, 0);
                 auto &vcache_half_tile_0 = get_vcache_half_tile(s, pipeline_stage, 0);
@@ -783,154 +720,9 @@ struct PartialOp
                 group<NUM_CONSUMER_WARPS>::sync(10);
 
                 // END DEBUG PRINTING
-                */
             }
 
-            // store outputs
-            if (inst.q_batch_idx >= 0) {
-                using o_rt_quarter_fp8_type = rt_fp8<o_tt_quarter_type::rows/NUM_CONSUMER_WARPS, o_tt_quarter_type::cols>;
-                o_rt_quarter_fp8_type o_quarter_fp8;
-
-                warp::copy(o_quarter_fp8, o_quarter_rt_1);
-                group<NUM_CONSUMER_WARPS>::store(get_o_fp8_st_quarter_tile(s, 2), o_quarter_fp8);
-
-                o_tt_quarter_type o_quarter_tt_0 = get_o_tt_quarter(s, 0);
-                o_tt_quarter_type o_quarter_tt_1 = get_o_tt_quarter(s, 1);
-                o_tt_quarter_type o_quarter_tt_2 = get_o_tt_quarter(s, 2);
-
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_0);
-                warp::copy(o_quarter_fp8, o_quarter_rt_1);
-                group<NUM_CONSUMER_WARPS>::store(get_o_fp8_st_quarter_tile(s, 0), o_quarter_fp8);
-                
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_1);
-                warp::copy(o_quarter_fp8, o_quarter_rt_1);
-                group<NUM_CONSUMER_WARPS>::store(get_o_fp8_st_quarter_tile(s, 1), o_quarter_fp8);
-
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_2);
-                warp::copy(o_quarter_fp8, o_quarter_rt_1);
-                group<NUM_CONSUMER_WARPS>::store(get_o_fp8_st_quarter_tile(s, 3), o_quarter_fp8);
-
-                group<NUM_CONSUMER_WARPS>::sync(2);
-                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                        g.O,
-                        get_o_fp8_st_quarter_tile(s, 0),
-                        {
-                            inst.q_batch_idx, 
-                            inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
-                            0, 
-                            0
-                        }
-                    );
-
-                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                        g.O,
-                        get_o_fp8_st_quarter_tile(s, 1),
-                        {
-                            inst.q_batch_idx, 
-                            inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
-                            0, 
-                            QVO_D/4
-                        }
-                    );
-
-                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                        g.O,
-                        get_o_fp8_st_quarter_tile(s, 2),
-                        {
-                            inst.q_batch_idx, 
-                            inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
-                            0, 
-                            QVO_D/2
-                        }
-                    );
-
-                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(
-                        g.O,
-                        get_o_fp8_st_quarter_tile(s, 3),
-                        {
-                            inst.q_batch_idx, 
-                            inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
-                            0, 
-                            3*QVO_D/4
-                        }
-                    );
-                }
-                group<NUM_CONSUMER_WARPS>::tma::store_async_wait();
-            } else {
-                o_tt_quarter_type o_quarter_tt_0 = get_o_tt_quarter(s, 0);
-                o_tt_quarter_type o_quarter_tt_1 = get_o_tt_quarter(s, 1);
-                o_tt_quarter_type o_quarter_tt_2 = get_o_tt_quarter(s, 2);
-                
-                group<NUM_CONSUMER_WARPS>::store(get_o_st_quarter_tile(s, 0), o_quarter_rt_1);
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_2);
-                group<NUM_CONSUMER_WARPS>::store(get_o_st_quarter_tile(s, 1), o_quarter_rt_1);
-                
-                group<NUM_CONSUMER_WARPS>::sync(2);
-                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
-                        g.O_scratch,
-                        get_o_st_quarter_tile(s, 0),
-                        {-inst.q_batch_idx-1, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, QVO_D/2}
-                    );
-
-                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
-                        g.O_scratch,
-                        get_o_st_quarter_tile(s, 1),
-                        {-inst.q_batch_idx-1, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 3 * QVO_D / 4}
-                    );
-                }
-
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_0);
-                group<NUM_CONSUMER_WARPS>::store(get_o_st_quarter_tile(s, 2), o_quarter_rt_1);
-                group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_1);
-
-                group<NUM_CONSUMER_WARPS>::tma::store_async_wait();
-
-                group<NUM_CONSUMER_WARPS>::store(get_o_st_quarter_tile(s, 0), o_quarter_rt_1);
-
-                group<NUM_CONSUMER_WARPS>::sync(3);
-                if(group<NUM_CONSUMER_WARPS>::laneid() == 0) {
-                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
-                        g.O_scratch,
-                        get_o_st_quarter_tile(s, 2),
-                        {-inst.q_batch_idx-1, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 0}
-                    );
-
-                    tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
-                        g.O_scratch,
-                        get_o_st_quarter_tile(s, 0),
-                        {-inst.q_batch_idx-1, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, QVO_D/4}
-                    );
-                }
-
-                // transform lvec before storing
-
-                warp::store(get_l_vec(s, group<NUM_CONSUMER_WARPS>::warpid()), current_tile_norm_vec);
-
-                warp::tma::store_async<cache_policy::EVICT_LAST>(
-                    g.Lvec_scratch,
-                    get_l_vec(s, group<NUM_CONSUMER_WARPS>::warpid()),
-                    {-inst.q_batch_idx-1, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0}
-                );
-
-                group<NUM_CONSUMER_WARPS>::tma::store_async_wait();
-
-                asm volatile("fence.sc.gpu;\n"); // Can't reorder across this boundary
-                __syncwarp();
-                if(inst.q_batch_idx < 0) {
-                    if(warp::laneid() < Q_STEP && inst.q_seq_idx + warp::laneid() < g.O_scratch.depth()) {
-                        // Todo: this can probably replaced by a st.async, which may prevent an expensive wait on the final finish barrier.
-                        g.Bar[{-inst.q_batch_idx-1, inst.q_seq_idx + warp::laneid()}] = g.tic;
-                        // For blackwell
-                        // asm volatile(
-                        //     "st.async.global.b32 [%0], %1;\n"
-                        // ::  "l"(&args.globals.semaphore[{-args.common.dst.batch_idx-1, args.common.dst.seq_idx + group<8>::laneid()}]), "r"(args.globals.tic)
-                        // :   "memory"
-                        // );
-                    }
-                }
-            }
+            store_outputs(g, s, o_quarter_rt_1, current_tile_norm_vec);
 
             if (laneid() == 0) {
                 for (int i = 0; i < NUM_PAGES; i++) {

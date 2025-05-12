@@ -23,8 +23,8 @@ PYBIND11_MODULE(kvm_llama, m)
                                     &llama_70b_globals::v_cache,
                                     &llama_70b_globals::q_post_rope,
                                     &llama_70b_globals::attn_out,
-                                    // &llama_70b_globals::attn_lse_intermediates,
-                                    // &llama_70b_globals::attn_out_intermediates,
+                                    &llama_70b_globals::kv_indices,
+                                    &llama_70b_globals::kv_indptr,
                                     &llama_70b_globals::pos_id,
                                     &llama_70b_globals::attn_scale
                                 );

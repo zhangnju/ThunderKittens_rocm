@@ -9,13 +9,11 @@ namespace kittens::prototype::vm
     template <typename config, typename globals>
     struct attention_decode
     {
-        static constexpr int opcode = OPCODE_GQA_Attention;
+        static constexpr int opcode = OPCODE_GQA_AttentionDecode;
         static constexpr int NUM_STAGES = 3;
         static constexpr int GQA_RATIO = LLAMA_70B_NUM_ATTENTION_HEADS / LLAMA_70B_NUM_KV_HEADS;
         static constexpr int QO_PAGE = 0;
         static constexpr int KV_PAGE = 1;
-        static constexpr int KV_INDICES_LEN = 0;
-        static constexpr int MAX_KV_INDICES_LEN = 0;
 
         static_assert(GQA_RATIO == 8, "GQA_RATIO must be 8.");
         static_assert(NUM_STAGES <= 4, "Modify page allocation for KVs.");
@@ -42,24 +40,12 @@ namespace kittens::prototype::vm
             int layer_idx;
             int kv_head_idx;
             int batch_idx;
-            int kv_indices_len;
-            int kv_indices[KV_INDICES_LEN]; // actual physical indices to read in from paged KV
-
+        
             __device__ inline parsed_instruction(typename config::instruction_t &instruction)
             {                
                 layer_idx = instruction[1];
                 kv_head_idx = instruction[2];
                 batch_idx = instruction[3];
-                kv_indices_len = instruction[4]; // length of number of indices from paged KV cache to read 
-
-                #pragma unroll
-                for (int k = 0; k < MAX_KV_INDICES_LEN; ++k) 
-                {
-                    if (k < kv_indices_len) 
-                    {
-                        kv_indices[k] = instruction[5 + k];
-                    }
-                }
             }
             __device__ inline parsed_instruction(state<config> &s) : parsed_instruction(s.instruction()) {}
         };
@@ -261,29 +247,28 @@ namespace kittens::prototype::vm
                 {
                     // Setup
                     parsed_instruction inst{s};
-                    int seq_len = g.pos_id + 1;
 
                     s.record(TEVENT_AT_GMEM_WAIT);
 
                     // Wait for the previous ops to finish (16 dims each, so 4 ops on the same head)
-                    while (*(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, LLAMA_70B_NUM_ATTENTION_HEADS + inst.kv_head_idx}] < 4 ||                       // K
-                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, LLAMA_70B_NUM_ATTENTION_HEADS + LLAMA_70B_NUM_KV_HEADS + inst.kv_head_idx}] < 4) // V
-                    {
-                        __nanosleep(20);
-                    }
+                    // while (*(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1, LLAMA_70B_NUM_ATTENTION_HEADS + inst.kv_head_idx}] < 4 ||                       // K
+                    //        *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1, LLAMA_70B_NUM_ATTENTION_HEADS + LLAMA_70B_NUM_KV_HEADS + inst.kv_head_idx}] < 4) // V
+                    // {
+                    //     __nanosleep(20);
+                    // }
 
                     s.record(TEVENT_DONE_GMEM_WAIT);
 
                     // Wait for the KV page
+                    
                     wait_KV_page(s);
                     
-                    // TODO: Do we still need this case? 
-                    // if (start_blk_idx >= end_blk_idx)
-                    //     finish_KV_page(s);
+                    int seq_len = g.pos_id + 1;
+                    int num_kv_pages = (seq_len + g.kv_page_size - 1) / g.kv_page_size;
+                    int kv_page_start = g.kv_indptr[inst.batch_idx];
 
                     // Run the pipeline!
-                    // for (int i = 0; i + start_blk_idx < end_blk_idx; ++i)
-                    for (int i = 0; i < inst.kv_indices_len; ++i)
+                    for (int i = 0; i < num_kv_pages; ++i)
                     {
                         int stage = i % NUM_STAGES;
                         kv_st &K_smem = get_K_smem(s, stage);
@@ -292,16 +277,17 @@ namespace kittens::prototype::vm
                         if (i >= NUM_STAGES)
                         {
                             wait(K_finished(s, stage), (i / NUM_STAGES - 1) % 2);
+                            
                             wait(V_finished(s, stage), (i / NUM_STAGES - 1) % 2);
                         }
                         
-                        int cur_page_idx = inst.kv_indices[i];
+                        int cur_page_idx = g.kv_indices[kv_page_start + i];
                         // TODO: Need to ensure right indexing based on k_cache and v_cache shape
                         tma::expect(K_arrived(s, stage), K_smem);
-                        // TODO: ensure AXIS access is right here? 
-                        tma::load_async<dim::DEPTH, cache_policy::EVICT_FIRST>(K_smem, g.k_cache, {cur_page_idx, 0, inst.kv_head_idx, 0}, K_arrived(s, stage));
+                        // NUM_PAGEX x NUM_KV_HEADS x PAGE_SIZE x HEAD_DIM
+                        tma::load_async(K_smem, g.k_cache, {cur_page_idx, inst.kv_head_idx, 0, 0}, K_arrived(s, stage));
                         tma::expect(V_arrived(s, stage), V_smem);
-                        tma::load_async<dim::DEPTH, cache_policy::EVICT_FIRST>(V_smem, g.v_cache, {cur_page_idx, 0, inst.kv_head_idx, 0}, V_arrived(s, stage));
+                        tma::load_async(V_smem, g.v_cache, {cur_page_idx, inst.kv_head_idx, 0, 0}, V_arrived(s, stage));
                     }
                 }
                 else if (laneid >= 2 && laneid < config::NUM_PAGES)
@@ -344,29 +330,27 @@ namespace kittens::prototype::vm
                     // Wait for the previous ops to finish
                     parsed_instruction inst{s};
                     int q_head_start_idx = inst.kv_head_idx * GQA_RATIO;
-                    while (*(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 0}] < 4 ||
-                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 1}] < 4 ||
-                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 2}] < 4 ||
-                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 3}] < 4 ||
-                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 4}] < 4 ||
-                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 5}] < 4 ||
-                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 6}] < 4 ||
-                           *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_QKV_MatVecRopeAppend - 1, q_head_start_idx + 7}] < 4)
-                    {
-                        __nanosleep(20);
-                    }
+                    // while (*(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1, q_head_start_idx + 0}] < 4 ||
+                    //        *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1, q_head_start_idx + 1}] < 4 ||
+                    //        *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1, q_head_start_idx + 2}] < 4 ||
+                    //        *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1, q_head_start_idx + 3}] < 4 ||
+                    //        *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1, q_head_start_idx + 4}] < 4 ||
+                    //        *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1, q_head_start_idx + 5}] < 4 ||
+                    //        *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1, q_head_start_idx + 6}] < 4 ||
+                    //        *(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_QKV_RopeAppend - 1, q_head_start_idx + 7}] < 4)
+                    // {
+                    //     __nanosleep(20);
+                    // }
                     warp::sync();
 
                     // Initiate the load on Q
+                    
                     wait_QO_page(s);
 
                     q_st &Q_smem = get_Q_smem(s);
                     load_Q_async(Q_smem, g.q_post_rope, q_head_start_idx);
 
-                    // Setup
-                    int q_head_local_idx = (q_head_start_idx % q_rt::tile_size_row) / 8;
-                    int seq_len = g.pos_id + 1;
-                    
+                    // Setup                    
                     float softmax_temp = g.attn_scale * 1.44269504089f; // 1 / (sqrt(D_h) * ln(2))
                     q_rt Q_reg;
                     k_rt K_reg;
@@ -386,7 +370,20 @@ namespace kittens::prototype::vm
                     o_sv(&O_smem)[8] = get_O_smem(s);
 
                     // Wait for Q to arrive
+                    
                     warp::load_async_wait();
+                    
+                    // if (warpid() == 0 && laneid() == 0)
+                    // {
+                    //     for (int i = 0; i < 16; i++)
+                    //     {
+                    //         for (int j = 0; j < 8; j++)
+                    //         {
+                    
+                    //         }
+                    
+                    //     }
+                    // }
 
                     if (laneid() == 0)
                     {
@@ -395,16 +392,22 @@ namespace kittens::prototype::vm
 
                     warp::load(Q_reg, Q_smem);
 
+
+                    int seq_len = g.pos_id + 1;
+                    int num_kv_pages = (seq_len + g.kv_page_size - 1) / g.kv_page_size;
+                    int kv_page_start = g.kv_indptr[inst.batch_idx];
+
                     // Run the pipeline!
-                    for (int i = 0; i < inst.kv_indices_len; ++i)
-                    {
+                    for (int i = 0; i < num_kv_pages; ++i)
+                    {   
                         int stage = i % NUM_STAGES;
-                        int cur_page_idx = inst.kv_indices[i];
+                        int cur_page_idx = g.kv_indices[kv_page_start + i];
                         kv_st &K_smem = get_K_smem(s, stage);
                         kv_st &V_smem = get_V_smem(s, stage);
 
                         // Perform Q @ K.T
                         warp::zero(attn_fl_reg);
+                        
                         warp::wait(K_arrived(s, stage), (i / NUM_STAGES) % 2);
                         if (laneid() == 0 && i < 16)
                             s.record(TEVENT_CONSUMER_START + 32 + i);
@@ -438,6 +441,7 @@ namespace kittens::prototype::vm
                         if (laneid() == 0 && i < 16)
                             s.record(TEVENT_CONSUMER_START + 48 + i);
                         warp::load(V_reg, V_smem);
+
                         warp::copy(attn_bf_reg, attn_fl_reg); // Convert to bf16 to do matmul
                         warp::mma_AB(O_reg, attn_bf_reg, V_reg, O_reg);
                         warp::sync();
@@ -455,11 +459,9 @@ namespace kittens::prototype::vm
                     warp::sync();
                     if (laneid() == 0)
                         s.record(TEVENT_CONSUMER_START + 64);
-                    if (inst.kv_indices_len > 0)
-                    {
-                        finish_KV_page(s);
-                        warp::div_row(O_reg, O_reg, norm_vec_reg);
-                    }
+                    
+                    finish_KV_page(s);
+                    warp::div_row(O_reg, O_reg, norm_vec_reg);
 
                     // Store the results
                     o_rt_bf O_reg_bf; 
@@ -492,13 +494,13 @@ namespace kittens::prototype::vm
 
                 parsed_instruction inst{s};
                 int laneid = warp::laneid();
-                int q_head_start_idx = inst.kv_head_idx * GQA_RATIO; // 0, 4, 8, 12, 16, 20, 24, 28
-                int q_head_vec_start_idx = q_head_start_idx % 16;
+                int q_head_start_idx = inst.kv_head_idx * GQA_RATIO; // 0, 8, 16, 24, 32, 40, 48, 56
 
                 // Store partial attention output to global memory
                 if (laneid == 0)
                 {
                     o_sv(&O_smem)[8] = get_O_smem(s);
+                    
                     wait(O_arrived(s), 0);
                     s.record(TEVENT_OUTPUT_READY);
 
@@ -520,7 +522,7 @@ namespace kittens::prototype::vm
                         s.record(123 + laneid);
                     finish_QO_page(s);
                     // Adding only at 0, 4, 8, ... should be sufficient for the reduction op!
-                    atomicAdd(&g.Bar[{inst.layer_idx, OPCODE_GQA_Attention - 1, q_head_start_idx + laneid}], 1);
+                    atomicAdd(&g.Bar[{inst.layer_idx, OPCODE_GQA_AttentionDecode - 1, q_head_start_idx + laneid}], 1);
                 }
                 warp::sync();
                 if (laneid == 0)

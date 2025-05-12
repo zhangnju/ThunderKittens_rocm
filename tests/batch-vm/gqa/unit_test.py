@@ -1,43 +1,36 @@
 import math
-
 import torch
+from einops import einsum, rearrange
 from kvm_llama import kvm_llama
 
-TORCH_DEVICE = torch.device('cpu')  # Temporarily use CPU instead of CUDA
-print(f'Using device: {TORCH_DEVICE}')
+TORCH_DEVICE = torch.device('cuda:2')
 
-# Fixed paramters
-NUM_BLOCKS = 148
+NUM_SMS = 148
 INSTRUCTION_WIDTH = 32
 TIMING_WIDTH = 128
-GQA_ATTENTION_OPCODE = 2
-NUM_OPS = 6
-KV_PAGE_SIZE = 128  # Size of each KV cache page
+GQA_ATTENTION_OPCODE = 3
+NUM_OPS = 8
+KV_PAGE_SIZE = 16
 
-# Llama 70B Model Parameters
-B = 1  # this is fixed for now
-N_max = 131072  # maximum sequence length
-H_q = 64  # number of query heads
-H_kv = 8  # number of key/value heads (number of query groups)
-D_h = 128  # dimension of each head
+N_max = 131072
+H_q = 64
+H_kv = 8
+D_h = 128
 
 # Kernel parameters
 LAYER_IDX = 3
-POS_ID = 1050
 ATTN_SCALE = 1 / math.sqrt(D_h)
 ATTN_BLOCK_SIZE = 16
-BATCH_IDX = 6
+BATCH_SIZE = 128
 
 # Unit testing
-H_kv_IDX = 5
+BATCH_IDX = 0
+POS_ID = 15
+KV_H_IDX = 0
 
-def generate_tensor_inputs(N_max: int, H_q: int, H_kv: int, D_h: int):
-    '''Generate tensor inputs for the attention kernel.
-    Args:
-        N_max (int): Maximum sequence length.
-        H_q (int): Number of query heads.
-        H_kv (int): Number of key/value heads (number of query groups).
-        D_h (int): Dimension of each head.
+def generate_tensor_inputs():
+    '''
+    Generate tensor inputs for the attention kernel.
     '''
     torch.manual_seed(42)
 
@@ -45,32 +38,39 @@ def generate_tensor_inputs(N_max: int, H_q: int, H_kv: int, D_h: int):
     num_pages = (N_max + KV_PAGE_SIZE - 1) // KV_PAGE_SIZE
 
     Q   = torch.randn(H_q * D_h, dtype=torch.bfloat16, device=TORCH_DEVICE)
-    # KV cache in paged format: (max_num_pages, page_size, num_heads, head_dim)
-    K_c = torch.randn(num_pages, KV_PAGE_SIZE, H_kv, D_h, dtype=torch.bfloat16, device=TORCH_DEVICE)
-    V_c = torch.randn(num_pages, KV_PAGE_SIZE, H_kv, D_h, dtype=torch.bfloat16, device=TORCH_DEVICE)
-    O   = torch.zeros(H_q, D_h, dtype=torch.float32, device=TORCH_DEVICE)
+    O   = torch.zeros(H_q * D_h, dtype=torch.bfloat16, device=TORCH_DEVICE)
 
-    return Q, K_c, V_c, O
+    # KV cache in paged format: (max_num_pages, head_idx, page_size, head_dim)
+    K_c = torch.randn(num_pages, H_kv, KV_PAGE_SIZE, D_h, dtype=torch.bfloat16, device=TORCH_DEVICE)
+    V_c = torch.randn(num_pages, H_kv, KV_PAGE_SIZE, D_h, dtype=torch.bfloat16, device=TORCH_DEVICE)
+
+    num_pages_needed = (POS_ID + 1 + KV_PAGE_SIZE - 1) // KV_PAGE_SIZE
+
+    kv_indices = []
+    for page in range(num_pages_needed):
+        kv_indices.append(page)
+    kv_indices = torch.tensor(kv_indices, dtype=torch.int32, device=TORCH_DEVICE)
+    
+    kv_indptr = torch.zeros(BATCH_SIZE, dtype=torch.int32, device=TORCH_DEVICE)
+    kv_indptr[BATCH_IDX] = 0
+
+    return Q, K_c, V_c, O, kv_indices, kv_indptr
 
 def generate_itb(): # instruction, timings, barriers
-    instructions = [[] for _ in range(NUM_BLOCKS)]
+    instructions = [[] for _ in range(NUM_SMS)]
     instruction_idx = 0
 
-    # Calculate which pages we need to access based on POS_ID
-    num_pages_needed = (POS_ID + 1 + KV_PAGE_SIZE - 1) // KV_PAGE_SIZE
-    kv_indices = list(range(num_pages_needed))  # List of page indices to access
-
-    # Single instruction, for testing (L, H_kv index, num_kv_indices, kv_indices...)
-    instruction = [GQA_ATTENTION_OPCODE, LAYER_IDX, H_kv_IDX, len(kv_indices)] + kv_indices
+    # Single instruction, for testing (LayerIdx, H_kv index, BatchIdx)
+    instruction = [GQA_ATTENTION_OPCODE, LAYER_IDX, KV_H_IDX, BATCH_IDX]
     instruction += [0] * (INSTRUCTION_WIDTH - len(instruction))  # Pad to INSTRUCTION_WIDTH
     instructions[0].append(instruction)
     instruction_idx += 1
 
-    # All blocks must have same number of instructions
+    # All SMs must have same number of instructions
     max_instructions = -1
-    for i in range(NUM_BLOCKS):
+    for i in range(NUM_SMS):
         max_instructions = max(max_instructions, len(instructions[i]))
-    for i in range(NUM_BLOCKS):
+    for i in range(NUM_SMS):
         while len(instructions[i]) < max_instructions:
             instructions[i].append([0] * INSTRUCTION_WIDTH)
         instruction_idx += 1
@@ -78,90 +78,106 @@ def generate_itb(): # instruction, timings, barriers
     # (BlockIdx, InstructionIdx, Instruction)
     # If opcode (instructions[:, :, 0]) is invalid, the instruction is ignored
     instructions = torch.tensor(instructions, dtype=torch.int32).to(device=TORCH_DEVICE)
-    timings = torch.zeros((NUM_BLOCKS, instruction_idx // NUM_BLOCKS, TIMING_WIDTH), dtype=torch.int32).to(device=TORCH_DEVICE)
+    timings = torch.zeros((NUM_SMS, instruction_idx // NUM_SMS, TIMING_WIDTH), dtype=torch.int32).to(device=TORCH_DEVICE)
     barriers = torch.zeros((7, NUM_OPS, H_q + 2 * H_kv), dtype=torch.uint32).to(device=TORCH_DEVICE)
 
     # Fill in the barrier
-    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, H_kv_IDX * 8 + 0] = 4
-    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, H_kv_IDX * 8 + 1] = 4
-    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, H_kv_IDX * 8 + 2] = 4
-    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, H_kv_IDX * 8 + 3] = 4
-    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, H_kv_IDX * 8 + 4] = 4
-    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, H_kv_IDX * 8 + 5] = 4
-    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, H_kv_IDX * 8 + 6] = 4
-    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, H_kv_IDX * 8 + 7] = 4
-    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, H_q + H_kv_IDX] = 4
-    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, H_q + H_kv + H_kv_IDX] = 4
+    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, KV_H_IDX * 8 + 0] = 8
+    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, KV_H_IDX * 8 + 1] = 8
+    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, KV_H_IDX * 8 + 2] = 8
+    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, KV_H_IDX * 8 + 3] = 8
+    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, KV_H_IDX * 8 + 4] = 8
+    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, KV_H_IDX * 8 + 5] = 8
+    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, KV_H_IDX * 8 + 6] = 8
+    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, KV_H_IDX * 8 + 7] = 8
+    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, H_q + KV_H_IDX] = 8
+    barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1, H_q + H_kv + KV_H_IDX] = 8
 
     return instructions, timings, barriers
+
+def reference_gqa(K_c, V_c, Q_post_rope, kv_indices, kv_indptr, pos_id, attn_scale):
+    kv_page_start = kv_indptr[BATCH_IDX]
+    num_kv_pages = (pos_id + 1 + KV_PAGE_SIZE - 1) // KV_PAGE_SIZE
+
+    gqa_ratio = H_q // H_kv
+
+    running_max   = torch.full((gqa_ratio,), -float("inf"), device=TORCH_DEVICE)
+    running_denom = torch.zeros((gqa_ratio,),               device=TORCH_DEVICE)
+    running_out   = torch.zeros((gqa_ratio, D_h),           device=TORCH_DEVICE)
+
+    q = rearrange(Q_post_rope, '(h d) -> h d', h=H_q)
+    q_slice = q[KV_H_IDX * 8: (KV_H_IDX + 1) * 8].float()
+
+    for i in range(num_kv_pages):
+        cur_page_idx = kv_indices[kv_page_start + i]
+        k = K_c[cur_page_idx, KV_H_IDX, :, :].float()
+        v = V_c[cur_page_idx, KV_H_IDX, :, :].float()
+        
+        qk = einsum(q_slice, k, 'q d, k d -> q k')
+        scaled_qk = qk * attn_scale
+
+        block_max = scaled_qk.amax(dim=1)
+        new_max = torch.maximum(running_max, block_max)
+
+        exp_old = torch.exp(running_max - new_max)
+        exp_block = torch.exp(scaled_qk - new_max.unsqueeze(1))
+
+        num_block = torch.matmul(exp_block, v)
+        running_out = running_out * exp_old.unsqueeze(1) + num_block
+
+        denom_block = exp_block.sum(dim=1)
+        running_denom = running_denom * exp_old + denom_block
+
+        running_max = new_max
+
+    out = running_out / running_denom.unsqueeze(1)
+    out_flat = out.view(-1)
+
+    return out_flat
 
 # Generate inputs
 print('\nGenerating inputs...')
 instructions, timings, barriers = generate_itb()
-Q, K_c, V_c, O = generate_tensor_inputs(N_max, H_q, H_kv, D_h)
+Q_post_rope, K_c, V_c, Attn_out, kv_indices, kv_indptr = generate_tensor_inputs()
 
 # Run the kernel
 print('Instruction shape:', instructions.shape)
 print('Barrier shape:', barriers.shape)
 print('Timings shape:', timings.shape) 
-print('Q shape:', Q.shape)
+print('Q_post_rope shape:', Q_post_rope.shape)
 print('K_c shape:', K_c.shape)
 print('V_c shape:', V_c.shape)
-print('O shape:', O.shape)
+print('Attn_out shape:', Attn_out.shape)
+
+
 print('\nRunning the kernel...')
-# kvm_llama(
-#     instructions, 
-#     barriers, 
-#     timings,
-#     K_c, 
-#     V_c, 
-#     Q,
-#     O, 
-#     POS_ID, 
-#     ATTN_SCALE
-# )
-# torch.cuda.synchronize(TORCH_DEVICE)
 
-# Reshape to match the reference implementation
-Q = Q.view(H_q, D_h)    # (H_q, D_h)
-O = O.view(H_q, D_h)    # (H_q, D_h)
+kvm_llama(
+    barriers, 
+    instructions, 
+    timings,
+    K_c, 
+    V_c, 
+    Q_post_rope,
+    Attn_out, 
+    kv_indices,
+    kv_indptr,
+    POS_ID, 
+    ATTN_SCALE
+)
+torch.cuda.synchronize(TORCH_DEVICE)
 
-# Run the reference implementation
-print('\nRunning the reference implementation...')
-seq_len = POS_ID + 1
 
-H_q_IDX = H_kv_IDX * 8
-Qi = Q[H_q_IDX:H_q_IDX+8, :]
+attn_out_ref = reference_gqa(K_c, V_c, Q_post_rope, kv_indices, kv_indptr, POS_ID, ATTN_SCALE)
+kvm_out_slice = Attn_out[KV_H_IDX * D_h: (KV_H_IDX + 8) * D_h]
 
-# Get the relevant pages and concatenate them
-num_pages_needed = (seq_len + KV_PAGE_SIZE - 1) // KV_PAGE_SIZE
-K_pages = []
-V_pages = []
-for page_idx in range(num_pages_needed):
-    K_pages.append(K_c[page_idx, :, H_kv_IDX, :])
-    V_pages.append(V_c[page_idx, :, H_kv_IDX, :])
+print(attn_out_ref)
+print(kvm_out_slice)
 
-print('K_pages shape:', K_pages[0].shape)
-print('V_pages shape:', V_pages[0].shape)
+# Compare reference and kernel outputs
+abs_diff = torch.abs(attn_out_ref - kvm_out_slice)
 
-# Concatenate pages and trim to seq_len
-Kj = torch.cat(K_pages, dim=0)[:seq_len]
-Vj = torch.cat(V_pages, dim=0)[:seq_len]
+print("\nOutput comparison:")
+print(f"Max absolute difference: {abs_diff.max().item():.6f}")
+print(f"Mean absolute difference: {abs_diff.mean().item():.6f}")
 
-QiKj = torch.matmul(Qi.float(), Kj.float().transpose(-1, -2))
-scaled_QiKj = QiKj * ATTN_SCALE
-softmax = torch.softmax(scaled_QiKj, dim=-1)
-O_ref = torch.matmul(softmax.float(), Vj.float())
-
-# Verify the output
-print('\nComparing outputs...')
-print('Qi shape:', Qi.shape)
-print('Kj shape:', Kj.shape)
-print('Vj shape:', Vj.shape)
-print('QiKj shape:', QiKj.shape)
-print('scaled_QiKj shape:', scaled_QiKj.shape)
-print('softmax shape:', softmax.shape)
-print('O_ref shape:', O_ref.shape)
-print(torch.max(torch.abs(O[H_q_IDX:H_q_IDX+8, :] - O_ref)))
-print(torch.mean(torch.abs(O[H_q_IDX:H_q_IDX+8, :] - O_ref)))
-print(barriers[LAYER_IDX, GQA_ATTENTION_OPCODE - 1])

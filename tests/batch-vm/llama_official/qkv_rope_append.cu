@@ -19,6 +19,8 @@ struct qkv_rope_append {
 
     using weight_tile = st_bf<Globals::head_dim, REDUCTION_BLOCK_SIZE>;
     using activation_tile = st_bf<Globals::batch_size, REDUCTION_BLOCK_SIZE>;
+    using output_tile = st_bf<Globals::batch_size, Globals::head_dim>;
+    using output_vec = sv_bf<Globals::head_dim>;
     using rope_vec = sv_fl<Globals::head_dim>;
 
     struct parsed_instruction {
@@ -217,10 +219,12 @@ struct qkv_rope_append {
                 consumer::add(output_fl, output_fl, output_rotated);
             }
 
-            int last_stage = (inst.num_iters - 1) % PIPELINE_STAGES;
-            activation_tile &output = *reinterpret_cast<activation_tile *>(s.pages[get_activation_page(s, last_stage)].data);
             rt_bf<Globals::batch_size / Config::NUM_CONSUMER_WARPS, Globals::head_dim> output_bf;
             consumer::copy(output_bf, output_fl);
+
+            int last_stage = (inst.num_iters - 1) % PIPELINE_STAGES;
+            int output_page = get_activation_page(s, last_stage);
+            output_tile &output = *reinterpret_cast<output_tile *>(s.pages[output_page].data);
             consumer::store(output, output_bf);
             __syncwarp();
             warp::arrive(outputs_shared(s));
@@ -232,16 +236,17 @@ struct qkv_rope_append {
             parsed_instruction inst{s};
             int laneid = warp::laneid();
 
+            wait(outputs_shared(s), 0);
+            int output_page = get_activation_page(s, (inst.num_iters - 1) % PIPELINE_STAGES);
+            output_tile &output = *reinterpret_cast<output_tile *>(s.pages[output_page].data);
+
             if (laneid == 0) {
-                wait(outputs_shared(s), 0);
-                int output_page = get_activation_page(s, (inst.num_iters - 1) % PIPELINE_STAGES);
-                activation_tile &output = *reinterpret_cast<activation_tile *>(s.pages[output_page].data);
-                if (inst.block_idx < K_BLOCK_START)
+                if (inst.block_idx < K_BLOCK_START) 
                     tma::store_async(g.q_post_rope, output, {0, inst.block_idx});
-                else if (inst.block_idx < V_BLOCK_START) // TODO: store to correct k_cache page
-                    tma::store_async(g.q_post_rope, output, {0, inst.block_idx - K_BLOCK_START});
-                else // TODO: store to correct v_cache page
-                    tma::store_async(g.q_post_rope, output, {0, inst.block_idx - V_BLOCK_START});
+                else if (inst.block_idx < V_BLOCK_START) 
+                    tma::store_async<dim::BATCH, cache_policy::NORMAL>(g.k_cache, output, {inst.layer_idx*Globals::batch_size, (int)g.pos_id, inst.block_idx - K_BLOCK_START, 0});
+                else
+                    tma::store_async<dim::BATCH, cache_policy::NORMAL>(g.v_cache, output, {inst.layer_idx*Globals::batch_size, (int)g.pos_id, inst.block_idx - V_BLOCK_START, 0});
                 tma::store_async_wait();
                 s.finish_page(output_page, Config::NUM_CONSUMER_WARPS);
                 s.finish_page(output_page + 1, Config::NUM_CONSUMER_WARPS);

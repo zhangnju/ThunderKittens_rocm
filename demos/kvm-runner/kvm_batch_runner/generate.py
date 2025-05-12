@@ -11,7 +11,7 @@ from tabulate import tabulate
 from torch import Tensor
 from tqdm import tqdm
 from transformers import AutoTokenizer
-
+from typing import Optional, Dict
 
 class ScriptConfig(pydra.Config):
     model: str = "meta-llama/Llama-3.1-70B-Instruct"
@@ -58,6 +58,7 @@ class PyTorchRunner(Runner):
         model: LlamaForCausalLM,
         output_tokens: Tensor,
         prompt_len: int,
+        debug_outputs: Optional[Dict[str, Tensor]] = None,
     ):
         self.config = config
         self.model = model
@@ -66,7 +67,8 @@ class PyTorchRunner(Runner):
         self.start_position_ids = torch.ones(
             self.model.extra_config.max_batch_size, 1, dtype=torch.long, device=model.device
         ) * (prompt_len)
-
+        self.debug_outputs = debug_outputs
+    
     def go(self):
         for i in tqdm(range(1, self.config.ntok)):
             position_ids = self.start_position_ids + i
@@ -75,7 +77,7 @@ class PyTorchRunner(Runner):
                 position_ids=position_ids,
                 seq_len=self.prompt_len + i + 1,
             )
-            decode_output: BatchState = self.model(decode_inp)
+            decode_output: BatchState = self.model(decode_inp, debug_outputs=self.debug_outputs)
             assert decode_output.output_ids is not None
             self.output_tokens[:, i] = decode_output.output_ids.squeeze(1)
 
@@ -87,6 +89,7 @@ class PyVMRunner(Runner):
         model: LlamaForCausalLM,
         output_tokens: Tensor,
         prompt_len: int,
+        debug_outputs: Optional[Dict[str, Tensor]] = None,
     ):
         self.config = config
         self.model = model
@@ -110,11 +113,16 @@ class PyVMRunner(Runner):
         )
 
         self.runner = runner
-
+        self.debug_outputs = debug_outputs
+    
     def go(self):
         for i in tqdm(range(1, self.config.ntok)):
             input_ids = self.output_tokens[:, i - 1 : i]
-            output_ids = self.runner.run(input_ids, pos_id=self.prompt_len + i)
+            output_ids = self.runner.run(
+                input_ids,
+                pos_id=self.prompt_len + i,
+                debug_outputs=self.debug_outputs,
+            )
             self.output_tokens[:, i] = output_ids
 
 

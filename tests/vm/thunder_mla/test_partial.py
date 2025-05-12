@@ -37,6 +37,8 @@ def init_arguments(seq_lengths: List[int], new_tokens: int, q_heads: int=16):
     Lengths = torch.tensor(seq_lengths, dtype=torch.int32, device='cuda')
     Table = torch.randint(0, NUM_PAGES, (B, MAX_NUM_PAGES), dtype=torch.int32, device='cuda')
 
+    # K_cache *= 0
+    # V_cache *= 0
     return QRot, QV, K_cache, V_cache, Lengths, Table
 
 def create_thundermla_arguments(seq_lengths, new_tokens, q_heads = 16, block_size=128, prints=True):
@@ -51,13 +53,13 @@ def create_thundermla_arguments(seq_lengths, new_tokens, q_heads = 16, block_siz
         }
 
         for j in range((seq_lengths[i] + block_size - 1) // block_size):
-            for k in range(0, new_tokens, 4):
-                write_scratch = (block_size < seq_lengths[i])
+            for k in range(0, new_tokens, 8):
+                write_scratch = False#(block_size < seq_lengths[i])
                 scheduled_tasks.append(
                     Task(
                         uid=idx,
                         batch_id=i,
-                        tok_ids=[k + l for l in range(4) if k + l < new_tokens],
+                        tok_ids=[k + l for l in range(8) if k + l < new_tokens],
                         name="Partial",
                         task_type="partial",
                         start=idx,
@@ -74,7 +76,7 @@ def create_thundermla_arguments(seq_lengths, new_tokens, q_heads = 16, block_siz
                 )
 
                 if write_scratch:
-                    for l in range(4):
+                    for l in range(8):
                         if k + l < new_tokens:
                             token_map[k + l].append(idx)
                 idx += 1
@@ -87,7 +89,6 @@ def create_thundermla_arguments(seq_lengths, new_tokens, q_heads = 16, block_siz
         scheduled_tasks, new_tokens, num_processors=NUM_PROCESSORS, enable_timings=ENABLE_TIMINGS, q_heads=q_heads, prints=prints
     )
 
-    print(Instructions[0][0])
     # visualize_schedule(scheduled_tasks, NUM_PROCESSORS)
     return Instructions, O_scratch, Lvec_scratch, Semaphore, Timings
 
@@ -106,6 +107,10 @@ def run_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_s
     if prints:
         print('Starting mla_decode')
 
+    QRot = QRot.to(torch.float8_e4m3fn)
+    QV = QV.to(torch.float8_e4m3fn)
+    K_cache = K_cache.to(torch.float8_e4m3fn)
+    V_cache = V_cache.to(torch.float8_e4m3fn)
     O = O.to(torch.float8_e4m3fn)
     if Timings is not None:
         mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, tic, Timings)
@@ -115,7 +120,6 @@ def run_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_s
         #mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1-tic)
     torch.cuda.synchronize()
 
-    print(O)
     if prints:
         print('Finished mla_decode')
     return O, Timings
@@ -158,8 +162,8 @@ def compute_thundermla_partials(QRot, QV, K_cache, V_cache, Lengths, Table, Inst
     if prints:
         print('Finished mla_decode')
 
-    print(O_scratch[0, 0])
-    print(Lvec_scratch[0, 0])
+    print(O_scratch[0, :, 0, 0])
+    print(Lvec_scratch[0])
 
     Os = []
     ls = []
@@ -170,9 +174,9 @@ def compute_thundermla_partials(QRot, QV, K_cache, V_cache, Lengths, Table, Inst
         for block_start in range(0, l, block_size):
             Os[b].append([])
             ls[b].append([])
-            for k in range(0, QRot.shape[1], 4):
-                O_block = O_scratch[idx, k:k+4]
-                L_block = Lvec_scratch[idx, k:k+4]
+            for k in range(0, QRot.shape[1], 8):
+                O_block = O_scratch[idx, k:k+8]
+                L_block = Lvec_scratch[idx, k:k+8]
 
                 Os[b][-1].append(O_block)
                 ls[b][-1].append(L_block)
@@ -213,8 +217,6 @@ def run_mla_torch(QRot, QV, K_cache, V_cache, Lengths, Table):
     q_heads = Q.shape[2]
     full_K = torch.cat([K_cache, V_cache], dim=-1)[Table].reshape(Q.shape[0], -1, Q.shape[-1])
     full_V = V_cache[Table].reshape(Q.shape[0], -1, QV.shape[-1])
-    full_K = torch.ones_like(full_K)
-    full_V = torch.ones_like(full_V)
     softmax_scale = 1.0 / math.sqrt(D_Main+D_Rot)
     O = torch.zeros_like(QV)
     for b, l in enumerate(Lengths):
@@ -228,6 +230,8 @@ def run_mla_torch(QRot, QV, K_cache, V_cache, Lengths, Table):
             attn_mask=mask,
             scale=softmax_scale
         ).transpose(1, 2)
+
+    print(O)
     return O
 
 def compute_mla_partials_torch(QRot, QV, K_cache, V_cache, Lengths, Table, block_size):
@@ -252,22 +256,22 @@ def compute_mla_partials_torch(QRot, QV, K_cache, V_cache, Lengths, Table, block
         for block_start in range(0, l, block_size):
             Os[b].append([])
             ls[b].append([])
-            for k in range(0, Q.shape[2], 4):
+            for k in range(0, Q.shape[2], 8):
                 K_block = full_K[b, block_start:block_start+block_size].to(torch.float32) # (L, D)
                 V_block = full_V[b, block_start:block_start+block_size].to(torch.float32) # (L, D)
 
-                q_loc = torch.arange(l - Q.shape[2] + k, min(l, l - Q.shape[2] + k + 4), device=Q.device)
+                q_loc = torch.arange(l - Q.shape[2] + k, min(l, l - Q.shape[2] + k + 8), device=Q.device)
                 k_loc = torch.arange(block_start, block_start + block_size, device=Q.device)
                 mask = (q_loc[:, None] >= k_loc[None, :]).unsqueeze(0) # (1, LQ, L)
 
-                QK = Q[b, :, k:k+4] @ K_block.transpose(0, 1) # (H, LQ<=4, L)
+                QK = Q[b, :, k:k+8] @ K_block.transpose(0, 1) # (H, LQ<=8, L)
                 QK = QK.masked_fill(~mask, -10000000)
 
-                max_vec = torch.max(QK, dim=-1, keepdim=True).values # (H, LQ<=4, 1)
+                max_vec = torch.max(QK, dim=-1, keepdim=True).values # (H, LQ<=8, 1)
                 QK = QK - max_vec
-                exp_QK = torch.exp(QK * softmax_scale) # (H, LQ<=4, L)
+                exp_QK = torch.exp(QK * softmax_scale) # (H, LQ<=8, L)
 
-                l_block = torch.sum(exp_QK, dim=-1, keepdim=True) # (H, LQ<=4, 1)
+                l_block = torch.sum(exp_QK, dim=-1, keepdim=True) # (H, LQ<=8, 1)
 
                 ls[b][-1].append((1.44269504089 * max_vec * softmax_scale + torch.log2(l_block)).transpose(0, 1)[..., 0])
 
@@ -295,6 +299,8 @@ def main(seq_lengths, new_tokens, q_heads=16, block_size=128, prints=True):
     # print("Avg absolute diff", torch.mean(torch.abs(O - ref)))
     if prints:
         print('Finished!')
+
+    O = O.to(torch.bfloat16)
 
     return {
         "Ref mean\t\t": torch.mean(ref.abs()),
@@ -329,11 +335,12 @@ def main_check_partials(seq_lengths, new_tokens, q_heads=16, block_size=128, pri
     #         plt.savefig(f"Os[{i}][{j}].png")
     #         plt.close()
 
-    print(len(Os))
-    print(len(Os[0]))
-    print(Os[0][0][0].shape)
-    for i in range(len(Os[0][0][0])):
-        print(Os[0][0][0][i].cpu().tolist())
+    # print(len(Os))
+    # print(len(Os[0]))
+    # print(Os[0][0].shape)
+    # print(Os[0][0])
+    # for i in range(len(Os[0][0])):
+    #     print(Os[0][0][0][i].cpu().tolist())
 
 
     stats_dict = {}
@@ -422,5 +429,5 @@ if __name__ == "__main__":
     # ], check_partials=True)
 
     test_inputs([
-        ([128], 1, 16, 128, 2),
+        ([16], 1, 16, 128, 1),
     ], prints=True)#, check_partials=True)

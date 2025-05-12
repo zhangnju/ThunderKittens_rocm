@@ -105,12 +105,12 @@ def partial_reduction_task(seq_lengths, new_tokens=8, q_heads = 16, block_size=1
     scheduled_tasks = []
     idx = 10
     for seq_length in seq_lengths:
-        for i in range(new_tokens):
+        for i in range(0, new_tokens, 8):
             scheduled_tasks.append(
                 Task(
                     uid=idx,
                     batch_id=0,
-                    tok_ids=[i],
+                    tok_ids=list(range(i, i+8)),
                     name="Reduction",
                     task_type="reduction",
                     start=idx,
@@ -297,6 +297,6 @@ def test_inputs(inputs, prints=False, check_partials=False):
             print()
 
 if __name__ == "__main__":
-    num_tokens = 1
-    main([128], num_tokens, 16, 32, prints=False, write_scratch=True)
+    num_tokens = 8
+    main([128], num_tokens, 16, 128, prints=False, write_scratch=True)
     #main([128], num_tokens, 16, 32, prints=False, write_scratch=True)

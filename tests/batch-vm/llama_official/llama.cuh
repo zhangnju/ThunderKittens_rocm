@@ -76,9 +76,8 @@ namespace kittens::prototype::vm
         using norm_weights_t = gl<bf16, 1, 1, -1, hidden_dim, sv_bf<hidden_dim>, sv_bf<16>>;
         using rope_table_t = gl<float, 1, 1, -1, head_dim, sv_fl<128>>;
         
-        // FlashInfer Paged KV Cache Format: (max_num_pages, page_size, num_heads, head_dim)
-        using kv_cache_t = gl<bf16, -1, -1, num_kv_heads, head_dim, sv_bf<16>, tma::descriptor<st_bf<kv_block_size, head_dim>, 1>, sv_bf<128>>;
-        using routing_table_t = gl<int, 1, 1, 1, -1>;
+        // KV Cache format: (num_layers * batch_size, sequence_length, num_heads, head_dim)
+        using kv_cache_t = gl<bf16, -1, -1, num_kv_heads, head_dim, sv_bf<16>, tma::descriptor<st_bf<kv_block_size, head_dim>, 1>, tma::descriptor<st_bf<128, 128>, 0>, sv_bf<128>>;
 
         // num_layers by 6 ops per layer by up to 48 heads (Q + K + V)
         using barriers = gl<uint, 1, -1, -1, num_attention_heads + 2 * num_kv_heads>;
@@ -118,8 +117,6 @@ namespace kittens::prototype::vm
         activations_t attn_out;
         activations_big_indim_t silu_out;
         logits_t logits;
-
-        routing_table_t routing_table;
 
         unsigned int pos_id;
         float attn_scale;

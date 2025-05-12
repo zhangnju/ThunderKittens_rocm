@@ -23,7 +23,7 @@ HIDDEN_DIM = 8192
 INTERMEDIATE_DIM = 28672
 HEAD_DIM = 128
 VOCAB_SIZE = 128256
-MAX_SEQ_LEN = 131072
+MAX_SEQ_LEN = 8192 # actual value is 131072
 NUM_ATTENTION_HEADS = 64
 NUM_KV_HEADS = 8
 KV_BLOCK_SIZE = HEAD_DIM
@@ -52,8 +52,8 @@ gate_weights = torch.zeros(NUM_LAYERS, HIDDEN_DIM, HIDDEN_DIM, dtype=torch.bfloa
 down_weights = torch.zeros(NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE_DIM, dtype=torch.bfloat16, device=device)
 lm_head_norm_weights = torch.zeros(HIDDEN_DIM, dtype=torch.bfloat16, device=device)
 lm_head_weights = torch.zeros(VOCAB_SIZE, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
-k_cache = torch.zeros(MAX_NUM_PAGES, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
-v_cache = torch.zeros(MAX_NUM_PAGES, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
+k_cache = torch.zeros(NUM_LAYERS*BATCH_SIZE, MAX_SEQ_LEN, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
+v_cache = torch.zeros(NUM_LAYERS*BATCH_SIZE, MAX_SEQ_LEN, NUM_KV_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
 rope_cos = torch.randn(MAX_SEQ_LEN, HEAD_DIM, dtype=torch.float32, device=device)
 rope_sin = torch.randn(MAX_SEQ_LEN, HEAD_DIM, dtype=torch.float32, device=device)
 hidden_states = torch.zeros(BATCH_SIZE, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
@@ -64,7 +64,6 @@ q_post_rope = torch.zeros(BATCH_SIZE, HIDDEN_DIM, dtype=torch.bfloat16, device=d
 attn_out = torch.zeros(BATCH_SIZE, HIDDEN_DIM, dtype=torch.bfloat16, device=device)
 silu_out = torch.zeros(BATCH_SIZE, INTERMEDIATE_DIM, dtype=torch.bfloat16, device=device)
 logits = torch.zeros(BATCH_SIZE, VOCAB_SIZE, dtype=torch.bfloat16, device=device)
-routing_table = torch.zeros(BATCH_SIZE * 2, dtype=torch.int32, device=device)
 pos_id = 10
 attn_scale = 1 / (HEAD_DIM ** 0.5)
 rms_norm_eps = 1e-5
@@ -72,7 +71,7 @@ rms_norm_eps = 1e-5
 # Generate instructions
 instructions = [[] for _ in range(SM_COUNT)]
 instruction_idx = 0
-for block_idx in range(NUM_ATTENTION_HEADS):
+for block_idx in range(NUM_ATTENTION_HEADS + NUM_KV_HEADS * 2):
     instructions[instruction_idx] = [[
         QKV_ROPE_APPEND_OPCODE, LAYER_IDX, block_idx, HIDDEN_DIM//128,
     ] + [0]*(INSTRUCTION_WIDTH - 4)]
@@ -91,9 +90,6 @@ instructions = torch.tensor(instructions, dtype=torch.int32, device=device)
 
 # Generate timings
 timings = torch.zeros((SM_COUNT, instructions.shape[1], TIMING_WIDTH), dtype=torch.int32, device=device)
-
-# Fill in routing table
-routing_table[::2] = torch.arange(BATCH_SIZE-1, -1, -1, dtype=torch.int32, device=device)
 
 
 ###
@@ -126,7 +122,6 @@ kvm_llama(
     attn_out,
     silu_out,
     logits,
-    routing_table,
     pos_id,
     attn_scale,
     rms_norm_eps
@@ -149,20 +144,11 @@ q_post_rope_ref, k_post_rope_ref, v_ref = matvec_rope(
     HEAD_DIM
 )
 
+q_diff = (q_post_rope - q_post_rope_ref).abs()
+print(f'Q -- max abs diff: {q_diff.max()}, mean abs diff: {q_diff.mean()}')
 
+k_diff = (k_cache[LAYER_IDX*BATCH_SIZE:(LAYER_IDX+1)*BATCH_SIZE, pos_id] - k_post_rope_ref).abs()
+print(f'K -- max abs diff: {k_diff.max()}, mean abs diff: {k_diff.mean()}')
 
-# print('diff', (q_post_rope[:, :NUM_KV_HEADS*HEAD_DIM] - q_post_rope_ref).abs().max())
-# print('diff', (q_post_rope[:, :NUM_KV_HEADS*HEAD_DIM] - q_post_rope_ref).abs().mean())
-# print('diff', (q_post_rope[:, :NUM_KV_HEADS*HEAD_DIM] - q_post_rope_ref))
-# print('diff', (q_post_rope[:, :NUM_KV_HEADS*HEAD_DIM]))
-
-# print('diff', (q_post_rope[:, :NUM_KV_HEADS*HEAD_DIM] - v_ref.reshape((BATCH_SIZE, -1))).abs().max())
-# print('diff', (q_post_rope[:, :NUM_KV_HEADS*HEAD_DIM] - v_ref.reshape((BATCH_SIZE, -1))).abs().mean())
-# print('diff', (q_post_rope[:, :NUM_KV_HEADS*HEAD_DIM]))
-# print('diff', (q_post_rope[:, :NUM_KV_HEADS*HEAD_DIM] - v_ref.reshape((BATCH_SIZE, -1))))
-
-print('diff', (q_post_rope - q_post_rope_ref).abs().max())
-print('diff', (q_post_rope - q_post_rope_ref).abs().mean())
-print(q_post_rope)
-print(q_post_rope_ref)
-print('diff', (q_post_rope - q_post_rope_ref))
+v_diff = (v_cache[LAYER_IDX*BATCH_SIZE:(LAYER_IDX+1)*BATCH_SIZE, pos_id] - v_ref).abs()
+print(f'V -- max abs diff: {v_diff.max()}, mean abs diff: {v_diff.mean()}')

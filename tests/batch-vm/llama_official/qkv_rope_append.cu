@@ -92,6 +92,10 @@ struct qkv_rope_append {
                     s.warp_finish_page(weight_page + 1, Config::NUM_CONSUMER_WARPS);
                 }
             } else if (laneid == 1) { // load activations
+                // TODO: match the barrier with the pre-attention rmsnorm
+                // while (*(volatile int *)&g.Bar[{inst.layer_idx, OPCODE_RMS_NORM - 1, 0}] < 1)
+                //     __nanosleep(20);
+
                 uint32_t phasebits = 0xFFFF0000;
                 for (int i = 0; i < inst.num_iters; i++) {
                     int stage = i % PIPELINE_STAGES;
@@ -241,6 +245,7 @@ struct qkv_rope_append {
                 tma::store_async_wait();
                 s.finish_page(output_page, Config::NUM_CONSUMER_WARPS);
                 s.finish_page(output_page + 1, Config::NUM_CONSUMER_WARPS);
+                atomicAdd(&g.Bar[{inst.layer_idx, opcode - 1, inst.block_idx}], 1);
             }
         }
     };

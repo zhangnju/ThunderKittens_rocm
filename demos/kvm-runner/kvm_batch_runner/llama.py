@@ -266,7 +266,6 @@ class LlamaAttention(nn.Module):
         batch_state: BatchState,
         debug_outputs: Optional[Dict[str, Tensor]] = None
     ):
-        # print("In LlamaAttention forward, debug_outputs: ", debug_outputs)
         assert batch_state.hidden_states is not None
         assert batch_state.position_embeddings is not None
         assert batch_state.position_ids is not None
@@ -278,7 +277,6 @@ class LlamaAttention(nn.Module):
 
         hidden_states = self.input_layernorm(inp)   
         hidden_states = all_gather(hidden_states, self.extra_config)
-        # _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_pre_attn_ln", hidden_states)
         bsz = hidden_states.shape[0]
         seq_len = hidden_states.shape[1]
 
@@ -307,15 +305,6 @@ class LlamaAttention(nn.Module):
             unsqueeze_dim=self.unsqueeze_dim,  # unsqueeze dim = head dim on q/k
         )
 
-        # turn from 128, 1, 64, 128 to 128, 64, 128
-        debug_q_rope = query_states.squeeze(1)
-        debug_k_rope = key_states.squeeze(1)
-        debug_v_rope = value_states.squeeze(1)
-
-        # _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_Q_rope", debug_q_rope)
-        # _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_K_rope", debug_k_rope)
-        # _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_V_arr", debug_v_rope)
-
         query_states = query_states.to(dtype)
         key_states = key_states.to(dtype)
         
@@ -329,9 +318,6 @@ class LlamaAttention(nn.Module):
             next_free_page=self.next_free_page,
         )
 
-        debug_attn_out = raw_attn_output.squeeze(1)
-        _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_attn_out", debug_attn_out)
-
         attn_output = raw_attn_output.reshape(bsz, seq_len, -1)
 
         o_proj = self.o_proj(attn_output)
@@ -340,9 +326,17 @@ class LlamaAttention(nn.Module):
 
         with_residual = residual + o_proj
 
-        debug_with_residual = with_residual.squeeze(1)
-        _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_o_proj_residual", debug_with_residual)
-        # print("Debug outputs: ", debug_outputs)
+        if debug_outputs is not None:
+            debug_q_rope = query_states.squeeze(1)
+            debug_k_rope = key_states.squeeze(1)
+            debug_v_rope = value_states.squeeze(1)
+            debug_attn_out = raw_attn_output.squeeze(1)
+            debug_with_residual = with_residual.squeeze(1)
+            _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_Q_rope", debug_q_rope)
+            _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_K_rope", debug_k_rope)
+            _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_V_arr", debug_v_rope)
+            _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_attn_out", debug_attn_out)
+            _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_o_proj_residual", debug_with_residual)
 
         batch_state.hidden_states = with_residual
         return batch_state
@@ -387,29 +381,32 @@ class LlamaMLP(nn.Module):
     ):
         inp = batch_state.hidden_states
         assert inp is not None
-        hidden_states = self.input_layernorm(inp)
-        _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_pre_mlp_layer_norm", hidden_states)
 
+        hidden_states = self.input_layernorm(inp)
         hidden_states = all_gather(hidden_states, self.extra_config)
 
         up = self.up_proj(hidden_states)
         gate = self.gate_proj(hidden_states)
         
         silu = F.silu(gate)
-        debug_silu= silu.squeeze(1)
-        _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_gate_silu", debug_silu)
 
         prod = up * silu
-        debug_prod = prod.squeeze(1)
-        _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_up_matmul", debug_prod)
 
         down = self.down_proj(prod)
         down = reduce_scatter(down, self.extra_config)
 
         with_residual = inp + down
-        debug_with_residual = with_residual.squeeze(1)
-        _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_down_proj_residual", debug_with_residual)
         batch_state.hidden_states = with_residual
+
+        if debug_outputs is not None:
+            _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_pre_mlp_layer_norm", hidden_states)
+            debug_silu= silu.squeeze(1)
+            _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_gate_silu", debug_silu)
+            debug_prod = prod.squeeze(1)
+            _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_up_matmul", debug_prod)
+            debug_with_residual = with_residual.squeeze(1)
+            _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_down_proj_residual", debug_with_residual)
+
         return batch_state
 
 
@@ -430,12 +427,12 @@ class LlamaBlock(nn.Module):
         batch_state: BatchState,
         debug_outputs: Optional[Dict[str, Tensor]] = None
     ):
-        # print("In LlamaBlock forward, debug_outputs: ", debug_outputs)
         out = self.self_attn(batch_state, debug_outputs)
-        _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_Block_AttnOut", out.hidden_states)
-        # print("Debug outputs out of block: ", debug_outputs)
         out = self.mlp(out, debug_outputs)
-        _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_Block_MLPOut", out.hidden_states)
+
+        if debug_outputs is not None:
+            _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_Block_AttnOut", out.hidden_states)
+            _store_debug_tensor(debug_outputs, f"L{self.layer_idx}_Block_MLPOut", out.hidden_states)
         return out
 
 
@@ -467,18 +464,20 @@ class LlamaLMHead(nn.Module):
             hidden_states = all_gather(hidden_states, self.extra_config)
 
         hidden_states = self.input_norm(hidden_states)
-        debug_hidden_states = hidden_states.squeeze(1)
-        _store_debug_tensor(debug_outputs, "pre_lm_head_rms", debug_hidden_states)
 
         logits = self.lm_head(hidden_states)
-        debug_logits = logits.squeeze(1)
-        _store_debug_tensor(debug_outputs, "lm_head_logits", debug_logits)
 
         next_token_ids = logits.argmax(dim=-1)
 
         if self.tp_size > 1:
             # TODO: fusion
             next_token_ids = all_gather(next_token_ids, self.extra_config)
+        
+        if debug_outputs is not None:
+            debug_hidden_states = hidden_states.squeeze(1)
+            _store_debug_tensor(debug_outputs, "pre_lm_head_rms", debug_hidden_states)
+            debug_logits = logits.squeeze(1)
+            _store_debug_tensor(debug_outputs, "lm_head_logits", debug_logits)
 
         batch_state.output_ids = next_token_ids
         return batch_state
@@ -560,7 +559,6 @@ class LlamaModel(nn.Module):
         batch_state: BatchState, 
         debug_outputs: Optional[Dict[str, Tensor]] = None
     ):
-        # print("In LlamaModel forward, debug_outputs: ", debug_outputs)
         out: BatchState = self.embed_tokens(batch_state)
         assert self.rope_cos.dtype == torch.float32
         assert self.rope_sin.dtype == torch.float32
@@ -569,9 +567,9 @@ class LlamaModel(nn.Module):
         out.position_embeddings = (cos, sin)
 
         for idx, layer in enumerate(self.layers):
-            # _store_debug_tensor(debug_outputs, f"L{idx}_LlamaModel_In", out.hidden_states)
             out = layer(out, debug_outputs)
-            _store_debug_tensor(debug_outputs, f"L{idx}_LlamaModel_Out", out.hidden_states)
+            if debug_outputs is not None:
+                _store_debug_tensor(debug_outputs, f"L{idx}_LlamaModel_Out", out.hidden_states)
         return out
 
 
@@ -632,9 +630,11 @@ class LlamaForCausalLM(nn.Module):
             seq_len=batch_state.seq_len,
         )
         out = self.model(out, debug_outputs=debug_outputs)
-        _store_debug_tensor(debug_outputs, "LlamaModel_Out", out.hidden_states)
         out = self.lm_head(out, debug_outputs=debug_outputs)
-        _store_debug_tensor(debug_outputs, "LlamaLMHead_Out", out.hidden_states)
+
+        if debug_outputs is not None:
+            _store_debug_tensor(debug_outputs, "LlamaModel_Out", out.hidden_states)
+            _store_debug_tensor(debug_outputs, "LlamaLMHead_Out", out.hidden_states)
 
         return out
 

@@ -103,11 +103,9 @@ def pre_attn_layer_norm(
         barriers = globals.barriers[layer_idx, batch_start_idx, instruction.opcode() - 1]
         barriers[0] += 1
     
-    # if batch_start_idx == 127:
-    #     _store_debug_tensor(debug_outputs, f"L{layer_idx}_pre_attn_ln", globals.rms_rope_intermediates)
+    if debug_outputs is not None and batch_start_idx == 127:
+        _store_debug_tensor(debug_outputs, f"L{layer_idx}_pre_attn_ln", globals.rms_rope_intermediates)
     
-    # print(f"Done with pre layer norm for layer {layer_idx} and batch {batch_start_idx}")
-
 
 def qkv_matmul_rope_append(
     globals: Globals,
@@ -136,8 +134,6 @@ def qkv_matmul_rope_append(
     k = matmul_output[batch_start_idx:batch_end_idx:, k_start:v_start]
     v = matmul_output[batch_start_idx:batch_end_idx:, v_start:]
 
-    # print("Batch start idx: ", batch_start_idx)
-    # print("Batch end idx: ", batch_end_idx)
     q_arr = rearrange(q, "b (h d) -> b h d", h=globals.num_attention_heads)
     k_arr = rearrange(k, "b (h d) -> b h d", h=globals.num_kv_heads)
     v_arr = rearrange(v, "b (h d) -> b h d", h=globals.num_kv_heads)
@@ -155,9 +151,9 @@ def qkv_matmul_rope_append(
     start, end = get_start_end(globals.qkv_block_size, qkv_block_idx)
     if start < k_start:
         globals.post_ln_rope_q[batch_start_idx:batch_end_idx, start:end] = q_with_rope.reshape(batch_size, -1)[:, start:end]
-        if batch_start_idx == 0:
+        if debug_outputs is not None and batch_start_idx == 0:
             debug_q_rope = rearrange(globals.post_ln_rope_q, "b (h d) -> b h d", h=globals.num_attention_heads)
-            # _store_debug_tensor(debug_outputs, f"L{layer_idx}_Q_rope", debug_q_rope)
+            _store_debug_tensor(debug_outputs, f"L{layer_idx}_Q_rope", debug_q_rope)
     else:
        # Each batch needs to go to its own page
        for i in range(batch_size):
@@ -175,11 +171,13 @@ def qkv_matmul_rope_append(
             if start < v_start: # Key
                 k_head_idx = (start - k_start) // globals.head_dim
                 globals.k_cache[layer_idx, pid, k_head_idx, slot_idx, :] = k_with_rope[i, k_head_idx, :]
-                # _store_debug_tensor(debug_outputs, f"L{layer_idx}_B{i}_K_rope", globals.k_cache[layer_idx, pid, :, slot_idx, :])
+                if debug_outputs is not None:
+                    _store_debug_tensor(debug_outputs, f"L{layer_idx}_B{i}_K_rope", globals.k_cache[layer_idx, pid, :, slot_idx, :])
             else: # Value
                 v_head_idx = (start - v_start) // globals.head_dim
                 globals.v_cache[layer_idx, pid, v_head_idx, slot_idx, :] = v_arr[i, v_head_idx, :]
-                # _store_debug_tensor(debug_outputs, f"L{layer_idx}_B{i}_V_arr", globals.v_cache[layer_idx, pid, :, slot_idx, :])
+                if debug_outputs is not None:
+                    _store_debug_tensor(debug_outputs, f"L{layer_idx}_B{i}_V_arr", globals.v_cache[layer_idx, pid, :, slot_idx, :])
 
     # Barrier update
     if include_barriers:
@@ -262,8 +260,9 @@ def attention_decode(
     out_end   = out_start + kv_head_dim
     globals.attn_out[batch_idx, out_start:out_end] = out_flat
 
-    debug_attn_out = rearrange(globals.attn_out[batch_idx], "(h d) -> h d", h=globals.num_attention_heads)
-    _store_debug_tensor(debug_outputs, f"L{layer_idx}_B{batch_idx}_attn_out", debug_attn_out)
+    if debug_outputs is not None:
+        debug_attn_out = rearrange(globals.attn_out[batch_idx], "(h d) -> h d", h=globals.num_attention_heads)
+        _store_debug_tensor(debug_outputs, f"L{layer_idx}_B{batch_idx}_attn_out", debug_attn_out)
 
     if include_barriers:
         next_opb = globals.barriers[layer_idx, batch_idx, instruction.opcode() - 1]
@@ -293,11 +292,12 @@ def o_proj_residual(
         residual = globals.hidden_states[batch_start_idx:batch_end_idx, start:end],  # [batch, block_size]
     )
 
-    _store_debug_tensor(
-        debug_outputs,
-        f"L{layer_idx}_o_proj_residual",
-        globals.hidden_states
-    )
+    if debug_outputs is not None:
+        _store_debug_tensor(
+            debug_outputs,
+            f"L{layer_idx}_o_proj_residual",
+            globals.hidden_states
+        )
 
     if include_barriers:
         next_op_barriers = globals.barriers[layer_idx, batch_start_idx, instruction.opcode() - 1]
@@ -323,7 +323,7 @@ def pre_mlp_layer_norm(
 
     globals.rms_gate_intermediates[batch_start_idx] = post_ln
 
-    if batch_start_idx == 127:
+    if debug_outputs is not None and batch_start_idx == 127:
         _store_debug_tensor(
             debug_outputs, 
             f"L{layer_idx}_pre_mlp_layer_norm",
@@ -363,11 +363,12 @@ def gate_silu(
 
     globals.silu_out[batch_start_idx:batch_end_idx, start:end] = post_silu
 
-    _store_debug_tensor(
-        debug_outputs,
-        f"L{layer_idx}_gate_silu",
-        globals.silu_out,
-    )
+    if debug_outputs is not None:
+        _store_debug_tensor(
+            debug_outputs,
+            f"L{layer_idx}_gate_silu",
+            globals.silu_out,
+        )
 
     if include_barriers:
         next_op_barriers = globals.barriers[layer_idx, batch_start_idx, instruction.opcode() - 1]
@@ -401,11 +402,12 @@ def up_matmul(
 
     globals.silu_out[batch_start_idx:batch_end_idx, start:end] = gated
 
-    _store_debug_tensor(
-        debug_outputs,
-        f"L{layer_idx}_up_matmul",
-        globals.silu_out,
-    )
+    if debug_outputs is not None:
+        _store_debug_tensor(
+            debug_outputs,
+            f"L{layer_idx}_up_matmul",
+            globals.silu_out,
+        )
 
     if include_barriers:
         next_op_barriers = globals.barriers[layer_idx, batch_start_idx, instruction.opcode() - 1]
@@ -436,11 +438,12 @@ def down_proj_residual(
         residual = globals.hidden_states[batch_start_idx:batch_end_idx, start:end],  # [batch, block_size]
     )
 
-    _store_debug_tensor(
-        debug_outputs,
-        f"L{layer_idx}_down_proj_residual",
-        globals.hidden_states
-    )
+    if debug_outputs is not None:
+        _store_debug_tensor(
+            debug_outputs,
+            f"L{layer_idx}_down_proj_residual",
+            globals.hidden_states
+        )
 
     if include_barriers:
         next_op_barriers = globals.barriers[layer_idx, batch_start_idx, instruction.opcode() - 1]
@@ -465,12 +468,12 @@ def pre_lm_head_rms(
 
     globals.rms_lm_head_intermediates[batch_start_idx] = post_ln
 
-    # if batch_start_idx == 127:
-    #     _store_debug_tensor(
-    #         debug_outputs, 
-    #         f"pre_lm_head_rms",
-    #         globals.rms_lm_head_intermediates
-    #     )
+    if debug_outputs is not None and batch_start_idx == 127:
+        _store_debug_tensor(
+            debug_outputs, 
+            f"pre_lm_head_rms",
+            globals.rms_lm_head_intermediates
+        )
     
     if include_barriers:
         barriers = globals.barriers[79, batch_start_idx, instruction.opcode() - 1]
@@ -505,11 +508,12 @@ def lm_head(
 
     globals.logits[batch_start_idx:batch_end_idx, start:end] = matmul_output
 
-    # _store_debug_tensor(
-    #     debug_outputs,
-    #     f"lm_head_logits",
-    #     globals.logits
-    # )
+    if debug_outputs is not None:
+        _store_debug_tensor(
+            debug_outputs,
+            f"lm_head_logits",
+            globals.logits
+        )
 
     if include_barriers:
         next_op_barriers = globals.barriers[

@@ -203,113 +203,27 @@ def main(config: ScriptConfig):
     output_tokens = torch.zeros(BATCH_SIZE, config.ntok, device=model.device, dtype=torch.long)
     output_tokens[:, :1]= new_input_token
 
-    # match config.mode:
-    #     case "model":
-    #         model = PyTorchRunner(config, model, output_tokens, prompt_len)
-    #     case "pyvm":
-    #         model = PyVMRunner(config, model, output_tokens, prompt_len)
-    #     case "kvm":
-    #         model = KVMRunner(config, model, output_tokens, prompt_len)
-    #         if config.noops:
-    #             model.runner.globals.instructions.zero_()
-    #     case _:
-    #         raise ValueError(f"Invalid mode: {config.mode}")
-
+    match config.mode:
+        case "model":
+            model = PyTorchRunner(config, model, output_tokens, prompt_len)
+        case "pyvm":
+            model = PyVMRunner(config, model, output_tokens, prompt_len)
+        case "kvm":
+            model = KVMRunner(config, model, output_tokens, prompt_len)
+            if config.noops:
+                model.runner.globals.instructions.zero_()
+        case _:
+            raise ValueError(f"Invalid mode: {config.mode}")
 
     times = []
-    pytorch_debug_outputs = {}
-    pytorch_model = PyTorchRunner(config, model, output_tokens, prompt_len, pytorch_debug_outputs)
-    print("Running PyTorch model")
     for _ in tqdm(range(config.num_warmup + config.num_iters)):
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
-        pytorch_model.go()
+        model.go()
         end_event.record()
         torch.cuda.synchronize()
         times.append(start_event.elapsed_time(end_event) / 1000)
-    for key, tensor in pytorch_model.debug_outputs.items():
-        #Only print if key name starts with L0
-        if key.startswith("L0"):
-            print(f"{key}: {tensor.shape}")
-        elif key == "LlamaModel_Out":
-            print(f"{key}: {tensor.shape}")
-        elif key == "pre_lm_head_rms":
-            print(f"{key}: {tensor.shape}")
-        elif key == "lm_head_logits":
-            print(f"{key}: {tensor.shape}")
-    
-    print("Running PyVM model")
-    pyvm_debug_outputs = {}
-    pyvm_model = PyVMRunner(config, model, output_tokens, prompt_len, pyvm_debug_outputs)
-    for _ in tqdm(range(config.num_warmup + config.num_iters)):
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        pyvm_model.go()
-        end_event.record()
-        torch.cuda.synchronize()
-        times.append(start_event.elapsed_time(end_event) / 1000)
-
-    # Diff check same size tensors
-    # layer_to_check = 0
-    # name_to_check = f"L{layer_to_check}_pre_attn_ln"
-    # name_to_check = f"L{layer_to_check}_Q_rope"
-    # name_to_check = f"L{layer_to_check}_o_proj_residual"
-    # name_to_check = f"L{layer_to_check}_pre_mlp_layer_norm"
-    # name_to_check = f"L{layer_to_check}_gate_silu"
-    # name_to_check = f"L{layer_to_check}_up_matmul"
-    # name_to_check = f"L{layer_to_check}_down_proj_residual"
-    # name_to_check = "pre_lm_head_rms"
-    # print(f"Diff check {name_to_check}")
-    # diff = pytorch_debug_outputs[name_to_check] - pyvm_debug_outputs[name_to_check]
-    # print("PyVM shape: ", pyvm_debug_outputs[name_to_check].shape)
-    # print("Pytorch shape: ", pytorch_debug_outputs[name_to_check].shape)
-    # print(f"Layer {layer_to_check} diff shape: {diff.shape}")
-    # print(f"Layer {layer_to_check} max absolute difference: {torch.max(torch.abs(diff))}")
-    # print(f"Layer {layer_to_check} mean absolute difference: {torch.mean(torch.abs(diff))}")
-
-    # Diff check across all layers
-    for layer_idx in range(80):
-        name_to_check = f"L{layer_idx}_down_proj_residual"
-        diff = pytorch_debug_outputs[name_to_check] - pyvm_debug_outputs[name_to_check]
-        print(f"Layer {layer_idx} diff shape: {diff.shape}")
-        print(f"Layer {layer_idx} max absolute difference: {torch.max(torch.abs(diff))}")
-        print(f"Layer {layer_idx} mean absolute difference: {torch.mean(torch.abs(diff))}")
-
-
-    # Diff check multiple names in same layer
-    # layer_to_check = 0
-    # names_to_check = [
-    #     f"L{layer_to_check}_o_proj_residual",
-    #     f"L{layer_to_check}_pre_mlp_layer_norm",
-    #     f"L{layer_to_check}_gate_silu",
-    #     f"L{layer_to_check}_up_matmul",
-    #     f"L{layer_to_check}_down_proj_residual",
-    # ]
-    # for name_to_check in names_to_check:
-    #     print(f"Diff check {name_to_check}")
-    #     diff = pytorch_debug_outputs[name_to_check] - pyvm_debug_outputs[name_to_check]
-    #     print(f"Layer {layer_to_check} {name_to_check} diff shape: {diff.shape}")
-    #     print(f"Layer {layer_to_check} {name_to_check} max absolute difference: {torch.max(torch.abs(diff))}")
-    #     print(f"Layer {layer_to_check} {name_to_check} mean absolute difference: {torch.mean(torch.abs(diff))}")
-
-
-    # Diff check different size tensors
-    # pytorch_name_to_check = f"L{layer_to_check}_attn_out"
-    # pytorch_name_to_check = f"L{layer_to_check}_attn_out"
-    # for i in range(128):
-    #     pyvm_name_to_check = f"L{layer_to_check}_B{i}_attn_out"
-    #     pyvm_tensor = pyvm_debug_outputs[pyvm_name_to_check]
-    #     pytorch_tensor = pytorch_debug_outputs[pytorch_name_to_check][i]
-    #     print(f"PyVM shape: {pyvm_tensor.shape}")
-    #     print(f"PyTorch shape: {pytorch_tensor.shape}")
-    #     print(f"PyVM: {pyvm_tensor}")
-    #     print(f"PyTorch: {pytorch_tensor}")
-    #     diff = pytorch_tensor - pyvm_tensor
-    #     print(f"Layer {layer_to_check} B{i} diff shape: {diff.shape}")
-    #     print(f"Layer {layer_to_check} B{i} max absolute difference: {torch.max(torch.abs(diff))}")
-    #     print(f"Layer {layer_to_check} B{i} mean absolute difference: {torch.mean(torch.abs(diff))}")
 
     non_warmup_times = times[config.num_warmup :]
     elapsed = sum(non_warmup_times) / len(non_warmup_times)
@@ -345,5 +259,3 @@ def main(config: ScriptConfig):
 
 if __name__ == "__main__":
     pydra.run(main)
-
-kvm_batch_runner/generate.py kvm_batch_runner/instructions.py kvm_batch_runner/llama.py kvm_batch_runner/python_vm.py kvm_batch_runner/scheduler.p 

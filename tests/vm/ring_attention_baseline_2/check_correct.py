@@ -1,9 +1,7 @@
+from functools import partial
+import os
 import torch
 import torch.distributed
-import os
-
-# Flash attention: https://github.com/Dao-AILab/flash-attention (used both in reference & ring attention)
-from flash_attn import flash_attn_func
 
 # Baseline repo: https://github.com/xdit-project/xDiT
 from yunchang.kernels import AttnType
@@ -16,9 +14,7 @@ from xfuser.core.distributed import init_distributed_environment
 ###
 NUM_DEVICES = int(os.environ['WORLD_SIZE'])
 CURRENT_DEVICE = int(os.environ['RANK'])
-NUM_ITERS = 1
-NUM_WARMUPS = 0
-B, H, N, D_h = 1, 16, 4096*NUM_DEVICES, 128
+B, H, N, D_h = 1, 16, 8192*NUM_DEVICES, 128
 CHECK_CORRECT = True
 
 assert os.environ['RANK']==os.environ['LOCAL_RANK'], 'Must be run on single node'
@@ -65,7 +61,8 @@ local_V = V.chunk(world_size, dim=1)[rank]
 #   Run the baseline ring attention
 ###
 print(f'Rank {rank}: Running baseline ring attention...')
-O = xdit_ring_flash_attn_func(
+ring_attn = partial(
+    xdit_ring_flash_attn_func,
     q=local_Q,
     k=local_K,
     v=local_V,
@@ -83,6 +80,7 @@ O = xdit_ring_flash_attn_func(
     joint_tensor_value=None,
     joint_strategy='none'
 )
+O = ring_attn()
 
 
 ###

@@ -14,6 +14,14 @@ pip install "xfuser==0.4.3.post3"
 
 ### Run
 
+Check correctness:
+
 ```bash
-CUDA_VISIBLE_DEVICES=1,2,3,4 TORCH_CUDA_ARCH_LIST=Blackwell OMP_NUM_THREADS=1 torchrun --nnodes=1 --nproc_per_node=gpu baseline.py
+CUDA_VISIBLE_DEVICES=1,2,3,4 TORCH_CUDA_ARCH_LIST=Blackwell OMP_NUM_THREADS=1 torchrun --nnodes=1 --nproc_per_node=gpu check_correct.py
+```
+
+Benchmark:
+
+```bash
+CUDA_VISIBLE_DEVICES=1,2,3,4 TORCH_CUDA_ARCH_LIST=Blackwell OMP_NUM_THREADS=1 torchrun --nnodes=1 --nproc_per_node=gpu benchmark.py
 ```

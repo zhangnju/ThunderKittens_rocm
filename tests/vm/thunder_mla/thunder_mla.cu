@@ -135,6 +135,7 @@ struct PartialOp
 {
     static constexpr int opcode = 1;
     static constexpr int OP_IDX = _OP_IDX; // Op index within the layer -- controls which barrier to listen to.
+    
     struct parsed_instruction
     {
         int uid;
@@ -147,8 +148,12 @@ struct PartialOp
             return (end_pos - start_pos + NUM_ROWS - 1) / NUM_ROWS;
         }
 
+        __device__ static inline int get_warp_q_seq_idx() {
+            return group<NUM_CONSUMER_WARPS>::warpid() / 4 + ((group<NUM_CONSUMER_WARPS>::warpid() % 4) * (NUM_CONSUMER_WARPS / 4));
+        }
+
         __device__ static inline int get_length(int length, int q_seq_idx, int q_depth) {
-            return length - q_depth + q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid() + 1;
+            return length - q_depth + q_seq_idx + get_warp_q_seq_idx() + 1;
         }
 
         __device__ inline parsed_instruction(typename config::instruction_t &instruction, int q_depth)
@@ -173,7 +178,7 @@ struct PartialOp
     using kcache_st_type         = globals::kcache_st_type;
     static constexpr int KCACHE_TILE_SIZE = sizeof(kcache_st_type::dtype) * kcache_st_type::rows * kcache_st_type::cols;
     using vcache_st_type         = globals::vcache_st_type;
-    using vcache_half_st_type         = st_fp8<NUM_ROWS, QVO_D/2>;
+    using vcache_half_st_type    = st_fp8<NUM_ROWS, QVO_D/2>;
 
     // Non-pipelined objects
     using qrot_st_type           = globals::qrot_st_type;
@@ -303,6 +308,8 @@ struct PartialOp
                 using o_rt_quarter_fp8_type = rt_fp8<o_tt_quarter_type::rows/NUM_CONSUMER_WARPS, o_tt_quarter_type::cols>;
                 o_rt_quarter_fp8_type o_quarter_fp8;
 
+                warp::div_row(o_quarter_rt_1, o_quarter_rt_1, norm_vec);
+
                 warp::copy(o_quarter_fp8, o_quarter_rt_1);
                 warp::store(get_o_fp8_st_warp_split_quarter_tile(s, 2, group<NUM_CONSUMER_WARPS>::warpid()), o_quarter_fp8);
 
@@ -311,14 +318,17 @@ struct PartialOp
                 o_tt_quarter_type o_quarter_tt_2 = get_o_tt_quarter(s, 2);
 
                 group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_0);
+                warp::div_row(o_quarter_rt_1, o_quarter_rt_1, norm_vec);
                 warp::copy(o_quarter_fp8, o_quarter_rt_1);
                 warp::store(get_o_fp8_st_warp_split_quarter_tile(s, 0, group<NUM_CONSUMER_WARPS>::warpid()), o_quarter_fp8);
                 
                 group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_1);
+                warp::div_row(o_quarter_rt_1, o_quarter_rt_1, norm_vec);
                 warp::copy(o_quarter_fp8, o_quarter_rt_1);
                 warp::store(get_o_fp8_st_warp_split_quarter_tile(s, 1, group<NUM_CONSUMER_WARPS>::warpid()), o_quarter_fp8);
 
                 group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_2);
+                warp::div_row(o_quarter_rt_1, o_quarter_rt_1, norm_vec);
                 warp::copy(o_quarter_fp8, o_quarter_rt_1);
                 warp::store(get_o_fp8_st_warp_split_quarter_tile(s, 3, group<NUM_CONSUMER_WARPS>::warpid()), o_quarter_fp8);
 
@@ -330,7 +340,7 @@ struct PartialOp
                         get_o_fp8_st_warp_split_quarter_tile(s, 0, group<NUM_CONSUMER_WARPS>::warpid()),
                         {
                             inst.output_location.batch_idx, 
-                            inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
+                            inst.output_location.seq_idx + inst.get_warp_q_seq_idx(), 
                             0, 
                             0
                         }
@@ -341,7 +351,7 @@ struct PartialOp
                         get_o_fp8_st_warp_split_quarter_tile(s, 1, group<NUM_CONSUMER_WARPS>::warpid()),
                         {
                             inst.output_location.batch_idx, 
-                            inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
+                            inst.output_location.seq_idx + inst.get_warp_q_seq_idx(), 
                             0, 
                             1
                         }
@@ -352,7 +362,7 @@ struct PartialOp
                         get_o_fp8_st_warp_split_quarter_tile(s, 2, group<NUM_CONSUMER_WARPS>::warpid()),
                         {
                             inst.output_location.batch_idx, 
-                            inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
+                            inst.output_location.seq_idx + inst.get_warp_q_seq_idx(), 
                             0, 
                             2
                         }
@@ -363,7 +373,7 @@ struct PartialOp
                         get_o_fp8_st_warp_split_quarter_tile(s, 3, group<NUM_CONSUMER_WARPS>::warpid()),
                         {
                             inst.output_location.batch_idx, 
-                            inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 
+                            inst.output_location.seq_idx + inst.get_warp_q_seq_idx(), 
                             0, 
                             3
                         }
@@ -377,6 +387,8 @@ struct PartialOp
                 o_tt_quarter_type o_quarter_tt_2 = get_o_tt_quarter(s, 2);
                 
                 group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_2);
+                warp::div_row(o_quarter_rt_1, o_quarter_rt_1, norm_vec);
+                warp::div_row(o_quarter_rt_2, o_quarter_rt_2, norm_vec);
                 warp::store(get_o_st_warp_split_quarter_tile(s, 0, group<NUM_CONSUMER_WARPS>::warpid()), o_quarter_rt_1);
                 warp::store(get_o_st_warp_split_quarter_tile(s, 1, group<NUM_CONSUMER_WARPS>::warpid()), o_quarter_rt_2);
                 
@@ -385,18 +397,20 @@ struct PartialOp
                     tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
                         g.O_scratch,
                         get_o_st_warp_split_quarter_tile(s, 0, group<NUM_CONSUMER_WARPS>::warpid()),
-                        {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 2}
+                        {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + inst.get_warp_q_seq_idx(), 0, 2}
                     );
 
                     tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
                         g.O_scratch,
                         get_o_st_warp_split_quarter_tile(s, 1, group<NUM_CONSUMER_WARPS>::warpid()),
-                        {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 3}
+                        {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + inst.get_warp_q_seq_idx(), 0, 3}
                     );
                 }
 
                 group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_1, o_quarter_tt_0);
                 group<NUM_CONSUMER_WARPS>::load_async(o_quarter_rt_2, o_quarter_tt_1);
+                warp::div_row(o_quarter_rt_1, o_quarter_rt_1, norm_vec);
+                warp::div_row(o_quarter_rt_2, o_quarter_rt_2, norm_vec);
                 warp::store(get_o_st_warp_split_quarter_tile(s, 2, group<NUM_CONSUMER_WARPS>::warpid()), o_quarter_rt_1);
 
                 group<NUM_CONSUMER_WARPS>::tma::store_async_read_wait();
@@ -408,13 +422,13 @@ struct PartialOp
                     tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
                         g.O_scratch,
                         get_o_st_warp_split_quarter_tile(s, 2, group<NUM_CONSUMER_WARPS>::warpid()),
-                        {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 0}
+                        {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + inst.get_warp_q_seq_idx(), 0, 0}
                     );
 
                     tma::store_async<dim::ROW, cache_policy::EVICT_LAST>(
                         g.O_scratch,
                         get_o_st_warp_split_quarter_tile(s, 0, group<NUM_CONSUMER_WARPS>::warpid()),
-                        {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 1}
+                        {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + inst.get_warp_q_seq_idx(), 0, 1}
                     );
                 }
 
@@ -427,7 +441,7 @@ struct PartialOp
                 warp::tma::store_async<cache_policy::EVICT_LAST>(
                     g.Lvec_scratch,
                     get_l_vec(s, group<NUM_CONSUMER_WARPS>::warpid()),
-                    {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0}
+                    {-inst.output_location.batch_idx-1, inst.output_location.seq_idx + inst.get_warp_q_seq_idx(), 0}
                 );
 
                 group<NUM_CONSUMER_WARPS>::tma::store_async_wait();
@@ -487,7 +501,6 @@ struct PartialOp
             warp::load_async(qvo_subtile, g.QV, {inst.q_batch_idx, inst.q_seq_idx + group<NUM_CONSUMER_WARPS>::warpid(), 0, 0});
             // end of loading qrot and qvo
 
-
             tensor_store_wait();
             load_async_wait();
             group<NUM_CONSUMER_WARPS>::sync(8);
@@ -526,6 +539,20 @@ struct PartialOp
                 kcache_st_type &kcache_st = get_kcache_tile(s, pipeline_stage);
                 vcache_st_type &vcache_st = get_vcache_tile(s, pipeline_stage);
 
+                // if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                //     printf("iter: %d\n", iter);
+                //     printf("kcache_st:\n");
+                //     print(kcache_st);
+                //     printf("vcache_st:\n");
+                //     print(vcache_st);
+
+                //     printf("qrot:\n");
+                //     print(qrot);
+                //     printf("qvo:\n");
+                //     print(qvo);
+                // }
+                // group<NUM_CONSUMER_WARPS>::sync(10);
+
                 group<NUM_CONSUMER_WARPS>::mm_ABt(attn_tt, qrot, kcache_st, matmul_finished(s));
                 group<NUM_CONSUMER_WARPS>::mma_ABt(attn_tt, qvo, vcache_st, matmul_finished(s));
 
@@ -543,9 +570,9 @@ struct PartialOp
                 // DEBUGGING MODE
                 using attn_st_type = st_fl<attn_tt_type::rows, attn_tt_type::cols>;
                 attn_st_type &attn_st = *reinterpret_cast<attn_st_type*>(s.pages[s.pid(2)].ptr());
-                group<NUM_CONSUMER_WARPS>::store(attn_st, attn_tt);
+                group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
                 group<NUM_CONSUMER_WARPS>::sync(10);
-                if (group<NUM_CONSUMER_WARPS>::warpid() == 0) {
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
                     print(attn_st);
                 }
                 group<NUM_CONSUMER_WARPS>::sync(10);
@@ -567,6 +594,16 @@ struct PartialOp
                     );
                 }
 
+                // DEBUGGING MODE
+                group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    printf("attn post mask");
+                    print(attn_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                // END DEBUGGING MODE
+
                 // Update current tile max and scaled current tile max
                 warp::row_max(accumulated_max_vec, attn_rt, accumulated_max_vec);
                 warp::mul(scaled_accumulated_max_vec, accumulated_max_vec, SOFTMAX_TEMPERATURE);
@@ -575,6 +612,16 @@ struct PartialOp
                 warp::mul(attn_rt, attn_rt, SOFTMAX_TEMPERATURE);
                 warp::sub_row(attn_rt, attn_rt, scaled_accumulated_max_vec);
                 warp::exp2(attn_rt, attn_rt);
+
+                // DEBUGGING MODE
+                group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    printf("attn post mask");
+                    print(attn_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                // END DEBUGGING MODE
 
                 // Convert attn_rt to fp8 and store in attn_tt_fp8
                 rt_fp8e4m3<attn_tt_type::rows / NUM_CONSUMER_WARPS, attn_tt_type::cols> attn_rt_fp8;
@@ -614,7 +661,16 @@ struct PartialOp
                 group<NUM_CONSUMER_WARPS>::sync(10);
 
                 o_tt_half_type o_half_1 = get_o_tt_half(s, 1);
-                auto &vcache_half_tile_1 = get_vcache_half_tile(s, pipeline_stage, 1);
+                auto & vcache_half_tile_1 = get_vcache_half_tile(s, pipeline_stage, 1);
+                group<NUM_CONSUMER_WARPS>::store(attn_st, attn_rt);
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    printf("vcache_half_tile_1");
+                    print(vcache_half_tile_1);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                // END DEBUGGING MODE
+                // auto vcache_half_tile_1 = vcache_st.template subtile<vcache_st_type::rows, vcache_st_type::cols/2>({0, 1});
                 if(group<NUM_CONSUMER_WARPS>::laneid() == 0) mma_AB(o_half_1, attn_tt_fp8, vcache_half_tile_1, matmul_finished(s));
                 
                 // load o[0] from o_quarter_tt_1 to o_quarter_rt_1, normalize o[0] and o[1], put o[0] back
@@ -634,8 +690,26 @@ struct PartialOp
                 tensor_store_wait();
                 group<NUM_CONSUMER_WARPS>::sync(10);
 
+                // DEBUG PRINTING
+                group<NUM_CONSUMER_WARPS>::store(o_st, o_quarter_rt_1);
+
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                printf("printing o2 immediately after mma\n");
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    print(o_st);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                // END DEBUG PRINTING
+
                 o_tt_half_type o_half_0 = get_o_tt_half(s, 0);
-                auto &vcache_half_tile_0 = get_vcache_half_tile(s, pipeline_stage, 0);
+                auto & vcache_half_tile_0 = get_vcache_half_tile(s, pipeline_stage, 0);
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                if (group<NUM_CONSUMER_WARPS>::laneid() == 0) {
+                    printf("vcache_half_tile_0");
+                    print(vcache_half_tile_0);
+                }
+                group<NUM_CONSUMER_WARPS>::sync(10);
+                // auto vcache_half_tile_0 = vcache_st.template subtile<vcache_st_type::rows, vcache_st_type::cols/2>({0, 0});
                 if(group<NUM_CONSUMER_WARPS>::laneid() == 0) mma_AB(o_half_0, attn_tt_fp8, vcache_half_tile_0, matmul_finished(s));
 
                 if (group<NUM_CONSUMER_WARPS>::laneid() == 1) {

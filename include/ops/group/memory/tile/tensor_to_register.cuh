@@ -168,6 +168,66 @@ __device__ inline static void store_async(TM &dst, const RT &src) {
         using U = TM::dtype;
         using U2 = base_types::packing<U>::packed_type;
 
+        if constexpr (sizeof(typename TM::dtype) == 1) {
+            #pragma unroll
+            for(int i = 0; i < src.height; i++) {
+                if constexpr (src.width%4 == 0) {
+                    #pragma unroll
+                    for(int j = 0; j < src.width; j+=4) {
+                        asm volatile(
+                            "tcgen05.st.sync.aligned.16x128b.x8.unpack::16b.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};\n"
+                            :: "r"(dst.addr + ((i * src.tile_size_row) << 16) + (j * src.tile_size_col)/(4/(uint32_t)sizeof(U))),
+                            "r"(*(uint32_t*)&src.tiles[i][j+0].data[0]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+0].data[1]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+0].data[2]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+0].data[3]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+1].data[0]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+1].data[1]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+1].data[2]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+1].data[3]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+2].data[0]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+2].data[1]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+2].data[2]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+2].data[3]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+3].data[0]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+3].data[1]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+3].data[2]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+3].data[3])
+                        );
+                    }
+                }
+                else if constexpr (src.width%2 == 0) {
+                    #pragma unroll
+                    for(int j = 0; j < src.width; j+=2) {
+                        asm volatile(
+                            "tcgen05.st.sync.aligned.16x128b.x4.unpack::16b.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};\n"
+                            :: "r"(dst.addr + ((i * src.tile_size_row) << 16) + (j * src.tile_size_col)/(4/(uint32_t)sizeof(U))),
+                            "r"(*(uint32_t*)&src.tiles[i][j+0].data[0]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+0].data[1]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+0].data[2]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+0].data[3]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+1].data[0]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+1].data[1]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+1].data[2]),
+                            "r"(*(uint32_t*)&src.tiles[i][j+1].data[3])
+                        );
+                    }
+                }
+                else {
+                    #pragma unroll
+                    for(int j = 0; j < src.width; j++) {
+                        asm volatile(
+                            "tcgen05.st.sync.aligned.16x128b.x2.unpack::16b.b32 [%0], {%1, %2, %3, %4};\n"
+                            :: "r"(dst.addr + ((i * src.tile_size_row) << 16) + (j * src.tile_size_col)/(4/(uint32_t)sizeof(U))),
+                            "r"(*(uint32_t*)&src.tiles[i][j].data[0]),
+                            "r"(*(uint32_t*)&src.tiles[i][j].data[1]),
+                            "r"(*(uint32_t*)&src.tiles[i][j].data[2]),
+                            "r"(*(uint32_t*)&src.tiles[i][j].data[3])
+                        );
+                    }
+                }
+            }
+        }
         if constexpr (sizeof(typename TM::dtype) == 2) {
             #pragma unroll
             for(int i = 0; i < src.height; i++) {

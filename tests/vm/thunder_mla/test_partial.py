@@ -37,6 +37,11 @@ def init_arguments(seq_lengths: List[int], new_tokens: int, q_heads: int=16):
     Lengths = torch.tensor(seq_lengths, dtype=torch.int32, device='cuda')
     Table = torch.randint(0, NUM_PAGES, (B, MAX_NUM_PAGES), dtype=torch.int32, device='cuda')
 
+    # QRot = torch.ones_like(QRot) * torch.arange(128, device='cuda').reshape(1, 8, 16, 1)
+    # QV = torch.ones_like(QV) * torch.arange(128, device='cuda').reshape(1, 8, 16, 1)
+    # K_cache = torch.ones_like(K_cache) * (torch.arange(K_cache.shape[-1], device='cuda') // 8)
+    # V_cache = torch.ones_like(V_cache) * (torch.arange(V_cache.shape[-1], device='cuda') // 8)
+
     # K_cache *= 0
     # V_cache *= 0
     return QRot, QV, K_cache, V_cache, Lengths, Table
@@ -54,7 +59,7 @@ def create_thundermla_arguments(seq_lengths, new_tokens, q_heads = 16, block_siz
 
         for j in range((seq_lengths[i] + block_size - 1) // block_size):
             for k in range(0, new_tokens, 8):
-                write_scratch = False#(block_size < seq_lengths[i])
+                write_scratch = True#False#(block_size < seq_lengths[i])
                 scheduled_tasks.append(
                     Task(
                         uid=idx,
@@ -120,6 +125,8 @@ def run_thundermla(QRot, QV, K_cache, V_cache, Lengths, Table, Instructions, O_s
         #mla_decode_fn(Instructions, QRot, QV, K_cache, V_cache, Table, O, O_scratch, Lvec_scratch, Semaphore, softmax_scale, 1-tic)
     torch.cuda.synchronize()
 
+    print("O_thundermla:", O)
+
     if prints:
         print('Finished mla_decode')
     return O, Timings
@@ -138,6 +145,12 @@ def compute_thundermla_partials(QRot, QV, K_cache, V_cache, Lengths, Table, Inst
     mla_decode_fn = mla_decode.mla_decode_8_heads if q_heads == 8 else mla_decode.mla_decode
     if prints:
         print('Starting mla_decode')
+
+    QRot = QRot.to(torch.float8_e4m3fn)
+    QV = QV.to(torch.float8_e4m3fn)
+    K_cache = K_cache.to(torch.float8_e4m3fn)
+    V_cache = V_cache.to(torch.float8_e4m3fn)
+    O = O.to(torch.float8_e4m3fn)
     if Timings is not None:
         mla_decode_fn(
             Instructions, 
@@ -162,8 +175,8 @@ def compute_thundermla_partials(QRot, QV, K_cache, V_cache, Lengths, Table, Inst
     if prints:
         print('Finished mla_decode')
 
-    print(O_scratch[0, :, 0, 0])
-    print(Lvec_scratch[0])
+    print("TK O_scratch slice:", O_scratch[0, 0, 0, :])
+    print("Len of O_scratch slice:", len(O_scratch[0, 0, 0, :]))
 
     Os = []
     ls = []
@@ -231,7 +244,6 @@ def run_mla_torch(QRot, QV, K_cache, V_cache, Lengths, Table):
             scale=softmax_scale
         ).transpose(1, 2)
 
-    print(O)
     return O
 
 def compute_mla_partials_torch(QRot, QV, K_cache, V_cache, Lengths, Table, block_size):
@@ -239,13 +251,17 @@ def compute_mla_partials_torch(QRot, QV, K_cache, V_cache, Lengths, Table, block
     q_heads = Q.shape[2]
     full_K = torch.cat([K_cache, V_cache], dim=-1)[Table].reshape(Q.shape[0], -1, Q.shape[-1])
     full_V = V_cache[Table].reshape(Q.shape[0], -1, QV.shape[-1])
-    full_K = torch.ones_like(full_K)
-    full_V = torch.ones_like(full_V)
+    # full_K = torch.ones_like(full_K)
+    # full_V = torch.ones_like(full_V)
     Q = Q.transpose(1, 2) # (B, H, LQ, D)
 
     # pad K and V to be a multiple of block_size
     full_K = torch.cat([full_K, torch.zeros(full_K.shape[0], block_size - full_K.shape[1] % block_size, full_K.shape[2], dtype=full_K.dtype, device=full_K.device)], dim=1)
     full_V = torch.cat([full_V, torch.zeros(full_V.shape[0], block_size - full_V.shape[1] % block_size, full_V.shape[2], dtype=full_V.dtype, device=full_V.device)], dim=1)
+
+    Q = Q.to(torch.float8_e4m3fn).to(torch.float32)
+    full_K = full_K.to(torch.float8_e4m3fn).to(torch.float32)
+    full_V = full_V.to(torch.float8_e4m3fn).to(torch.float32)
 
     softmax_scale = 1.0 / math.sqrt(D_Main+D_Rot)
     Os = []
@@ -254,6 +270,7 @@ def compute_mla_partials_torch(QRot, QV, K_cache, V_cache, Lengths, Table, block
         Os.append([])
         ls.append([])
         for block_start in range(0, l, block_size):
+            print(f"block_start: {block_start}, block_size: {block_size}, l: {l}")
             Os[b].append([])
             ls[b].append([])
             for k in range(0, Q.shape[2], 8):
@@ -265,21 +282,60 @@ def compute_mla_partials_torch(QRot, QV, K_cache, V_cache, Lengths, Table, block
                 mask = (q_loc[:, None] >= k_loc[None, :]).unsqueeze(0) # (1, LQ, L)
 
                 QK = Q[b, :, k:k+8] @ K_block.transpose(0, 1) # (H, LQ<=8, L)
+                print(f"QK: {QK}")
                 QK = QK.masked_fill(~mask, -10000000)
-
+                print(f"QK after mask:")
+                for i in range(QK.shape[0]):
+                    print(QK[i, 0, :].tolist())
+                print()
                 max_vec = torch.max(QK, dim=-1, keepdim=True).values # (H, LQ<=8, 1)
                 QK = QK - max_vec
                 exp_QK = torch.exp(QK * softmax_scale) # (H, LQ<=8, L)
+
+                print(f"exp_QK:")
+                for i in range(exp_QK.shape[0]):
+                    print(exp_QK[i, 0, :].tolist())
+                print()
 
                 l_block = torch.sum(exp_QK, dim=-1, keepdim=True) # (H, LQ<=8, 1)
 
                 ls[b][-1].append((1.44269504089 * max_vec * softmax_scale + torch.log2(l_block)).transpose(0, 1)[..., 0])
 
-                O_block = exp_QK @ V_block / l_block # (H, LQ<=4, D)
-                Os[b][-1].append(O_block.transpose(0, 1))
+                O_block = (exp_QK.to(torch.float8_e4m3fn).to(torch.float32)) @ V_block # / l_block # (H, LQ<=8, D)
+
+                print(torch.sum(exp_QK.to(torch.float8_e4m3fn).to(torch.float32)[0, 0, :] * V_block[:, 0]))
+
+                print(f"V_block 1:")
+                for i in range(V_block.shape[0]):
+                    print(V_block[i, 256:].tolist())
+                print()
+                print(f"V_block 0:")
+                for i in range(V_block.shape[0]):
+                    print(V_block[i, :256].tolist())
+                print()
+                print(f"O_block 0:")
+                for i in range(O_block.shape[0]):
+                    print(O_block[i, 0, :128].tolist())
+                print()
+                print(f"O_block 1:")
+                for i in range(O_block.shape[0]):
+                    print(O_block[i, 0, 128:256].tolist())
+                print()
+                print(f"O_block 2:")
+                for i in range(O_block.shape[0]):
+                    print(O_block[i, 0, 256:384].tolist())
+                print()
+                print(f"O_block 3:")
+                for i in range(O_block.shape[0]):
+                    print(O_block[i, 0, 384:].tolist())
+                print()
+                Os[b][-1].append((O_block / l_block).transpose(0, 1))
 
             Os[b][-1] = torch.cat(Os[b][-1], dim=0)
             ls[b][-1] = torch.cat(ls[b][-1], dim=0)
+
+    print("Torch O_scratch slice:", Os[0][0][0, 0, :])
+    print("Len of O_scratch slice:", len(Os[0][0][0, 0, :]))
 
     return Os, ls
 
@@ -307,6 +363,7 @@ def main(seq_lengths, new_tokens, q_heads=16, block_size=128, prints=True):
         "Kernel output mean\t": torch.mean(O.abs()),
         "Max absolute diff\t": torch.max(torch.abs(O - ref)),
         "Avg absolute diff\t": torch.mean(torch.abs(O - ref)),
+        "Avg relative diff\t": torch.mean(torch.abs(2*(O - ref)/(O + ref + 1e-6))),
     }
 
 def main_check_partials(seq_lengths, new_tokens, q_heads=16, block_size=128, prints=True):
@@ -324,6 +381,14 @@ def main_check_partials(seq_lengths, new_tokens, q_heads=16, block_size=128, pri
     # print("Avg absolute diff", torch.mean(torch.abs(O - ref)))
     if prints:
         print('Finished!')
+
+    for i in range(len(Os[0][0][0, 0, :])):
+        print(Os_torch[0][0][0, 0, i].item(), end="\t")
+        print(Os[0][0][0, 0, i].item(), end="\t")
+        print(Os[0][0][0, 0, i] - Os_torch[0][0][0, 0, i])
+    print()
+
+    print("Ls diff:", ls[0][0] - ls_torch[0][0])
     
     # for i in range(len(Os)):
     #     for j in range(len(Os[i])):
@@ -360,10 +425,10 @@ def main_check_partials(seq_lengths, new_tokens, q_heads=16, block_size=128, pri
             else:
                 stats_dict[f"\nOs[{i}][{j}] max diff\t"] = torch.max(torch.abs(Os_torch[i][j] - Os[i][j]))
             
-            stats_dict[f"Os[{i}][{j}] mean diff\t"] = torch.mean(torch.abs(Os_torch[i][j] - Os[i][j]))
+            stats_dict[f"Os[{i}][{j}] mean relative diff\t"] = torch.median(torch.abs(2*(Os_torch[i][j] - Os[i][j])/(Os_torch[i][j] + Os[i][j] + 1e-6)))
 
             stats_dict[f"\nls[{i}][{j}] max diff\t"] = torch.max(torch.abs(ls_torch[i][j] - ls[i][j]))
-            stats_dict[f"ls[{i}][{j}] mean diff\t"] = torch.mean(torch.abs(ls_torch[i][j] - ls[i][j]))
+            stats_dict[f"ls[{i}][{j}] mean relative diff\t"] = torch.mean(torch.abs(2*(ls_torch[i][j] - ls[i][j])/(ls_torch[i][j] + ls[i][j] + 1e-6)))
 
     return stats_dict
 
@@ -429,5 +494,5 @@ if __name__ == "__main__":
     # ], check_partials=True)
 
     test_inputs([
-        ([16], 1, 16, 128, 1),
-    ], prints=True)#, check_partials=True)
+        ([128], 1, 16, 128, 1),
+    ], prints=True, check_partials=True)

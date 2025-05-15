@@ -5,7 +5,7 @@ import numpy as np
 fig, ax = plt.subplots(figsize=(10, 6))
 
 # Extract data
-N_values = [16384*2**i for i in range(7)]
+N_labels = [f'$2^{{{i}}}$' for i in range(14, 21)]
 comm_0_values = [185.590861063713,  402.42394045062053, 684.0080230832069, 831.3073710520496, 855.9992523261375, 886.4029767166567, 889.7014210006454]
 comm_2_values = [268.6913106700555, 526.5637359594801,  808.270115030147,  872.4621283424646, 874.2722886322125, 892.6658221442152, 886.5143609934917]
 comm_4_values = [418.2157088369102, 730.76127976704,    804.7538130661654, 868.1141226293634, 869.9436662306031, 890.3894067038113, 884.3053061304734]
@@ -13,16 +13,11 @@ comm_8_values = [551.6706408990542, 733.3903737311397,  801.4786905239077, 866.9
 
 # Convert N to a readable format (K for thousands, M for millions)
 x_labels = []
-for n in N_values:
-    if n >= 1000000:
-        x_labels.append(f"{n/1000000:.1f}M")
-    elif n >= 1000:
-        x_labels.append(f"{n/1000:.0f}K")
-    else:
-        x_labels.append(str(n))
+for n in N_labels:
+    x_labels.append(n)
 
 # Create the bar chart
-x = np.arange(len(N_values))
+x = np.arange(len(N_labels))
 width = 0.2
 
 # Plot bars
@@ -39,6 +34,7 @@ ax.set_title('Ring Attention Performance (4xB200)', fontsize=14)
 # Set x-axis ticks and labels
 ax.set_xticks(x)
 ax.set_xticklabels(x_labels)
+ax.tick_params(axis='both', which='major', labelsize=13)
 
 # Add legend
 ax.legend()
@@ -50,4 +46,4 @@ ax.legend()
 plt.tight_layout()
 
 # Save the figure
-plt.savefig('ringattention.png', dpi=300)
+plt.savefig('ringattention-ablation.png', dpi=300)

@@ -8,6 +8,8 @@
 #define OPCODE_Up 1
 #define OPCODE_Down 2
 
+static constexpr int HIDDEN_DIM = 2048;
+
 namespace kittens::prototype::vm {
 
 template<int _pipeline_stages>
@@ -96,7 +98,7 @@ struct globals_t {
 
 typedef globals_t<
     2048,
-    4096,
+    HIDDEN_DIM,
     132>
     mlp_micro_globals;
 

@@ -143,36 +143,47 @@ namespace kittens::prototype::vm {
 
             auto needed_pages = 1 + min(inst.iters, INPUT_PIPELINE_STAGES) * STAGE_PAGES;
 
-            if (laneid() == 0) {
+            // if(get_worker_id() == 0 && laneid() == 0) printf("instruction: %d, iter: %d made it here 4\n", s.instruction()[0], 0);
 
-                int input_stage = 0;
-                for (int iter = 0; iter < inst.iters; iter++) {
-                    wait(weights_finished(s, input_stage), (iter % (2 * INPUT_PIPELINE_STAGES)) < INPUT_PIPELINE_STAGES);
+            int input_stage = 0;
+            for (int iter = 0; iter < inst.iters; iter++) {
+                // if(get_worker_id() == 0) printf("instruction: %d, iter: %d\n", s.instruction()[0], iter);
+                wait(weights_finished(s, input_stage), (iter % (2 * INPUT_PIPELINE_STAGES)) < INPUT_PIPELINE_STAGES);
 
-                    auto &sem = weights_arrived(s, input_stage);
-                    tma::expect_bytes(sem, sizeof(bf16) * 2048 * 16);
+                // if(get_worker_id() == 0) printf("instruction: %d, iter: %d made it here\n", s.instruction()[0], iter);
+
+                if (iter == 0) {
+                    // if(get_worker_id() == 0) printf("instruction: %d, iter: %d made it here 2\n", s.instruction()[0], iter);
+                    if(laneid() == 0) s.record(10);
+                }
+
+                auto &sem = weights_arrived(s, input_stage);
+                warp::tma::expect_bytes(sem, sizeof(bf16) * 2048 * 16);
 #pragma unroll
-                    for (int i = 0; i < 4; i++) {
-                        int weight_page = get_weight_page(s, input_stage, i);
-                        if (iter < INPUT_PIPELINE_STAGES) {
-                            s.wait_page_ready(weight_page);
-                        }
-                        auto &weight_chunk = reinterpret_cast<st_bf<16, 512> &>(s.pages[weight_page]);
+                for (int i = 0; i < 4; i++) {
+                    int weight_page = get_weight_page(s, input_stage, i);
+                    if (iter < INPUT_PIPELINE_STAGES) {
+                        s.wait_page_ready(weight_page);
+                    }
+                    auto &weight_chunk = reinterpret_cast<st_bf<16, 512> &>(s.pages[weight_page]);
 
-                        if (iter == 0 && i == 0) {
-                            s.record(TEVENT_FIRST_LOAD);
-                        }
-                        else if (iter == inst.iters - 1 && i == 3) {
-                            s.record(TEVENT_LAST_LOAD);
-                        }
-
-                        pipeline_specifics::load_iter(s, g, inst, iter, i, weight_chunk, sem);
+                    if (iter == 0 && i == 0) {
+                        // s.record(TEVENT_FIRST_LOAD);
+                    }
+                    else if (iter == inst.iters - 1 && i == 3) {
+                        // s.record(TEVENT_LAST_LOAD);
                     }
 
-                    input_stage = (input_stage + 1) % INPUT_PIPELINE_STAGES;
+                    pipeline_specifics::load_iter(s, g, inst, iter, i, weight_chunk, sem);
+                    __syncwarp();
                 }
+                // load_async_wait();
+                // warp::sync();
+                // warp::arrive(sem);
+
+                input_stage = (input_stage + 1) % INPUT_PIPELINE_STAGES;
             }
-            else if (laneid() >= needed_pages && laneid() < Config::NUM_PAGES) {
+            if (laneid() >= needed_pages && laneid() < Config::NUM_PAGES) {
                 auto pid = s.pid(laneid());
                 s.wait_page_ready(pid);
                 s.finish_page(pid, Config::NUM_CONSUMER_WARPS);
@@ -193,15 +204,16 @@ namespace kittens::prototype::vm {
             for (int i = 0; i < inst.iters; i++) {
                 int weight_page = get_weight_page(s, input_stage, page_index);
                 wait(weights_arrived(s, input_stage), (i % (2 * INPUT_PIPELINE_STAGES)) >= INPUT_PIPELINE_STAGES);
+                if(i == 0) if(laneid() == 0) s.record(30);
                 wait(outputs_finished(s, output_stage), (i % (2 * OUTPUT_PIPELINE_STAGES)) < OUTPUT_PIPELINE_STAGES);
                 st_bf<16, REDUCTION_DIM_PER_WARP> &weights = reinterpret_cast<st_bf<16, REDUCTION_DIM_PER_WARP> *>(s.pages[weight_page].ptr())[warpid() % WARPS_PER_PAGE];
                 sv_fl<16> &out_smem = *reinterpret_cast<sv_fl<16> *>((float *)s.scratch() + (32 * output_stage));
 
                 if (i == 0) {
-                    s.record(TEVENT_FIRST_USE);
+                    // s.record(TEVENT_FIRST_USE);
                 }
                 else if (i == inst.iters - 1) {
-                    s.record(TEVENT_LAST_USE);
+                    // s.record(TEVENT_LAST_USE);
                 }
 
                 matvec(out_smem, weights, activations_vec);
@@ -233,17 +245,27 @@ namespace kittens::prototype::vm {
 
                 wait(sem, bit);
 
+                if (laneid() == 0 && i == 0) {
+                    s.record(50);
+                }
+
                 if (i == 0) {
-                    s.record(TEVENT_FIRST_STORE);
+                    // s.record(TEVENT_FIRST_STORE);
                 }
                 else if (i == inst.iters - 1) {
-                    s.record(TEVENT_LAST_STORE);
+                    // s.record(TEVENT_LAST_STORE);
                 }
 
                 pipeline_specifics::store(s, g, inst, i, output_stage);
 
                 warp::arrive(outputs_finished(s, output_stage));
                 output_stage = (output_stage + 1) % OUTPUT_PIPELINE_STAGES;
+
+                __syncwarp();
+
+                if (laneid() == 0 && i == inst.iters - 1) {
+                    s.record(60);
+                }
             }
         }
     };

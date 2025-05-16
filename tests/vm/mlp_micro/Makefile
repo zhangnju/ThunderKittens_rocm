@@ -8,6 +8,7 @@ SRC=mlp.cu
 # Python version configuration
 ifndef PYTHON_VERSION
 PYTHON_VERSION=3.12
+LDFLAGS += -L/home/simarora/bfs/.local/cpython-3.12/lib
 endif
 
 THUNDERKITTENS_ROOT=$(shell pwd)/../../../
@@ -32,7 +33,8 @@ all: $(TARGET)
 # 	python test.py
 
 $(TARGET): $(SRC)
-	$(NVCC) $(SRC) $(NVCCFLAGS) -o $(TARGET)$(shell python3-config --extension-suffix)
+	$(NVCC) $(SRC) $(NVCCFLAGS) -o $(TARGET).cpython-312-x86_64-linux-gnu.so $(LDFLAGS)
+## $(shell python3-config --extension-suffix)
 
 # Clean target
 clean:

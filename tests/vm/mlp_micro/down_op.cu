@@ -30,8 +30,8 @@ namespace kittens::prototype::vm {
         struct pipeline_specifics {
 
             static __device__ inline void load_iter(state<Config> &s, const Globals &g, parsed_instruction &inst, int iter, int col_idx, st_bf<16, 512> &weight_chunk, semaphore &sem) {
-                if(iter == 0 && laneid() == 0) s.record(83);
-                tma::load_async<dim::ROW, cache_policy::EVICT_FIRST>(weight_chunk, g.down_weights, coord<>{(inst.start_block_idx + iter) * Globals::matvec_block_size, inst.start_reduction_col + 512 * col_idx}, sem);
+                warp::tma::load_async<dim::ROW, cache_policy::EVICT_FIRST>(weight_chunk, g.down_weights, coord<>{(inst.start_block_idx + iter) * Globals::matvec_block_size, inst.start_reduction_col + 512 * col_idx}, sem);
+                // warp::load_async(weight_chunk, g.down_weights, coord<>{(inst.start_block_idx + iter) * Globals::matvec_block_size, inst.start_reduction_col + 512 * col_idx});
             }
 
             static __device__ inline void store(state<Config> &s, const Globals &g, parsed_instruction &inst, int output_idx, int output_stage) {
@@ -46,9 +46,9 @@ namespace kittens::prototype::vm {
                 warp::sync();
 
                 if (warp::laneid() == 0) {
-                    if(output_idx == inst.iters-1) s.record(85);
+                    // if(output_idx == inst.iters-1) s.record(85);
                     auto &OutputActivations = g.outputs; // object in global memory
-                    tma::store_add_async<cache_policy::EVICT_LAST>(OutputActivations, output_smem, {block_idx});
+                    tma::store_add_async(OutputActivations, output_smem, {block_idx});
                     tma::store_async_read_wait();
                 }
 
@@ -71,7 +71,9 @@ namespace kittens::prototype::vm {
         struct loader {
             static __device__ void run(const Globals &g, state<Config> &s) {
                 // Need to clear the first few elements of the scratch buffer, since we are using atomicAdd later.
-                s.template zero_scratch<1024>();
+                s.template zero_scratch<Config::SCRATCH_BYTES>();
+
+                // if(get_worker_id() == 0 && laneid() == 0) printf("instruction: %d, iter: %d made it here 3\n", s.instruction()[0], 0);
 
                 pipeline::loader_loop(s, g);
             }
@@ -98,20 +100,21 @@ namespace kittens::prototype::vm {
                     int activation_page = pipeline::get_activation_page(s);
                     s.wait_page_ready(activation_page);
 
-                    s.record(TEVENT_AT_GMEM_WAIT);
+                    // s.record(TEVENT_AT_GMEM_WAIT);
                     while (*(volatile int *)&g.Bar[{inst.reduction_block_idx}] < EXPECTED_ARRIVAL_COUNT) {
                         __nanosleep(Config::GMEM_SPIN_LOOP_SLEEP_NANOS);
                     }
-                    s.record(TEVENT_DONE_GMEM_WAIT);
+                    // s.record(TEVENT_DONE_GMEM_WAIT);
 
                     auto &activations = pipeline::get_activations(s);
                     auto &InputActivations = g.intermediates; // object in global memory
                 }
                 group<Config::NUM_CONSUMER_WARPS>::sync(4);
-                if(warpid() == 0 && laneid() == 0) s.record(84);
+                // if(warpid() == 0 && laneid() == 0) s.record(84);
 
                 sv_t &activations_smem = reinterpret_cast<sv_t *>(&pipeline::get_activations(s))[warpid()];
 
+                if(laneid() == 0) s.record(20);
                 warp::load(activations_smem, g.intermediates, coord<>{inst.start_reduction_col + warpid() * pipeline::REDUCTION_DIM_PER_WARP});
                 warp::sync();
 
@@ -119,9 +122,13 @@ namespace kittens::prototype::vm {
                 warp::load(activations_vec, activations_smem);
                 warp::sync();
 
+                if(laneid() == 0) s.record(30);
+
                 s.warp_finish_page(pipeline::get_activation_page(s), 1);
 
                 pipeline::consumer_loop(s, g, activations_vec);
+
+                if (laneid() == 0) s.record(45);
             }
         };
         struct storer {

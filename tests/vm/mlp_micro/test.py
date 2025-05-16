@@ -1,17 +1,20 @@
 import torch
+import pickle
 import mlp
-from timings import save_gantt_chart
+import sys
 
 true_num_sms = 132
-num_sms = 128
+num_sms = 132
 
-intermediate_dim = 4096
+intermediate_dim = 2048
 
 up = torch.randn(intermediate_dim, 2048, dtype=torch.bfloat16, device=0) / 2048**.25
 down = torch.randn(2048, intermediate_dim, dtype=torch.bfloat16, device=0) / intermediate_dim**.25
 
 upcopy = up.clone()
 downcopy = down.clone()
+
+derp, dorp = torch.randn(8192,8192, dtype=torch.bfloat16, device=0) / 8192**.5, torch.randn(8192,8192, dtype=torch.bfloat16, device=0) / 8192**.5
 
 vec = torch.randn(2048, dtype=torch.bfloat16, device=0) / 2048**.5
 
@@ -25,8 +28,11 @@ def make_schedule():
         up_instruction = [1, len(work)] + work
         up_instruction += [0] * (32 - len(up_instruction))
         instructions.append(up_instruction)
-    # for i in range(num_sms):
+    # for i in range(2048//16):
     #     down_instruction = [2, i, i+1, 0] + [0]*28
+    #     instructions.append(down_instruction)
+    # for i in range(num_sms):
+    #     down_instruction = [2, i, i+1, 1] + [0]*28
     #     instructions.append(down_instruction)
     num_down_stages = intermediate_dim//2048
     for j in range(0,num_down_stages):
@@ -34,6 +40,8 @@ def make_schedule():
         print('num_j_sms', num_j_sms)
         for i in range(num_j_sms):
             start, end = (2048//16)*i//num_j_sms, (2048//16)*(i+1)//num_j_sms
+            if start == end:
+                continue
             down_instruction = [2, start, end, j] + [0]*28
             instructions.append(down_instruction)
     while len(instructions) % num_sms != 0:
@@ -49,17 +57,27 @@ ITERS = 1
 instructions, timings, barriers = make_schedule()
 many_barriers = torch.stack([barriers]*ITERS)
 many_timings = torch.stack([timings]*ITERS)
-print(instructions.shape)
+print(instructions[0])
 
 inputs = vec.to(torch.float32)
 hidden = torch.zeros(intermediate_dim, device=0, dtype=torch.float32)
 outputs = torch.zeros(2048, device=0, dtype=torch.float32)
 
-mlp.mlp_1stage(barriers, instructions, timings, upcopy, downcopy, inputs, hidden, outputs)
+zerp = derp @ dorp
+
+if sys.argv[1] == '1':
+    mlp.mlp_1stage(barriers, instructions, timings, upcopy, downcopy, inputs, hidden, outputs)
+else:
+    mlp.mlp_2stage(barriers, instructions, timings, up, down, inputs, hidden, outputs)
 
 torch.cuda.synchronize()
 start_event = torch.cuda.Event(enable_timing=True)
 end_event = torch.cuda.Event(enable_timing=True)
+
+
+print(ref)
+print(outputs)
+
 
 # start_event.record()
 # for i in range(ITERS):
@@ -72,41 +90,44 @@ end_event = torch.cuda.Event(enable_timing=True)
 # print(timings[0])
 # print(timings[127])
 
-print(timings[:128,:,4].min(), timings[:128,:,4].max())
+pickle.dump(timings.cpu().numpy(), open(f'timings_{sys.argv[1]}stage.pkl', 'wb'))
 
-print('\n-------\n\n-------\n')
+# print('\n-------\n\n-------\n')
 
-save_gantt_chart(timings, instructions, save_all=True, name='1stage', clock_rate=1000)
+# # save_gantt_chart(timings, instructions, save_all=True, name='1 Stage', clock_rate=1000)
 
-many_barriers.zero_()
-many_timings.zero_()
-outputs.zero_()
 
-mlp.mlp_2stage(barriers, instructions, timings, upcopy, downcopy, inputs, hidden, outputs)
-torch.cuda.synchronize()
+# many_barriers.zero_()
+# many_timings.zero_()
+# outputs.zero_()
+# timings.zero_()
 
-# start_event.record()
-# for i in range(ITERS):
-#     mlp.mlp_2stage(many_barriers[i], instructions, many_timings[i], up, down, inputs, hidden, outputs)
-# end_event.record()
+# zerp = derp @ dorp
+
+
 # torch.cuda.synchronize()
-# elapsed_time = start_event.elapsed_time(end_event)
-# print(f"Execution time: {elapsed_time/ITERS*1000:.2f} us")
 
-print(timings[:128,:,4].min(), timings[:128,:,4].max())
+# # start_event.record()
+# # for i in range(ITERS):
+# #     mlp.mlp_2stage(many_barriers[i], instructions, many_timings[i], up, down, inputs, hidden, outputs)
+# # end_event.record()
+# # torch.cuda.synchronize()
+# # elapsed_time = start_event.elapsed_time(end_event)
+# # print(f"Execution time: {elapsed_time/ITERS*1000:.2f} us")
 
-# print(timings[0])
-# print(timings[127])
+# pickle.dump((timings[0,0,:].cpu().numpy(), timings[0,1,:].cpu().numpy()), open('timings_2stage.pkl', 'wb'))
 
-# print(instructions[:,:,0])
+# # print(timings[0])
+# # print(timings[127])
+
+# # print(instructions[:,:,0])
 
 
-print(ref.shape)
-print(ref)
-print(outputs)
+# print(ref)
+# print(outputs)
 
-# breakpoint()
-save_gantt_chart(timings, instructions, save_all=True, name='2stage', clock_rate=1000)
+# # breakpoint()
+# save_gantt_chart(timings, instructions, save_all=True, name='2 Stage', clock_rate=1000)
 
-print(timings[0,0,80:83])
-print(timings[0,1,80:83])
+# print(timings[0,0,80:83])
+# print(timings[0,1,83:86])

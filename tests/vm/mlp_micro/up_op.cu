@@ -24,9 +24,8 @@ namespace kittens::prototype::vm {
 
             static __device__ inline void load_iter(state<Config> &s, const Globals &g, parsed_instruction &inst, int iter, int col_idx, st_bf<16, 512> &weight_chunk, semaphore &sem) {
                 auto block_idx = inst.block_idxs[iter];
-                if(iter == 0 && laneid() == 0) s.record(80);
-                tma::load_async<dim::ROW, cache_policy::EVICT_FIRST>(weight_chunk, g.up_weights, {block_idx, col_idx}, sem);
-
+                warp::tma::load_async<dim::ROW, cache_policy::EVICT_FIRST>(weight_chunk, g.up_weights, {block_idx, col_idx}, sem);
+                // warp::load_async<dim::ROW, cache_policy::EVICT_FIRST>(weight_chunk, g.up_weights, {block_idx, col_idx});
             }
 
             static __device__ inline void store(state<Config> &s, const Globals &g, parsed_instruction &inst, int output_idx, int output_stage) {
@@ -42,7 +41,7 @@ namespace kittens::prototype::vm {
                 warp::sync();
 
                 if (warp::laneid() == 0) {
-                    if(output_idx == inst.iters-1) s.record(82);
+                    // if(output_idx == inst.iters-1) s.record(82);
                     auto &OutputActivations = g.intermediates; // object in global memory
                     tma::store_async<cache_policy::EVICT_LAST>(OutputActivations, output_smem, {block_idx});
                     tma::store_async_wait();
@@ -76,6 +75,7 @@ namespace kittens::prototype::vm {
                 pipeline::loader_loop(s, g);
             }
         };
+
         struct launcher {
             static __device__ void run(const Globals &g, state<Config> &s) {
                 if (laneid() == 0) {
@@ -94,7 +94,7 @@ namespace kittens::prototype::vm {
                 parsed_instruction inst{s};
 
                 sv_t &activations_smem = reinterpret_cast<sv_t *>(&pipeline::get_activations(s))[warpid()];
-                if(laneid() == 0) s.record(81);
+                if(laneid() == 0) s.record(20);
 
                 warp::load(activations_smem, g.inputs, coord<>{warpid() * pipeline::REDUCTION_DIM_PER_WARP});
                 warp::sync();
@@ -106,6 +106,8 @@ namespace kittens::prototype::vm {
                 s.warp_finish_page(pipeline::get_activation_page(s), 1);
 
                 pipeline::consumer_loop(s, g, activations_vec);
+
+                if (laneid() == 0) s.record(45);
             }
         };
 

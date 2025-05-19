@@ -12,3 +12,6 @@ local/
 __pycache__/
 */printouts/*
 .vscode/
+Miniconda*
+miniconda*
+.venv/

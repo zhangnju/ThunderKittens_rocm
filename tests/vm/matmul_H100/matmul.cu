@@ -81,10 +81,13 @@ template<typename config=config> struct MatmulOp {
     };
     struct loader {
         static __device__ void run(const globals &g, state<config> &s) {
-            s.warp_finish_page(12, config::NUM_CONSUMER_WARPS); // Release the unused page immediately.
-
             parsed_instruction inst{s};
             int laneid = warp::laneid();
+
+            if (laneid >= PIPELINE_STAGES*3 && laneid < config::NUM_PAGES) {
+                s.wait_page_ready(laneid);
+                s.finish_page(laneid, config::NUM_CONSUMER_WARPS); // release unused pages immediately
+            }
 
             int pipeline_stage = 0;
             uint32_t semaphore_bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
@@ -161,7 +164,7 @@ template<typename config=config> struct MatmulOp {
             parsed_instruction inst{s};
             int laneid = warp::laneid();
 
-            if(laneid < 2) {
+            if (laneid < 2) {
                 wait(outputs_arrived(s, laneid), 0);
                 int store_page = get_store_page(s, laneid);
                 c_tile &store_buffer = *reinterpret_cast<c_tile *>(s.pages[store_page].data);

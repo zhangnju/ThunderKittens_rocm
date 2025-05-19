@@ -1,7 +1,5 @@
 import torch
 from matmul import matmul
-import sys
-import time
 
 # M, K, N = 3072, 4096, 3072
 # M, K, N = 512, 256, 256

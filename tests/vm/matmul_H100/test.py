@@ -8,7 +8,7 @@ from matmul import matmul
 # M, K, N = 8192, 8192, 8192
 # M, K, N = 3072, 16384*2, 3072
 # M, K, N = 256, 4096, 256
-M, K, N = 4096, 4096, 4096
+M, K, N = 8192, 16384, 8192
 
 OPCODE = 1
 SM_COUNT = 132

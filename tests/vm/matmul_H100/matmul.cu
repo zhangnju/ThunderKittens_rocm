@@ -39,18 +39,18 @@ template<typename config=config> struct MatmulOp {
     static_assert(config::NUM_CONSUMER_WARPS == 8);
     
     struct parsed_instruction {
-        int row, col, iters;
+        int row, col, num_iters;
         __device__ inline parsed_instruction(typename config::instruction_t &instruction) {
             /*
                 Instruction format:
                 [0] = opcode
-                [1] = Row offset of C, in units of 128
-                [2] = Col offset of C, in units of 256
-                [3] = K reduction dimension, in units of 128
+                [1] = Row offset of C, in units of M_BLOCK
+                [2] = Col offset of C, in units of N_BLOCK
+                [3] = K reduction dimension, in units of K_BLOCK
             */
             row = instruction[1];
             col = instruction[2];
-            iters = instruction[3];
+            num_iters = instruction[3];
         }
         __device__ inline parsed_instruction(state<config> &s): parsed_instruction(s.instruction()) {}
     };
@@ -88,7 +88,7 @@ template<typename config=config> struct MatmulOp {
 
             int pipeline_stage = 0;
             uint32_t semaphore_bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
-            for (int i = 0; i < inst.iters; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
+            for (int i = 0; i < inst.num_iters; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
                 wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
                 warp::tma::expect_bytes(inputs_arrived(s, pipeline_stage), sizeof(a_tile)*2 + sizeof(b_tile));
                 if (laneid < 2) {
@@ -97,7 +97,7 @@ template<typename config=config> struct MatmulOp {
                         s.wait_page_ready(a_page);
                     }
                     a_tile &a = *reinterpret_cast<a_tile *>((uint8_t *)s.pages[a_page].data + sizeof(a_tile) * laneid);
-                    tma::load_async(a, g.A, {inst.row + laneid, i}, inputs_arrived(s, pipeline_stage));
+                    tma::load_async(a, g.A, {inst.row*2 + laneid, i}, inputs_arrived(s, pipeline_stage));
                 } else if (laneid == 2) {
                     int b_page = get_b_page(s, pipeline_stage);
                     if (i < PIPELINE_STAGES) {
@@ -105,7 +105,7 @@ template<typename config=config> struct MatmulOp {
                         s.wait_page_ready(b_page + 1); // because b_page is a megapage
                     }
                     b_tile &b = *reinterpret_cast<b_tile *>(s.pages[b_page].data);
-                    tma::load_async(b, g.B, {inst.col / 2, i}, inputs_arrived(s, pipeline_stage));
+                    tma::load_async(b, g.B, {inst.col, i}, inputs_arrived(s, pipeline_stage));
                 }
                 update_phasebit<1>(semaphore_bitfield, pipeline_stage);
             }
@@ -135,7 +135,7 @@ template<typename config=config> struct MatmulOp {
 
             int pipeline_stage = 0;
             uint32_t semaphore_bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
-            for (int i = 0; i < inst.iters; i++, update_phasebit<0>(semaphore_bitfield, pipeline_stage), pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
+            for (int i = 0; i < inst.num_iters; i++, update_phasebit<0>(semaphore_bitfield, pipeline_stage), pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
                 wait(inputs_arrived(s, pipeline_stage), get_phasebit<0>(semaphore_bitfield, pipeline_stage));
                 int a_page = get_a_page(s, pipeline_stage);
                 int b_page = get_b_page(s, pipeline_stage);
@@ -165,7 +165,7 @@ template<typename config=config> struct MatmulOp {
                 wait(outputs_arrived(s, laneid), 0);
                 int store_page = get_store_page(s, laneid);
                 c_tile &store_buffer = *reinterpret_cast<c_tile *>(s.pages[store_page].data);
-                tma::store_async(g.C, store_buffer, {inst.row+laneid, inst.col/2});
+                tma::store_async(g.C, store_buffer, {inst.row*2 + laneid, inst.col});
                 tma::store_async_read_wait();
                 s.finish_page(store_page, config::NUM_CONSUMER_WARPS);
             }

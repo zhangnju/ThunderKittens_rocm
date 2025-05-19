@@ -6,9 +6,13 @@ using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::vm;
 
-using a_tile = st_fp8e4m3<64, 128>;
-using b_tile = st_fp8e4m3<256, 128>;
-using c_tile = st_fp8e4m3<64, 256>;
+constexpr int M_BLOCK = 128;
+constexpr int N_BLOCK = 256;
+constexpr int K_BLOCK = 128;
+
+using a_tile = st_fp8e4m3<M_BLOCK / 2, K_BLOCK>; // 2 consumer warpgroups
+using b_tile = st_fp8e4m3<N_BLOCK, K_BLOCK>;
+using c_tile = st_fp8e4m3<M_BLOCK / 2, N_BLOCK>;
 
 static constexpr int SM_COUNT = 132;
 
@@ -57,7 +61,7 @@ template<typename config=config> struct MatmulOp {
     __device__ static inline int get_a_page(state<config> &s, int stage) { return stage*3; }
     __device__ static inline int get_b_page(state<config> &s, int stage) { return stage*3 + 1; }
     __device__ static inline int get_store_page(state<config> &s, int consumer_id) {
-        return PIPELINE_STAGES*3 - consumer_id - 1; // use the last stage pages
+        return (PIPELINE_STAGES-1)*3 + consumer_id; // use 2 pages from the last stage
     }
 
     struct controller {
@@ -107,9 +111,9 @@ template<typename config=config> struct MatmulOp {
             }
             warp::sync();
 
-            for (int i = 0; i < PIPELINE_STAGES - 1; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
+            for (int i = 0; i < PIPELINE_STAGES; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
                 wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
-                if (laneid < 3) {
+                if ((laneid < 3 && pipeline_stage < PIPELINE_STAGES - 1) || (laneid == 2 && pipeline_stage == PIPELINE_STAGES - 1)) {
                     int release_pid = pipeline_stage*3 + laneid;
                     s.finish_page(release_pid, config::NUM_CONSUMER_WARPS);
                 }
@@ -126,46 +130,46 @@ template<typename config=config> struct MatmulOp {
             int warpid = warpgroup::warpid();
             int groupid = warpgroup::groupid();
 
+            rt_fl<M_BLOCK / config::NUM_CONSUMER_WARPS, N_BLOCK> acc_fl;
+            warp::zero(acc_fl);
+
             int pipeline_stage = 0;
             uint32_t semaphore_bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
             for (int i = 0; i < inst.iters; i++, update_phasebit<0>(semaphore_bitfield, pipeline_stage), pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
                 wait(inputs_arrived(s, pipeline_stage), get_phasebit<0>(semaphore_bitfield, pipeline_stage));
+                int a_page = get_a_page(s, pipeline_stage);
+                int b_page = get_b_page(s, pipeline_stage);
+                a_tile &a = *reinterpret_cast<a_tile *>((uint8_t *)s.pages[a_page].data + sizeof(a_tile) * groupid);
+                b_tile &b = *reinterpret_cast<b_tile *>(s.pages[b_page].data);
+                warpgroup::mma_ABt(acc_fl, a, b);
+                warpgroup::mma_async_wait();
                 warpgroup::arrive(inputs_finished(s, pipeline_stage));
-                // wait(outputs_arrived(s, groupid), 0);
-                // auto accumulator = s.tensor_alloc.template allocate<tt<float, 128, 256>>(groupid*256);
-                // c_tile &store_buffer = *reinterpret_cast<c_tile *>(s.pages[get_store_page(s, inst, groupid)].data);
-                // rt_fl<32, 256> acc_rt;
-                // rt_fp8e4m3<32, 256> acc_fp8;
-                // warpgroup::load_async(acc_rt, accumulator);
-                // warp::copy(acc_fp8, acc_rt);
-                // warpgroup::store(store_buffer, acc_fp8);
             }
 
+            rt_fp8e4m3<M_BLOCK / config::NUM_CONSUMER_WARPS, N_BLOCK> acc_fp8;
+            warp::copy(acc_fp8, acc_fl);
+
+            int store_page = get_store_page(s, groupid);
+            c_tile &store_buffer = *reinterpret_cast<c_tile *>(s.pages[store_page].data);
+            warpgroup::store(store_buffer, acc_fp8);
             __syncwarp();
             warp::arrive(outputs_arrived(s, groupid));
         }
     };
     struct storer {
-        // Uses 4 full pages for outputs.
         static __device__ void run(const globals &g, state<config> &s) {
             parsed_instruction inst{s};
             int laneid = warp::laneid();
 
             if(laneid < 2) {
                 wait(outputs_arrived(s, laneid), 0);
-                // int store_page = get_store_page(s, inst, laneid());
-                // c_tile &output = *reinterpret_cast<c_tile *>(s.pages[get_store_page(s, inst, laneid())].data);
-                // tma::store_async(g.C, output, {inst.row+laneid(), inst.col/2});
-                // tma::store_async_read_wait();
-                // s.finish_page(store_page, config::NUM_CONSUMER_WARPS);
-                // s.finish_page(store_page + 1, config::NUM_CONSUMER_WARPS); // because store_page is megapage
+                int store_page = get_store_page(s, laneid);
+                c_tile &store_buffer = *reinterpret_cast<c_tile *>(s.pages[store_page].data);
+                tma::store_async(g.C, store_buffer, {inst.row+laneid, inst.col/2});
+                tma::store_async_read_wait();
+                s.finish_page(store_page, config::NUM_CONSUMER_WARPS);
             }
             warp::sync();
-
-            if (laneid < 3) {
-                int release_pid = (PIPELINE_STAGES-1)*3 + laneid;
-                s.finish_page(release_pid, config::NUM_CONSUMER_WARPS);
-            }
         }
     };
 };

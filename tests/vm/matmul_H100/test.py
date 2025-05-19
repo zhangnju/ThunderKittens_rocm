@@ -37,13 +37,15 @@ C =  torch.zeros((M, N), device=0, dtype=torch.float8_e4m3fn)
 print('Input tensors created, of shapes', A.shape, B.shape, C.shape)
 
 instructions = [[] for _ in range(SM_COUNT)]
-SUPER_M = 3072
-instruction_idx = 0
+SUPER_M = 1024
 num_iters = K // K_BLOCK
-for i in range((M + SUPER_M - 1) // SUPER_M): # ceil
+instruction_idx = 0
+for row_outer in range((M + SUPER_M - 1) // SUPER_M): # ceil
     for col in range(N // N_BLOCK):
-        for k in range(SUPER_M // K_BLOCK):
-            row = (SUPER_M // M_BLOCK) * i + k
+        rows_per_super = SUPER_M // M_BLOCK
+        row_start = rows_per_super * row_outer
+        for row_inner in range(rows_per_super):
+            row = row_start + row_inner
             if row >= M // M_BLOCK:
                 break
             instructions[instruction_idx%SM_COUNT].append([OPCODE, row, col, num_iters] + [0]*(INSTRUCTION_WIDTH-4))
@@ -91,5 +93,3 @@ C_ref = C_ref.to(torch.float32).cpu().numpy()
 assert C.shape == C_ref.shape
 print('abs diff max:', abs(C - C_ref).max())
 print('abs diff mean:', abs(C - C_ref).mean())
-
-breakpoint()

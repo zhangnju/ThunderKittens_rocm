@@ -68,12 +68,14 @@ __device__ static __forceinline__ int laneid() {
     return threadIdx.x & 31;
 }
 
-#if defined(KITTENS_HOPPER)
+#if defined(KITTENS_4090)
+constexpr int MAX_SHARED_MEMORY = 100000;
+#elif defined(KITTENS_5090)
+constexpr int MAX_SHARED_MEMORY = 100000;
+#elif defined(KITTENS_HOPPER)
 constexpr int MAX_SHARED_MEMORY = 227000;
 #elif defined(KITTENS_A100)
 constexpr int MAX_SHARED_MEMORY = 164000;
-#elif defined(KITTENS_4090)
-constexpr int MAX_SHARED_MEMORY = 100000;
 #endif
 
 struct transpose {

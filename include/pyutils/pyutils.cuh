@@ -38,6 +38,8 @@ template<ducks::gl::all GL> struct from_object<GL> {
             
             // Get data pointer using data_ptr()
             uint64_t data_ptr = obj.attr("data_ptr")().cast<uint64_t>();
+
+            // std::cout << "dims " << shape[0] << " " << shape[1] << " " << shape[2] << " " << shape[3] << std::endl;
             
             // Create GL object using make_gl
             return make_gl<GL>(data_ptr, shape[0], shape[1], shape[2], shape[3]);

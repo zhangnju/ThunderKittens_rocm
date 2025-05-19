@@ -6,7 +6,7 @@ namespace kittens::prototype::vm {
 
     template <typename Config, typename Globals, typename parsed_instruction, typename pipeline_specifics>
     struct matvec_pipeline {
-        static constexpr int INPUT_PIPELINE_STAGES = 3;
+        static constexpr int INPUT_PIPELINE_STAGES = 1;
         static constexpr int OUTPUT_PIPELINE_STAGES = 3;
         static constexpr int STAGE_PAGES = 4;
         static constexpr int ACTIVATION_PAGE = 0;
@@ -35,33 +35,35 @@ namespace kittens::prototype::vm {
             parsed_instruction inst{instruction};
             // unused pages, then activation, then weights
 
-            static_assert(INPUT_PIPELINE_STAGES == 3, "INPUT_PIPELINE_STAGES must be 3");
+            // static_assert(INPUT_PIPELINE_STAGES == 3, "INPUT_PIPELINE_STAGES must be 3");
 
             auto iters = inst.iters;
             auto remainder = iters % INPUT_PIPELINE_STAGES;
 
             // special handling for 1 and 2 because only then do
             // we free pages before the activation/rms scale (page 0)
-            if (iters == 1) {
-                int ret_order[13] = {5, 6, 7, 8, 9, 10, 11, 12, 0, 1, 2, 3, 4};
-                return ret_order[query];
-            }
-            else if (iters == 2) {
-                int ret_order[13] = {9, 10, 11, 12, 0, 1, 2, 3, 4, 5, 6, 7, 8};
-                return ret_order[query];
-            }
-            else if (remainder == 1) {
-                int ret_order[13] = {0, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2, 3, 4};
-                return ret_order[query];
-            }
-            else if (remainder == 2) {
-                int ret_order[13] = {0, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8};
-                return ret_order[query];
-            }
-            else {
-                int ret_order[13] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
-                return ret_order[query];
-            }
+            // if (iters == 1) {
+            //     int ret_order[13] = {5, 6, 7, 8, 9, 10, 11, 12, 0, 1, 2, 3, 4};
+            //     return ret_order[query];
+            // }
+            // else if (iters == 2) {
+            //     int ret_order[13] = {9, 10, 11, 12, 0, 1, 2, 3, 4, 5, 6, 7, 8};
+            //     return ret_order[query];
+            // }
+            // else if (remainder == 1) {
+            //     int ret_order[13] = {0, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2, 3, 4};
+            //     return ret_order[query];
+            // }
+            // else if (remainder == 2) {
+            //     int ret_order[13] = {0, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8};
+            //     return ret_order[query];
+            // }
+            // else {
+            //     int ret_order[13] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+            //     return ret_order[query];
+            // }
+            int ret_order[6] = {5, 0, 1, 2, 3, 4};
+            return ret_order[query];
         }
 
         __device__ static inline int init_semaphores(state<Config> &s) {

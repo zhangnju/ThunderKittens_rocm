@@ -16,7 +16,7 @@ namespace kittens::prototype::vm {
         auto OutputActivationsPtr,
         int _opcode,
         int _prev_opcode = 0,
-        typename Config = kittens::prototype::vm::default_config,
+        typename Config = kittens::prototype::vm::config,
         typename Globals = llama_1b_globals>
 
     struct MatVecAddOp {

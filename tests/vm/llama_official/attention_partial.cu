@@ -8,7 +8,7 @@ namespace kittens::prototype::vm {
     template <typename config, typename globals>
     struct attention_partial {
         static constexpr int opcode = OPCODE_PartialAttention;
-        static constexpr int NUM_STAGES = 3;
+        static constexpr int NUM_STAGES = 1;
         static constexpr int GQA_RATIO = LLAMA_1B_NUM_ATTENTION_HEADS / LLAMA_1B_NUM_KV_HEADS;
         static constexpr int QOL_PAGE = 0;
         static constexpr int KV_PAGE = 1;
@@ -224,7 +224,8 @@ namespace kittens::prototype::vm {
 
         struct controller {
             static __device__ int release_lid(const globals &g, typename config::instruction_t &instruction, int &query) {
-                int ret_order[13] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0, 1};
+                int ret_order[6] = {0, 1, 2, 3, 4, 5};
+                // int ret_order[13] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0, 1};
                 return ret_order[query];
             }
             static __device__ int init_semaphores(const globals &g, state<config> &s) {

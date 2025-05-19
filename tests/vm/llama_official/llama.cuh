@@ -26,7 +26,13 @@
 #define H100_SM_COUNT 132
 #define B200_SM_COUNT 148
 
-namespace kittens::prototype::vm {
+template <int N>
+struct assert_6 {
+    static_assert(N == 6, "N must be 6");
+};
+
+namespace kittens::prototype::vm
+{
 
     constexpr int ATOMIC_ADD_START = FREE_SLOTS_START;
     constexpr int ATOMIC_ADD_END = ATOMIC_ADD_START + 1;
@@ -46,10 +52,53 @@ namespace kittens::prototype::vm {
     constexpr int TEMP5 = TEMP4 + 1;
     constexpr int TEMP6 = TEMP5 + 1;
 
-    using config = default_config;
+    struct config {
+        // Instruction pipeline
+        static constexpr int INSTRUCTION_PIPELINE_STAGES = 2;
+
+        // num bits required to represent num pipeline stages
+        static constexpr int INSTRUCTION_PIPELINE_STAGES_BITS = 1;
+
+        static constexpr int INSTRUCTION_WIDTH = 32; // 128 bytes per instruction.
+        using instruction_t = int[INSTRUCTION_WIDTH];
+
+        // Timing info
+        static constexpr int TIMING_WIDTH = 32;
+        using timing_t = int[TIMING_WIDTH];
+
+        // How many semaphores are available for dynamic use?
+        static constexpr int DYNAMIC_SEMAPHORES = 16;
+
+        // One controller warp, one load warp, one store warp, and one mma warp.
+        static constexpr int NUM_CONSUMER_WARPS = 16;
+        static constexpr int NUM_WARPS = 4 + NUM_CONSUMER_WARPS;
+        static constexpr int NUM_THREADS = NUM_WARPS * ::kittens::WARP_THREADS;
+        static constexpr int NUM_BLOCKS = 1;
+        static constexpr int CLUSTER_BLOCKS = 1;
+        static constexpr int MAX_SHARED_MEMORY = kittens::MAX_SHARED_MEMORY;
+
+        // Shared memory declared statically
+        static constexpr int SCRATCH_BYTES = 256;
+        static constexpr int STATIC_SHARED_MEMORY = 128 + INSTRUCTION_PIPELINE_STAGES * (SCRATCH_BYTES + (INSTRUCTION_WIDTH + TIMING_WIDTH) * 4 + DYNAMIC_SEMAPHORES * 8);
+        static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
+
+        // Shared memory declared dynamically
+        static constexpr int PAGE_SIZE = 16384;
+        static constexpr int NUM_PAGES = DYNAMIC_SHARED_MEMORY / PAGE_SIZE;
+        // static_assert(NUM_PAGES == 6, "NUM_PAGES must be 6");
+        assert_6<NUM_PAGES> assert_6;
+
+        static constexpr bool TIMING_RECORD_ENABLED = false;
+
+        static constexpr bool GMEM_SPIN_LOOP_SLEEP_NANOS = 20;
+
+        static constexpr int CONSUMER_REGISTERS = 104;
+        static constexpr int NON_CONSUMER_REGISTERS = 64;
+        };
 
     template <int _num_layers, int _hidden_dim, int _intermediate_dim, int _head_dim, int _num_attention_heads, int _num_kv_heads, int _kv_block_size, int _matvec_block_size, int _sm_count>
-    struct globals_t {
+    struct globals_t
+    {
 
         // constexpr static unsigned int num_layers = _num_layers;
         // constexpr static unsigned int matvec_block_size = _matvec_block_size;
@@ -87,10 +136,11 @@ namespace kittens::prototype::vm {
 
         // max attention partials == sm_count
         using attn_out_intermediates_t = gl<float, 1, num_attention_heads, -1, head_dim, sv_fl<head_dim>>;
-        using attn_lse_intermediates_t = gl<float, 1, 1, num_attention_heads, -1, sv_fl<((sm_count + 15) / 16) * 16>>;
+        using attn_lse_intermediates_t = gl<float, 1, 1, num_attention_heads, -1>;
+        // using attn_lse_intermediates_t = gl<float, 1, 1, num_attention_heads, -1, sv_fl<((sm_count + 15) / 16) * 16>>;
 
         // num_layers by 6 ops per layer by up to 48 heads (Q + K + V)
-        using barriers = gl<uint, 1, -1, 6, num_attention_heads + 2 * num_kv_heads>;
+        using barriers = gl<uint, 1, -1, -1, num_attention_heads + 2 * num_kv_heads>;
 
         // vm stuff
         barriers Bar;
@@ -143,10 +193,12 @@ namespace kittens::prototype::vm {
         LLAMA_1B_NUM_KV_HEADS,
         LLAMA_1B_KV_BLOCK_SIZE,
         LLAMA_1B_MATVEC_BLOCK_SIZE,
-#ifndef KITTENS_BLACKWELL
-        H100_SM_COUNT>
-#else
+#ifdef KITTENS_BLACKWELL
         B200_SM_COUNT>
+#elif defined(KITTENS_5090)
+        170>
+#else
+        H100_SM_COUNT>
 #endif
         llama_1b_globals;
 

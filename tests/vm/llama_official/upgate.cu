@@ -6,7 +6,6 @@ using namespace kittens::prototype;
 namespace kittens::prototype::vm {
 
     using globals = llama_1b_globals;
-    using config = default_config;
 
     template <typename Config, typename Globals>
     struct rms_upgate_silu {
@@ -105,7 +104,7 @@ namespace kittens::prototype::vm {
         };
 
         using pipeline = rms_matvec_pipeline<Config, Globals, parsed_instruction, pipeline_specifics, &Globals::hidden_states, &Globals::mlp_norm_weights>;
-        static_assert(pipeline::OUTPUT_PIPELINE_STAGES == 3);
+        // static_assert(pipeline::OUTPUT_PIPELINE_STAGES == 3);
 
         struct controller {
             static __device__ int release_lid(const Globals &g, typename Config::instruction_t &instruction, int &query) {
@@ -133,6 +132,7 @@ namespace kittens::prototype::vm {
 
         struct consumer {
             static __device__ void run(const Globals &g, state<Config> &s) {
+                printf("NUM_PAGES: %d\n", (int) config::NUM_PAGES);
                 pipeline::consumer_loop(s, g);
             }
         };

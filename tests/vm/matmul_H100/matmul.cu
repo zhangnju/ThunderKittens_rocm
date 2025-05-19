@@ -6,9 +6,9 @@ using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::vm;
 
-using a_tile = st_fp8e4m3<128, 128>;
+using a_tile = st_fp8e4m3<64, 128>;
 using b_tile = st_fp8e4m3<256, 128>;
-using c_tile = st_fp8e4m3<128, 256>;
+using c_tile = st_fp8e4m3<64, 256>;
 
 static constexpr int SM_COUNT = 132;
 
@@ -16,7 +16,7 @@ using config = default_config;
 struct globals {
     using instruction_layout = ::kittens::prototype::vm::instruction_layout<config>;
     using timing_layout = ::kittens::prototype::vm::timing_layout<config>;
-    using fp8_matrix = gl<fp8e4m3, 1, 1, -1, -1, a_tile, b_tile, c_tile>;
+    using fp8_matrix = gl<fp8e4m3, 1, -1, -1, -1, a_tile, b_tile, c_tile>;
     instruction_layout instructions;
     timing_layout timings;
     fp8_matrix A, B, C;
@@ -27,10 +27,12 @@ struct globals {
 
 template<typename config=config> struct MatmulOp {
     static constexpr int opcode = 1;
-    static constexpr int PIPELINE_STAGES = 3;
+    static constexpr int PIPELINE_STAGES = 4;
 
     static_assert(config::NUM_PAGES == 13);
     static_assert(config::PAGE_SIZE == 16384);
+    static_assert(PIPELINE_STAGES >= 2);
+    static_assert(config::NUM_CONSUMER_WARPS == 8);
     
     struct parsed_instruction {
         int row, col, iters;
@@ -48,86 +50,69 @@ template<typename config=config> struct MatmulOp {
         }
         __device__ inline parsed_instruction(state<config> &s): parsed_instruction(s.instruction()) {}
     };
-    static __device__ inline parsed_instruction parse_instruction(const globals &g, state<config> &s) {
-        return parsed_instruction{s.instruction()[1], s.instruction()[2], s.instruction()[3]};
+
+    __device__ static inline semaphore &inputs_arrived(state<config> &s, int stage) { return s.semaphores()[stage]; }
+    __device__ static inline semaphore &inputs_finished(state<config> &s, int stage) { return s.semaphores()[stage+PIPELINE_STAGES]; }
+    __device__ static inline semaphore &outputs_arrived(state<config> &s, int consumer_id) { return s.semaphores()[consumer_id+PIPELINE_STAGES*2]; }
+    __device__ static inline int get_a_page(state<config> &s, int stage) { return stage*3; }
+    __device__ static inline int get_b_page(state<config> &s, int stage) { return stage*3 + 1; }
+    __device__ static inline int get_store_page(state<config> &s, int consumer_id) {
+        return PIPELINE_STAGES*3 - consumer_id - 1; // use the last stage pages
     }
-    __device__ static inline semaphore &inputs_arrived(state<config> &s, int id) {
-        return s.semaphores()[id];
-    }
-    __device__ static inline semaphore &inputs_finished(state<config> &s, int id) {
-        return s.semaphores()[id+PIPELINE_STAGES];
-    }
-    __device__ static inline semaphore &outputs_arrived(state<config> &s, int id) {
-        return s.semaphores()[id+PIPELINE_STAGES*2];
-    }
-    __device__ static inline semaphore &outputs_shared(state<config> &s, int id) {
-        return s.semaphores()[id+PIPELINE_STAGES*2+2];
-    }
-    __device__ static inline int get_a_page(state<config> &s, int stage, int offset) {
-        return stage*4 + offset;
-    }
-    __device__ static inline int get_b_page(state<config> &s, int stage) {
-        return stage*4 + 2; // single mega page for b (32KB)
-    }
-    __device__ static inline int get_store_page(state<config> &s, parsed_instruction &inst, int offset) {
-        return ((inst.iters+2)%PIPELINE_STAGES)*4 + offset*2; // 32KB megapages
-    }
-    
+
     struct controller {
         static __device__ int release_lid(const globals &g, typename config::instruction_t &instruction, int &query) {
             return query;
         }
         static __device__ int init_semaphores(const globals &g, state<config> &s) {
             for(int i = 0; i < PIPELINE_STAGES; i++) {
-                init_semaphore(inputs_arrived(s, i), 1); // Inputs arrived.
-                init_semaphore(inputs_finished(s, i), 2); // Inputs finished.
+                init_semaphore(inputs_arrived(s, i), 1);
+                init_semaphore(inputs_finished(s, i), 2);
             }
             for(int i = 0; i < 2; i++) {
-                init_semaphore(outputs_arrived(s, i), 1); // outputs arrived.
-                init_semaphore(outputs_shared(s, i), 1); // outputs shared.
+                init_semaphore(outputs_arrived(s, i), 4);
             }
-            return 2*PIPELINE_STAGES + 4;
+            return 2*PIPELINE_STAGES + 2;
         }
     };
     struct loader {
         static __device__ void run(const globals &g, state<config> &s) {
-            // s.warp_finish_page(12, config::NUM_CONSUMER_WARPS); // Release the unused page immediately.
-            // parsed_instruction inst{s};
-            // uint32_t semaphore_bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
-            // int pipeline_stage = 0;
-            // for(int i = 0; i < inst.iters; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
-            //     wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
-            //     warp::tma::expect_bytes(inputs_arrived(s, pipeline_stage), sizeof(a_tile)*2 + sizeof(b_tile));
-            //     if(laneid() < 2) {
-            //         int a_page = get_a_page(s, pipeline_stage, laneid());
-            //         if(i < PIPELINE_STAGES) {
-            //             s.wait_page_ready(a_page);
-            //         }
-            //         a_tile &a = s.pages[a_page].template as_st<fp8e4m3>();
-            //         tma::load_async(a, g.A, {inst.row+laneid(), i}, inputs_arrived(s, pipeline_stage));
-            //     } else if (laneid() == 2) {
-            //         int b_page = get_b_page(s, pipeline_stage);
-            //         if(i < PIPELINE_STAGES) {
-            //             s.wait_page_ready(b_page);
-            //             s.wait_page_ready(b_page+1); // because b_page is a megapage
-            //         }
-            //         b_tile &b = *reinterpret_cast<b_tile *>(s.pages[b_page].data);
-            //         tma::load_async(b, g.B, {inst.col/2, i}, inputs_arrived(s, pipeline_stage));
-            //     }
-            //     update_phasebit<1>(semaphore_bitfield, pipeline_stage);
-            // }
-            // warp::sync();
-            // if(laneid() >= 28) {
-            //     for(int i = 0; i < PIPELINE_STAGES-1; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
-            //         wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
-            //         int release_pid = pipeline_stage*4 + laneid() - 28;
-            //         s.finish_page(release_pid, config::NUM_CONSUMER_WARPS);
-            //     }
-            // }
+            s.warp_finish_page(12, config::NUM_CONSUMER_WARPS); // Release the unused page immediately.
 
-            if (warp::laneid() < config::NUM_PAGES) {
-                s.wait_page_ready(warp::laneid());
-                s.finish_page(warp::laneid(), config::NUM_CONSUMER_WARPS);
+            parsed_instruction inst{s};
+            int laneid = warp::laneid();
+
+            int pipeline_stage = 0;
+            uint32_t semaphore_bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
+            for (int i = 0; i < inst.iters; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
+                wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
+                warp::tma::expect_bytes(inputs_arrived(s, pipeline_stage), sizeof(a_tile)*2 + sizeof(b_tile));
+                if (laneid < 2) {
+                    int a_page = get_a_page(s, pipeline_stage);
+                    if (i < PIPELINE_STAGES) {
+                        s.wait_page_ready(a_page);
+                    }
+                    a_tile &a = *reinterpret_cast<a_tile *>((uint8_t *)s.pages[a_page].data + sizeof(a_tile) * laneid);
+                    tma::load_async(a, g.A, {inst.row + laneid, i}, inputs_arrived(s, pipeline_stage));
+                } else if (laneid == 2) {
+                    int b_page = get_b_page(s, pipeline_stage);
+                    if (i < PIPELINE_STAGES) {
+                        s.wait_page_ready(b_page);
+                        s.wait_page_ready(b_page + 1); // because b_page is a megapage
+                    }
+                    b_tile &b = *reinterpret_cast<b_tile *>(s.pages[b_page].data);
+                    tma::load_async(b, g.B, {inst.col / 2, i}, inputs_arrived(s, pipeline_stage));
+                }
+                update_phasebit<1>(semaphore_bitfield, pipeline_stage);
+            }
+            warp::sync();
+
+            for (int i = 0; i < PIPELINE_STAGES - 1; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
+                wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
+                if (laneid < 3) {
+                    int release_pid = pipeline_stage*3 + laneid;
+                    s.finish_page(release_pid, config::NUM_CONSUMER_WARPS);
+                }
             }
         }
     };
@@ -137,33 +122,50 @@ template<typename config=config> struct MatmulOp {
     struct consumer {
         static __device__ void run(const globals &g, state<config> &s) {
             parsed_instruction inst{s};
-            int groupid = warpgroup::groupid(); // 2 warpgroups
-            wait(outputs_arrived(s, groupid), 0);
-            // auto accumulator = s.tensor_alloc.template allocate<tt<float, 128, 256>>(groupid*256);
-            // c_tile &store_buffer = *reinterpret_cast<c_tile *>(s.pages[get_store_page(s, inst, groupid)].data);
-            // rt_fl<32, 256> acc_rt;
-            // rt_fp8e4m3<32, 256> acc_fp8;
-            // warpgroup::load_async(acc_rt, accumulator);
-            // warp::copy(acc_fp8, acc_rt);
-            // warpgroup::store(store_buffer, acc_fp8);
-            warpgroup::sync(groupid);
-            warpgroup::arrive(outputs_shared(s, groupid));
+            int laneid = warpgroup::laneid();
+            int warpid = warpgroup::warpid();
+            int groupid = warpgroup::groupid();
+
+            int pipeline_stage = 0;
+            uint32_t semaphore_bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
+            for (int i = 0; i < inst.iters; i++, update_phasebit<0>(semaphore_bitfield, pipeline_stage), pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
+                wait(inputs_arrived(s, pipeline_stage), get_phasebit<0>(semaphore_bitfield, pipeline_stage));
+                warpgroup::arrive(inputs_finished(s, pipeline_stage));
+                // wait(outputs_arrived(s, groupid), 0);
+                // auto accumulator = s.tensor_alloc.template allocate<tt<float, 128, 256>>(groupid*256);
+                // c_tile &store_buffer = *reinterpret_cast<c_tile *>(s.pages[get_store_page(s, inst, groupid)].data);
+                // rt_fl<32, 256> acc_rt;
+                // rt_fp8e4m3<32, 256> acc_fp8;
+                // warpgroup::load_async(acc_rt, accumulator);
+                // warp::copy(acc_fp8, acc_rt);
+                // warpgroup::store(store_buffer, acc_fp8);
+            }
+
+            __syncwarp();
+            warp::arrive(outputs_arrived(s, groupid));
         }
     };
     struct storer {
         // Uses 4 full pages for outputs.
         static __device__ void run(const globals &g, state<config> &s) {
-            // parsed_instruction inst{s};
-            // if(laneid() < 2) {
-            //     wait(outputs_shared(s, laneid()), 0);
-            //     int store_page = get_store_page(s, inst, laneid());
-            //     c_tile &output = *reinterpret_cast<c_tile *>(s.pages[get_store_page(s, inst, laneid())].data);
-            //     tma::store_async(g.C, output, {inst.row+laneid(), inst.col/2});
-            //     tma::store_async_read_wait();
-            //     s.finish_page(store_page, config::NUM_CONSUMER_WARPS);
-            //     s.finish_page(store_page + 1, config::NUM_CONSUMER_WARPS); // because store_page is megapage
-            // }
-            // warp::sync();
+            parsed_instruction inst{s};
+            int laneid = warp::laneid();
+
+            if(laneid < 2) {
+                wait(outputs_arrived(s, laneid), 0);
+                // int store_page = get_store_page(s, inst, laneid());
+                // c_tile &output = *reinterpret_cast<c_tile *>(s.pages[get_store_page(s, inst, laneid())].data);
+                // tma::store_async(g.C, output, {inst.row+laneid(), inst.col/2});
+                // tma::store_async_read_wait();
+                // s.finish_page(store_page, config::NUM_CONSUMER_WARPS);
+                // s.finish_page(store_page + 1, config::NUM_CONSUMER_WARPS); // because store_page is megapage
+            }
+            warp::sync();
+
+            if (laneid < 3) {
+                int release_pid = (PIPELINE_STAGES-1)*3 + laneid;
+                s.finish_page(release_pid, config::NUM_CONSUMER_WARPS);
+            }
         }
     };
 };

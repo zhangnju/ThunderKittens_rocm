@@ -13,10 +13,13 @@ import time
 M, K, N = 4096, 4096, 4096
 
 SM_COUNT = 132
+M_BLOCK = 128
+K_BLOCK = 128
+N_BLOCK = 256
 
-if M%256 != 0: raise ValueError("M must be divisible by 256")
-if K%128 != 0: raise ValueError("K must be divisible by 128")
-if N%256 != 0: raise ValueError("N must be divisible by 256")
+if M%M_BLOCK != 0: raise ValueError("M must be divisible by 256")
+if K%K_BLOCK != 0: raise ValueError("K must be divisible by 128")
+if N%N_BLOCK != 0: raise ValueError("N must be divisible by 256")
 
 print("Starting test...")
 

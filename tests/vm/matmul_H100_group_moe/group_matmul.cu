@@ -13,7 +13,7 @@ constexpr int K_BLOCK = 128;
 
 using a_tile = st_fp8e4m3<M_BLOCK / 2, K_BLOCK>; // 2 consumer warpgroups
 using b_tile = st_fp8e4m3<N_BLOCK, K_BLOCK>;
-using c_tile = st_fp8e4m3<M_BLOCK / 2, N_BLOCK>;
+using c_tile = st_fl<M_BLOCK / 2, N_BLOCK>;
 
 static constexpr int SM_COUNT = 132;
 
@@ -74,16 +74,18 @@ struct config
 
     static constexpr bool GMEM_SPIN_LOOP_SLEEP_NANOS = 20;
 
-    static constexpr int CONSUMER_REGISTERS = 104;
+    static constexpr int CONSUMER_REGISTERS = 152;
     static constexpr int NON_CONSUMER_REGISTERS = 64;
 };
 
 struct globals {
     using instruction_layout = ::kittens::prototype::vm::instruction_layout<config>;
     using timing_layout = ::kittens::prototype::vm::timing_layout<config>;
-    using fp8_matrix = gl<fp8e4m3, 1, -1, -1, -1, a_tile, b_tile, c_tile>;
+    using fp8_matrix = gl<fp8e4m3, 1, -1, -1, -1, a_tile, b_tile>;
+    using fl_matrix = gl<float, 1, -1, -1, -1, c_tile>;
     instruction_layout instructions;
-    fp8_matrix A, B, C;
+    fp8_matrix A, B;
+    fl_matrix C;
     dim3 grid() { return dim3(SM_COUNT); }
     dim3 block() { return dim3(config::NUM_THREADS); }
     int dynamic_shared_memory() { return config::DYNAMIC_SHARED_MEMORY; }
@@ -99,7 +101,7 @@ template<typename config=config> struct GroupMatmulOp {
     static_assert(config::NUM_CONSUMER_WARPS == 8);
     static_assert(sizeof(a_tile) == config::PAGE_SIZE / 2);
     static_assert(sizeof(b_tile) == config::PAGE_SIZE * 2);
-    static_assert(sizeof(c_tile) == config::PAGE_SIZE);
+    static_assert(sizeof(c_tile) == config::PAGE_SIZE * 4);
     
     struct parsed_instruction {
         int group_id, row, col, red_start, red_end;
@@ -127,8 +129,11 @@ template<typename config=config> struct GroupMatmulOp {
     __device__ static inline semaphore &outputs_arrived(state<config> &s, int consumer_id) { return s.semaphores()[consumer_id+PIPELINE_STAGES*2]; }
     __device__ static inline int get_a_page(state<config> &s, int stage) { return stage*3; }
     __device__ static inline int get_b_page(state<config> &s, int stage) { return stage*3 + 1; }
-    __device__ static inline int get_store_page(state<config> &s, int consumer_id) {
-        return (PIPELINE_STAGES-1)*3 + consumer_id; // use 2 pages from the last stage
+    __device__ static inline int get_store_page(state<config> &s, int consumer_id) { 
+        if (consumer_id == 0)
+            return 5; // 5, 6, 7, 8 
+        else
+            return 9; // 9, 10, 11, 12
     }
 
     struct controller {
@@ -150,11 +155,6 @@ template<typename config=config> struct GroupMatmulOp {
         static __device__ void run(const globals &g, state<config> &s) {
             parsed_instruction inst{s};
             int laneid = warp::laneid();
-
-            if (laneid >= PIPELINE_STAGES*3 && laneid < config::NUM_PAGES) {
-                s.wait_page_ready(laneid);
-                s.finish_page(laneid, config::NUM_CONSUMER_WARPS); // release unused pages immediately
-            }
 
             int pipeline_stage = 0;
             uint32_t semaphore_bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
@@ -184,9 +184,9 @@ template<typename config=config> struct GroupMatmulOp {
 
             for (int i = 0; i < PIPELINE_STAGES; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
                 wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
-                if ((laneid < 3 && pipeline_stage < PIPELINE_STAGES - 1) || (laneid == 2 && pipeline_stage == PIPELINE_STAGES - 1)) {
+                if (laneid < 3) {
                     int release_pid = pipeline_stage*3 + laneid;
-                    s.finish_page(release_pid, config::NUM_CONSUMER_WARPS);
+                    if (release_pid < 5) s.finish_page(release_pid, config::NUM_CONSUMER_WARPS);
                 }
             }
         }
@@ -217,13 +217,10 @@ template<typename config=config> struct GroupMatmulOp {
                 warpgroup::arrive(inputs_finished(s, pipeline_stage));
             }
 
-            rt_fp8e4m3<M_BLOCK / config::NUM_CONSUMER_WARPS, N_BLOCK> acc_fp8;
-            warp::copy(acc_fp8, acc_fl);
-
             int store_page = get_store_page(s, groupid);
             c_tile &store_buffer = *reinterpret_cast<c_tile *>(s.pages[store_page].data);
             group<config::NUM_CONSUMER_WARPS>::sync(1); // must sync as we reuse the pages from the last stage
-            warpgroup::store(store_buffer, acc_fp8);
+            warpgroup::store(store_buffer, acc_fl);
             __syncwarp();
             warp::arrive(outputs_arrived(s, groupid));
         }
@@ -242,9 +239,9 @@ template<typename config=config> struct GroupMatmulOp {
             __syncwarp();
             if (laneid == 0) tma::store_async_read_wait();
             __syncwarp();
-            if (laneid < 2) {
-                int store_page = get_store_page(s, laneid);
-                s.finish_page(store_page, config::NUM_CONSUMER_WARPS);
+            if (laneid < 8) {
+                int store_page = get_store_page(s, laneid / 4);
+                s.finish_page(store_page + (laneid % 4), config::NUM_CONSUMER_WARPS);
             }
         }
     };
@@ -315,14 +312,13 @@ PYBIND11_MODULE(group_matmul, m) {
         int *instructions_dev;
         cudaMalloc(&instructions_dev, SM_COUNT * num_instructions_per_sm * config::INSTRUCTION_WIDTH * sizeof(int));
         cudaMemcpy(instructions_dev, instructions_host, SM_COUNT * num_instructions_per_sm * config::INSTRUCTION_WIDTH * sizeof(int), cudaMemcpyHostToDevice);
-        delete[] instructions_host;
         typename globals::instruction_layout instructions_g{instructions_dev, nullptr, (unsigned long)SM_COUNT, (unsigned long)num_instructions_per_sm, nullptr};
 
         globals __g__{
             instructions_g,
             py::from_object<typename globals::fp8_matrix>::make(A),
             py::from_object<typename globals::fp8_matrix>::make(B),
-            py::from_object<typename globals::fp8_matrix>::make(C)
+            py::from_object<typename globals::fl_matrix>::make(C)
         };
 
         cudaStream_t raw_stream = nullptr;
@@ -334,5 +330,7 @@ PYBIND11_MODULE(group_matmul, m) {
         int __dynamic_shared_memory__ = (int)__g__.dynamic_shared_memory();
         cudaFuncSetAttribute(kvm<config, globals, GroupMatmulOp<config>>, cudaFuncAttributeMaxDynamicSharedMemorySize, __dynamic_shared_memory__);
         kvm<config, globals, GroupMatmulOp<config>><<<__g__.grid(), __g__.block(), __dynamic_shared_memory__, raw_stream>>>(__g__);
+        
+        delete[] instructions_host;
     });
 }

@@ -28,8 +28,8 @@ if N%N_BLOCK != 0: raise ValueError(f'N must be divisible by {N_BLOCK}')
 # Create input and output tensors
 print('Starting test...')
 torch.manual_seed(1)
-A = (torch.randn((NUM_EP, M, K), device=0, dtype=torch.float32) / K**.25).to(torch.float8_e4m3fn)
-B = (torch.randn((NUM_EP, N, K), device=0, dtype=torch.float32) / K**.25).to(torch.float8_e4m3fn)
+A = (torch.randn((NUM_EP, M, K), device=0, dtype=torch.bfloat16) / K**.25).to(torch.float8_e4m3fn)
+B = (torch.randn((NUM_EP, N, K), device=0, dtype=torch.bfloat16) / K**.25).to(torch.float8_e4m3fn)
 C = torch.zeros((NUM_EP, M, N), device=0, dtype=torch.float8_e4m3fn)
 print('Input tensors created')
 print('A shapes:', A.shape)
@@ -48,7 +48,7 @@ for group_id in range(NUM_EP):
                 row = row_start + row_inner
                 if row >= M // M_BLOCK:
                     break
-                instructions[instruction_idx%SM_COUNT].append([OPCODE, group_id, row, col, 0, num_iters] + [0]*(INSTRUCTION_WIDTH-5))
+                instructions[instruction_idx%SM_COUNT].append([OPCODE, group_id, row, col, 0, num_iters] + [0]*(INSTRUCTION_WIDTH-6))
                 instruction_idx += 1
 
 # Pad instructions

@@ -118,6 +118,7 @@ template<typename config=config> struct GroupMatmulOp {
             for (int i = 0; i < inst.num_iters; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
                 wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
                 warp::tma::expect_bytes(inputs_arrived(s, pipeline_stage), sizeof(a_tile)*2 + sizeof(b_tile));
+                __syncwarp(); // none-0 lanes must wait for the tma::expect_bytes to complete
                 if (laneid < 2) {
                     int a_page = get_a_page(s, pipeline_stage);
                     if (i < PIPELINE_STAGES) {
@@ -178,6 +179,7 @@ template<typename config=config> struct GroupMatmulOp {
 
             int store_page = get_store_page(s, groupid);
             c_tile &store_buffer = *reinterpret_cast<c_tile *>(s.pages[store_page].data);
+            group<config::NUM_CONSUMER_WARPS>::sync(1); // must sync as we reuse the pages from the last stage
             warpgroup::store(store_buffer, acc_fp8);
             __syncwarp();
             warp::arrive(outputs_arrived(s, groupid));
@@ -193,7 +195,12 @@ template<typename config=config> struct GroupMatmulOp {
                 int store_page = get_store_page(s, laneid);
                 c_tile &store_buffer = *reinterpret_cast<c_tile *>(s.pages[store_page].data);
                 tma::store_async(g.C[inst.group_id], store_buffer, {inst.row*2 + laneid, inst.col});
-                tma::store_async_read_wait();
+            }
+            __syncwarp();
+            if (laneid == 0) tma::store_async_read_wait();
+            __syncwarp();
+            if (laneid < 2) {
+                int store_page = get_store_page(s, laneid);
                 s.finish_page(store_page, config::NUM_CONSUMER_WARPS);
             }
         }

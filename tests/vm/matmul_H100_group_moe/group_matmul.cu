@@ -8,7 +8,7 @@ using namespace kittens::prototype;
 using namespace kittens::prototype::vm;
 
 constexpr int M_BLOCK = 128;
-constexpr int N_BLOCK = 256;
+constexpr int N_BLOCK = 128;
 constexpr int K_BLOCK = 128;
 
 using a_tile = st_fp8e4m3<M_BLOCK / 2, K_BLOCK>; // 2 consumer warpgroups
@@ -74,8 +74,8 @@ struct config
 
     static constexpr bool GMEM_SPIN_LOOP_SLEEP_NANOS = 20;
 
-    static constexpr int CONSUMER_REGISTERS = 152;
-    static constexpr int NON_CONSUMER_REGISTERS = 64;
+    static constexpr int CONSUMER_REGISTERS = 104;
+    static constexpr int NON_CONSUMER_REGISTERS = 96;
 };
 
 struct globals {
@@ -100,8 +100,8 @@ template<typename config=config> struct GroupMatmulOp {
     static_assert(PIPELINE_STAGES >= 2);
     static_assert(config::NUM_CONSUMER_WARPS == 8);
     static_assert(sizeof(a_tile) == config::PAGE_SIZE / 2);
-    static_assert(sizeof(b_tile) == config::PAGE_SIZE * 2);
-    static_assert(sizeof(c_tile) == config::PAGE_SIZE * 4);
+    static_assert(sizeof(b_tile) <= config::PAGE_SIZE * 2);
+    static_assert(sizeof(c_tile) <= config::PAGE_SIZE * 4);
     
     struct parsed_instruction {
         int group_id, row, col, red_start, red_end;
@@ -127,13 +127,13 @@ template<typename config=config> struct GroupMatmulOp {
     __device__ static inline semaphore &inputs_arrived(state<config> &s, int stage) { return s.semaphores()[stage]; }
     __device__ static inline semaphore &inputs_finished(state<config> &s, int stage) { return s.semaphores()[stage+PIPELINE_STAGES]; }
     __device__ static inline semaphore &outputs_arrived(state<config> &s, int consumer_id) { return s.semaphores()[consumer_id+PIPELINE_STAGES*2]; }
-    __device__ static inline int get_a_page(state<config> &s, int stage) { return stage*3; }
-    __device__ static inline int get_b_page(state<config> &s, int stage) { return stage*3 + 1; }
+    __device__ static inline int get_a_page(state<config> &s, int stage) { return stage*2 + 0; }
+    __device__ static inline int get_b_page(state<config> &s, int stage) { return stage*2 + 1; }
     __device__ static inline int get_store_page(state<config> &s, int consumer_id) { 
         if (consumer_id == 0)
-            return 5; // 5, 6, 7, 8 
+            return 8; // 8, 9
         else
-            return 9; // 9, 10, 11, 12
+            return 10; // 10, 11
     }
 
     struct controller {
@@ -173,7 +173,6 @@ template<typename config=config> struct GroupMatmulOp {
                     int b_page = get_b_page(s, pipeline_stage);
                     if (i < PIPELINE_STAGES) {
                         s.wait_page_ready(b_page);
-                        s.wait_page_ready(b_page + 1); // because b_page is a megapage
                     }
                     b_tile &b = *reinterpret_cast<b_tile *>(s.pages[b_page].data);
                     tma::load_async(b, g.B, {inst.col, i + inst.red_start}, inputs_arrived(s, pipeline_stage));
@@ -184,10 +183,15 @@ template<typename config=config> struct GroupMatmulOp {
 
             for (int i = 0; i < PIPELINE_STAGES; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
                 wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
-                if (laneid < 3) {
-                    int release_pid = pipeline_stage*3 + laneid;
-                    if (release_pid < 5) s.finish_page(release_pid, config::NUM_CONSUMER_WARPS);
+                if (laneid < 2) {
+                    int release_pid = pipeline_stage*2 + laneid;
+                    s.finish_page(release_pid, config::NUM_CONSUMER_WARPS);
                 }
+            }
+
+            if (laneid == 0) { // Release unused page (no need to do this first as we are relying on physical page IDs)
+                s.wait_page_ready(12);
+                s.finish_page(12, config::NUM_CONSUMER_WARPS);
             }
         }
     };
@@ -239,9 +243,9 @@ template<typename config=config> struct GroupMatmulOp {
             __syncwarp();
             if (laneid == 0) tma::store_async_read_wait();
             __syncwarp();
-            if (laneid < 8) {
-                int store_page = get_store_page(s, laneid / 4);
-                s.finish_page(store_page + (laneid % 4), config::NUM_CONSUMER_WARPS);
+            if (laneid < 4) {
+                int store_page = get_store_page(s, laneid / 2);
+                s.finish_page(store_page + (laneid % 2), config::NUM_CONSUMER_WARPS);
             }
         }
     };

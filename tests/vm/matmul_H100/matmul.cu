@@ -181,11 +181,28 @@ template<typename config=config> struct MatmulOp {
 
 PYBIND11_MODULE(matmul, m) {
     m.doc() = "matmul python module";
-    kittens::py::bind_kernel<kvm<config, globals, MatmulOp<config>>>(m, "matmul",
-        &globals::instructions,
-        &globals::timings,
-        &globals::A,
-        &globals::B,
-        &globals::C
-    );
+    m.def("matmul", [](
+        pybind11::object instructions,
+        pybind11::object timings,
+        pybind11::object A,
+        pybind11::object B,
+        pybind11::object C,
+        pybind11::kwargs kwargs
+    ) {
+        globals __g__{
+            py::from_object<typename globals::instruction_layout>::make(instructions),
+            py::from_object<typename globals::timing_layout>::make(timings),
+            py::from_object<typename globals::fp8_matrix>::make(A),
+            py::from_object<typename globals::fp8_matrix>::make(B),
+            py::from_object<typename globals::fp8_matrix>::make(C)
+        };
+        cudaStream_t raw_stream = nullptr;
+        if (kwargs.contains("stream")) {
+            uintptr_t stream_ptr = kwargs["stream"].attr("cuda_stream").cast<uintptr_t>();
+            raw_stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+        }
+        int __dynamic_shared_memory__ = (int)__g__.dynamic_shared_memory();
+        cudaFuncSetAttribute(kvm<config, globals, MatmulOp<config>>, cudaFuncAttributeMaxDynamicSharedMemorySize, __dynamic_shared_memory__);
+        kvm<config, globals, MatmulOp<config>><<<__g__.grid(), __g__.block(), __dynamic_shared_memory__, raw_stream>>>(__g__);
+    });
 }

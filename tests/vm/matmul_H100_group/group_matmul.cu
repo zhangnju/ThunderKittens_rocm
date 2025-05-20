@@ -56,6 +56,9 @@ template<typename config=config> struct GroupMatmulOp {
     static_assert(config::PAGE_SIZE == 16384);
     static_assert(PIPELINE_STAGES >= 2);
     static_assert(config::NUM_CONSUMER_WARPS == 8);
+    static_assert(sizeof(a_tile) == config::PAGE_SIZE / 2);
+    static_assert(sizeof(b_tile) == config::PAGE_SIZE * 2);
+    static_assert(sizeof(c_tile) == config::PAGE_SIZE);
     
     struct parsed_instruction {
         int group_id, row, col, num_iters;
@@ -193,7 +196,6 @@ template<typename config=config> struct GroupMatmulOp {
                 tma::store_async_read_wait();
                 s.finish_page(store_page, config::NUM_CONSUMER_WARPS);
             }
-            warp::sync();
         }
     };
 };

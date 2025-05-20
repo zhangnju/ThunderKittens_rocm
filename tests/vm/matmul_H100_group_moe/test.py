@@ -27,16 +27,24 @@ if N%N_BLOCK != 0: raise ValueError(f'N must be divisible by {N_BLOCK}')
 # Create input and output tensors
 print('Starting test...')
 torch.manual_seed(1)
-A = (torch.randn((M, K), device=0, dtype=torch.float32) / K**.25).to(torch.float8_e4m3fn)
-A_scale = torch.randn((M//SCALE_BLOCK, K), device=0, dtype=torch.float32)
-B = (torch.randn((N, K), device=0, dtype=torch.float32) / K**.25).to(torch.float8_e4m3fn)
-B_scale = torch.randn((N//SCALE_BLOCK, K), device=0, dtype=torch.float32)
+A = (torch.randn((M, K), device=0, dtype=torch.float32) / K**.25)
+A_blocks = A.view(M, K//SCALE_BLOCK, SCALE_BLOCK)
+A_scale = A_blocks.abs().max(dim=2)[0]  # Max absolute value per block
+A_scale = torch.clamp(A_scale, min=1e-8) # Avoid division by zero
+A_fp8 = (A / A_scale.repeat_interleave(SCALE_BLOCK, dim=1)).to(dtype=torch.float8_e4m3fn)
+B = (torch.randn((N, K), device=0, dtype=torch.float32) / K**.25)
+B_blocks = B.view(N, K//SCALE_BLOCK, SCALE_BLOCK)
+B_scale = B_blocks.abs().max(dim=2)[0]  # Max absolute value per block
+B_scale = torch.clamp(B_scale, min=1e-8) # Avoid division by zero
+B_fp8 = (B / B_scale.repeat_interleave(SCALE_BLOCK, dim=1)).to(dtype=torch.float8_e4m3fn)
 C = torch.zeros((NUM_EP, M, N), device=0, dtype=torch.float32)
 tokens_per_ep = torch.zeros((NUM_EP,), device=0, dtype=torch.int32)
 print('Input tensors created')
 print('A shape:', A.shape)
+print('A_fp8 shape:', A_fp8.shape)
 print('A_scale shape:', A_scale.shape)
 print('B shape:', B.shape)
+print('B_fp8 shape:', B_fp8.shape)
 print('B_scale shape:', B_scale.shape)
 print('C shape:', C.shape)
 print('tokens_per_ep shape:', tokens_per_ep.shape)
@@ -51,18 +59,18 @@ print('tokens_per_ep:', tokens_per_ep)
 
 # Run the group_matmul kernel
 print('Launching kernel...')
-group_matmul(A, A_scale, B, B_scale, C, tokens_per_ep)
+group_matmul(A_fp8, A_scale, B_fp8, B_scale, C, tokens_per_ep)
 torch.cuda.synchronize()
 
 print('Starting timing loop...')
 for i in range(NUM_WARMUP_ITERS):
-    group_matmul(A, A_scale, B, B_scale, C, tokens_per_ep)
+    group_matmul(A_fp8, A_scale, B_fp8, B_scale, C, tokens_per_ep)
     torch.cuda.synchronize()
 start_event = torch.cuda.Event(enable_timing=True)
 end_event = torch.cuda.Event(enable_timing=True)
 start_event.record()
 for i in range(NUM_ITERS):
-    group_matmul(A, A_scale, B, B_scale, C, tokens_per_ep)
+    group_matmul(A_fp8, A_scale, B_fp8, B_scale, C, tokens_per_ep)
     torch.cuda.synchronize()
 end_event.record()
 torch.cuda.synchronize()

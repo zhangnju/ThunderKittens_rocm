@@ -15,6 +15,8 @@ constexpr int SCALE_BLOCK = 128;
 using a_tile = st_fp8e4m3<M_BLOCK / 2, K_BLOCK>; // 2 consumer warpgroups
 using b_tile = st_fp8e4m3<N_BLOCK, K_BLOCK>;
 using c_tile = st_fl<M_BLOCK / 2, N_BLOCK>;
+using a_scale_vec = col_vec<st_fl<M_BLOCK, K_BLOCK>>;
+using b_scale_vec = row_vec<st_fl<K_BLOCK, N_BLOCK>/* Transposed */>;
 
 static constexpr int SM_COUNT = 132;
 
@@ -83,7 +85,7 @@ struct globals {
     using instruction_layout = ::kittens::prototype::vm::instruction_layout<config>;
     using timing_layout = ::kittens::prototype::vm::timing_layout<config>;
     using fp8_matrix = gl<fp8e4m3, 1, 1, -1, -1, a_tile, b_tile>;
-    using fp8_scale = gl<float, 1, 1, -1, -1>;
+    using fp8_scale = gl<float, 1, 1, -1, -1, a_scale_vec, b_scale_vec>;
     using fl_matrix = gl<float, 1, -1, -1, -1, c_tile>;
     instruction_layout instructions;
     fp8_matrix A;
@@ -272,16 +274,16 @@ PYBIND11_MODULE(group_matmul, m) {
         int K = pybind11::cast<int>(py_shape[1]);
 
         py_shape = A_scale.attr("shape").cast<pybind11::tuple>();
-        if (pybind11::cast<int>(py_shape[0]) != M / SCALE_BLOCK) throw std::runtime_error("M dimension mismatch on A_scale (must be blocks of " + std::to_string(SCALE_BLOCK) + ")");
-        if (pybind11::cast<int>(py_shape[1]) != K) throw std::runtime_error("Reduction dimension mismatch on A_scale");
+        if (pybind11::cast<int>(py_shape[0]) != M) throw std::runtime_error("M dimension mismatch on A_scale");
+        if (pybind11::cast<int>(py_shape[1]) != K / SCALE_BLOCK) throw std::runtime_error("Reduction dimension mismatch on A_scale (must be divisible by " + std::to_string(SCALE_BLOCK) + ")");
 
         py_shape = B.attr("shape").cast<pybind11::tuple>();
         int N = pybind11::cast<int>(py_shape[0]);
         if (pybind11::cast<int>(py_shape[1]) != K) throw std::runtime_error("Reduction dimension mismatch on B");
 
         py_shape = B_scale.attr("shape").cast<pybind11::tuple>();
-        if (pybind11::cast<int>(py_shape[0]) != N / SCALE_BLOCK) throw std::runtime_error("N dimension mismatch on B_scale (must be blocks of " + std::to_string(SCALE_BLOCK) + ")");
-        if (pybind11::cast<int>(py_shape[1]) != K) throw std::runtime_error("Reduction dimension mismatch on B_scale");
+        if (pybind11::cast<int>(py_shape[0]) != N) throw std::runtime_error("N dimension mismatch on B_scale");
+        if (pybind11::cast<int>(py_shape[1]) != K / SCALE_BLOCK) throw std::runtime_error("Reduction dimension mismatch on B_scale (must be divisible by " + std::to_string(SCALE_BLOCK) + ")");
 
         py_shape = C.attr("shape").cast<pybind11::tuple>();
         int num_ep = pybind11::cast<int>(py_shape[0]);

@@ -27,8 +27,8 @@ if N%N_BLOCK != 0: raise ValueError(f'N must be divisible by {N_BLOCK}')
 # Create input and output tensors
 print('Starting test...')
 torch.manual_seed(1)
-A = (torch.randn((NUM_EP, M, K), device=0, dtype=torch.bfloat16) / K**.25).to(torch.float8_e4m3fn)
-B = (torch.randn((NUM_EP, N, K), device=0, dtype=torch.bfloat16) / K**.25).to(torch.float8_e4m3fn)
+A = (torch.randn((M, K), device=0, dtype=torch.bfloat16) / K**.25).to(torch.float8_e4m3fn)
+B = (torch.randn((N, K), device=0, dtype=torch.bfloat16) / K**.25).to(torch.float8_e4m3fn)
 C = torch.zeros((NUM_EP, M, N), device=0, dtype=torch.float32)
 tokens_per_ep = torch.zeros((NUM_EP,), device=0, dtype=torch.int32)
 print('Input tensors created')
@@ -75,8 +75,8 @@ token_index = 0
 for group_id in range(NUM_EP):
     C_impl = C[group_id].cpu().numpy()
     C_ref = (
-        A[group_id, :, token_index:token_index+tokens_per_ep[group_id]].to(torch.float16) @ 
-        B[group_id, :, token_index:token_index+tokens_per_ep[group_id]].to(torch.float16).T
+        A[:, token_index:token_index+tokens_per_ep[group_id]].to(torch.float16) @ 
+        B[:, token_index:token_index+tokens_per_ep[group_id]].to(torch.float16).T
     ).to(torch.float32).cpu().numpy()
     token_index += tokens_per_ep[group_id]
     assert C_impl.shape == C_ref.shape

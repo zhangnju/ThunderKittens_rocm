@@ -81,7 +81,7 @@ struct config
 struct globals {
     using instruction_layout = ::kittens::prototype::vm::instruction_layout<config>;
     using timing_layout = ::kittens::prototype::vm::timing_layout<config>;
-    using fp8_matrix = gl<fp8e4m3, 1, -1, -1, -1, a_tile, b_tile>;
+    using fp8_matrix = gl<fp8e4m3, 1, 1, -1, -1, a_tile, b_tile>;
     using fl_matrix = gl<float, 1, -1, -1, -1, c_tile>;
     instruction_layout instructions;
     fp8_matrix A, B;
@@ -168,7 +168,7 @@ template<typename config=config> struct GroupMatmulOp {
                         s.wait_page_ready(a_page);
                     }
                     a_tile &a = *reinterpret_cast<a_tile *>((uint8_t *)s.pages[a_page].data + sizeof(a_tile) * laneid);
-                    tma::load_async(a, g.A, {inst.group_id, inst.row*2 + laneid, i + inst.red_start}, inputs_arrived(s, pipeline_stage));
+                    tma::load_async(a, g.A, {inst.row*2 + laneid, i + inst.red_start}, inputs_arrived(s, pipeline_stage));
                 } else if (laneid == 2) {
                     int b_page = get_b_page(s, pipeline_stage);
                     if (i < PIPELINE_STAGES) {
@@ -176,7 +176,7 @@ template<typename config=config> struct GroupMatmulOp {
                         s.wait_page_ready(b_page + 1); // because b_page is a megapage
                     }
                     b_tile &b = *reinterpret_cast<b_tile *>(s.pages[b_page].data);
-                    tma::load_async(b, g.B, {inst.group_id, inst.col, i + inst.red_start}, inputs_arrived(s, pipeline_stage));
+                    tma::load_async(b, g.B, {inst.col, i + inst.red_start}, inputs_arrived(s, pipeline_stage));
                 }
                 update_phasebit<1>(semaphore_bitfield, pipeline_stage);
             }
@@ -257,17 +257,15 @@ PYBIND11_MODULE(group_matmul, m) {
         pybind11::kwargs kwargs
     ) {
         auto py_shape = A.attr("shape").cast<pybind11::tuple>();
-        int num_ep = pybind11::cast<int>(py_shape[0]);
-        int M = pybind11::cast<int>(py_shape[1]);
-        int K = pybind11::cast<int>(py_shape[2]);
+        int M = pybind11::cast<int>(py_shape[0]);
+        int K = pybind11::cast<int>(py_shape[1]);
 
         py_shape = B.attr("shape").cast<pybind11::tuple>();
-        int N = pybind11::cast<int>(py_shape[1]);
-        if (pybind11::cast<int>(py_shape[0]) != num_ep) throw std::runtime_error("Expert dimension mismatch on B");
-        if (pybind11::cast<int>(py_shape[2]) != K) throw std::runtime_error("Reduction dimension mismatch on B");
+        int N = pybind11::cast<int>(py_shape[0]);
+        if (pybind11::cast<int>(py_shape[1]) != K) throw std::runtime_error("Reduction dimension mismatch on B");
 
         py_shape = C.attr("shape").cast<pybind11::tuple>();
-        if (pybind11::cast<int>(py_shape[0]) != num_ep) throw std::runtime_error("Expert dimension mismatch on C");
+        int num_ep = pybind11::cast<int>(py_shape[0]);
         if (pybind11::cast<int>(py_shape[1]) != M) throw std::runtime_error("Row dimension mismatch on C");
         if (pybind11::cast<int>(py_shape[2]) != N) throw std::runtime_error("Column dimension mismatch on C");
 

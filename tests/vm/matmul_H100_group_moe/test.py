@@ -18,7 +18,7 @@ NUM_WARMUP_ITERS = 3
 M_BLOCK = 128
 K_BLOCK = 128
 N_BLOCK = 256
-SUPER_M = 1024 # for better L2 cache utilization
+SCALE_BLOCK = 128
 
 if M%M_BLOCK != 0: raise ValueError(f'M must be divisible by {M_BLOCK}')
 if K%K_BLOCK != 0: raise ValueError(f'K must be divisible by {K_BLOCK}')
@@ -27,13 +27,17 @@ if N%N_BLOCK != 0: raise ValueError(f'N must be divisible by {N_BLOCK}')
 # Create input and output tensors
 print('Starting test...')
 torch.manual_seed(1)
-A = (torch.randn((M, K), device=0, dtype=torch.bfloat16) / K**.25).to(torch.float8_e4m3fn)
-B = (torch.randn((N, K), device=0, dtype=torch.bfloat16) / K**.25).to(torch.float8_e4m3fn)
+A = (torch.randn((M, K), device=0, dtype=torch.float32) / K**.25).to(torch.float8_e4m3fn)
+A_scale = torch.randn((M//SCALE_BLOCK, K), device=0, dtype=torch.float32)
+B = (torch.randn((N, K), device=0, dtype=torch.float32) / K**.25).to(torch.float8_e4m3fn)
+B_scale = torch.randn((N//SCALE_BLOCK, K), device=0, dtype=torch.float32)
 C = torch.zeros((NUM_EP, M, N), device=0, dtype=torch.float32)
 tokens_per_ep = torch.zeros((NUM_EP,), device=0, dtype=torch.int32)
 print('Input tensors created')
 print('A shape:', A.shape)
+print('A_scale shape:', A_scale.shape)
 print('B shape:', B.shape)
+print('B_scale shape:', B_scale.shape)
 print('C shape:', C.shape)
 print('tokens_per_ep shape:', tokens_per_ep.shape)
 
@@ -47,18 +51,18 @@ print('tokens_per_ep:', tokens_per_ep)
 
 # Run the group_matmul kernel
 print('Launching kernel...')
-group_matmul(A, B, C, tokens_per_ep)
+group_matmul(A, A_scale, B, B_scale, C, tokens_per_ep)
 torch.cuda.synchronize()
 
 print('Starting timing loop...')
 for i in range(NUM_WARMUP_ITERS):
-    group_matmul(A, B, C, tokens_per_ep)
+    group_matmul(A, A_scale, B, B_scale, C, tokens_per_ep)
     torch.cuda.synchronize()
 start_event = torch.cuda.Event(enable_timing=True)
 end_event = torch.cuda.Event(enable_timing=True)
 start_event.record()
 for i in range(NUM_ITERS):
-    group_matmul(A, B, C, tokens_per_ep)
+    group_matmul(A, A_scale, B, B_scale, C, tokens_per_ep)
     torch.cuda.synchronize()
 end_event.record()
 torch.cuda.synchronize()

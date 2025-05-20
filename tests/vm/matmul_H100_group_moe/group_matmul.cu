@@ -10,6 +10,7 @@ using namespace kittens::prototype::vm;
 constexpr int M_BLOCK = 128;
 constexpr int N_BLOCK = 128;
 constexpr int K_BLOCK = 128;
+constexpr int SCALE_BLOCK = 128;
 
 using a_tile = st_fp8e4m3<M_BLOCK / 2, K_BLOCK>; // 2 consumer warpgroups
 using b_tile = st_fp8e4m3<N_BLOCK, K_BLOCK>;
@@ -82,9 +83,13 @@ struct globals {
     using instruction_layout = ::kittens::prototype::vm::instruction_layout<config>;
     using timing_layout = ::kittens::prototype::vm::timing_layout<config>;
     using fp8_matrix = gl<fp8e4m3, 1, 1, -1, -1, a_tile, b_tile>;
+    using fp8_scale = gl<float, 1, 1, -1, -1>;
     using fl_matrix = gl<float, 1, -1, -1, -1, c_tile>;
     instruction_layout instructions;
-    fp8_matrix A, B;
+    fp8_matrix A;
+    fp8_scale A_scale;
+    fp8_matrix B;
+    fp8_scale B_scale;
     fl_matrix C;
     dim3 grid() { return dim3(SM_COUNT); }
     dim3 block() { return dim3(config::NUM_THREADS); }
@@ -100,8 +105,8 @@ template<typename config=config> struct GroupMatmulOp {
     static_assert(PIPELINE_STAGES >= 2);
     static_assert(config::NUM_CONSUMER_WARPS == 8);
     static_assert(sizeof(a_tile) == config::PAGE_SIZE / 2);
-    static_assert(sizeof(b_tile) <= config::PAGE_SIZE * 2);
-    static_assert(sizeof(c_tile) <= config::PAGE_SIZE * 4);
+    static_assert(sizeof(b_tile) == config::PAGE_SIZE);
+    static_assert(sizeof(c_tile) == config::PAGE_SIZE * 2);
     
     struct parsed_instruction {
         int group_id, row, col, red_start, red_end;
@@ -195,7 +200,7 @@ template<typename config=config> struct GroupMatmulOp {
             }
         }
     };
-    struct launcher { // no warpgroup-level tensor cores in H100s
+    struct launcher { // no B200-like tensor cores in H100s
         static __device__ void run(const globals &g, state<config> &s) { }
     };
     struct consumer {
@@ -255,7 +260,9 @@ PYBIND11_MODULE(group_matmul, m) {
     m.doc() = "group_matmul python module";
     m.def("group_matmul", [](
         pybind11::object A,
+        pybind11::object A_scale,
         pybind11::object B,
+        pybind11::object B_scale,
         pybind11::object C,
         pybind11::object tokens_per_ep,
         pybind11::kwargs kwargs
@@ -264,9 +271,17 @@ PYBIND11_MODULE(group_matmul, m) {
         int M = pybind11::cast<int>(py_shape[0]);
         int K = pybind11::cast<int>(py_shape[1]);
 
+        py_shape = A_scale.attr("shape").cast<pybind11::tuple>();
+        if (pybind11::cast<int>(py_shape[0]) != M / SCALE_BLOCK) throw std::runtime_error("M dimension mismatch on A_scale (must be blocks of " + std::to_string(SCALE_BLOCK) + ")");
+        if (pybind11::cast<int>(py_shape[1]) != K) throw std::runtime_error("Reduction dimension mismatch on A_scale");
+
         py_shape = B.attr("shape").cast<pybind11::tuple>();
         int N = pybind11::cast<int>(py_shape[0]);
         if (pybind11::cast<int>(py_shape[1]) != K) throw std::runtime_error("Reduction dimension mismatch on B");
+
+        py_shape = B_scale.attr("shape").cast<pybind11::tuple>();
+        if (pybind11::cast<int>(py_shape[0]) != N / SCALE_BLOCK) throw std::runtime_error("N dimension mismatch on B_scale (must be blocks of " + std::to_string(SCALE_BLOCK) + ")");
+        if (pybind11::cast<int>(py_shape[1]) != K) throw std::runtime_error("Reduction dimension mismatch on B_scale");
 
         py_shape = C.attr("shape").cast<pybind11::tuple>();
         int num_ep = pybind11::cast<int>(py_shape[0]);
@@ -310,6 +325,12 @@ PYBIND11_MODULE(group_matmul, m) {
             }
             token_index += tokens_per_ep_host[group_id];
         }
+        while (instruction_index % SM_COUNT != 0) {
+            int sm = instruction_index % SM_COUNT;
+            int local_instruction_index = instruction_index / SM_COUNT;
+            instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH] = 0; // no-op
+            instruction_index++;
+        }
 
         int *instructions_dev;
         cudaMalloc(&instructions_dev, SM_COUNT * num_instructions_per_sm * config::INSTRUCTION_WIDTH * sizeof(int));
@@ -319,7 +340,9 @@ PYBIND11_MODULE(group_matmul, m) {
         globals __g__{
             instructions_g,
             py::from_object<typename globals::fp8_matrix>::make(A),
+            py::from_object<typename globals::fp8_scale>::make(A_scale),
             py::from_object<typename globals::fp8_matrix>::make(B),
+            py::from_object<typename globals::fp8_scale>::make(B_scale),
             py::from_object<typename globals::fl_matrix>::make(C)
         };
 
@@ -332,7 +355,7 @@ PYBIND11_MODULE(group_matmul, m) {
         int __dynamic_shared_memory__ = (int)__g__.dynamic_shared_memory();
         cudaFuncSetAttribute(kvm<config, globals, GroupMatmulOp<config>>, cudaFuncAttributeMaxDynamicSharedMemorySize, __dynamic_shared_memory__);
         kvm<config, globals, GroupMatmulOp<config>><<<__g__.grid(), __g__.block(), __dynamic_shared_memory__, raw_stream>>>(__g__);
-        
+
         delete[] instructions_host;
     });
 }

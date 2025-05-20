@@ -12,7 +12,6 @@ N = 2048
 
 OPCODE = 1
 SM_COUNT = 132
-INSTRUCTION_WIDTH = 32
 NUM_ITERS = 10
 NUM_WARMUP_ITERS = 3
 
@@ -36,46 +35,20 @@ print('A shapes:', A.shape)
 print('B shapes:', B.shape)
 print('C shapes:', C.shape)
 
-instruction_idx = 0
-instructions = [[] for _ in range(SM_COUNT)]
-for group_id in range(NUM_EP):
-    num_iters = K // K_BLOCK
-    for row_outer in range((M + SUPER_M - 1) // SUPER_M): # ceil
-        for col in range(N // N_BLOCK):
-            rows_per_super = SUPER_M // M_BLOCK
-            row_start = rows_per_super * row_outer
-            for row_inner in range(rows_per_super):
-                row = row_start + row_inner
-                if row >= M // M_BLOCK:
-                    break
-                instructions[instruction_idx%SM_COUNT].append([OPCODE, group_id, row, col, 0, num_iters] + [0]*(INSTRUCTION_WIDTH-6))
-                instruction_idx += 1
-
-# Pad instructions
-max_instructions = -1
-for i in range(SM_COUNT):
-    max_instructions = max(max_instructions, len(instructions[i]))
-for i in range(SM_COUNT):
-    while len(instructions[i]) < max_instructions:
-        instructions[i].append([0] * INSTRUCTION_WIDTH)
-
-instructions = torch.tensor(instructions, dtype=torch.int32, device=0)
-print(f'Instruction tensor created, of shape {instructions.shape}')
-
 # Run the group_matmul kernel
 print('Launching kernel...')
-group_matmul(instructions, A, B, C)
+group_matmul(A, B, C)
 torch.cuda.synchronize()
 
 print('Starting timing loop...')
 for i in range(NUM_WARMUP_ITERS):
-    group_matmul(instructions, A, B, C)
+    group_matmul(A, B, C)
 torch.cuda.synchronize()
 start_event = torch.cuda.Event(enable_timing=True)
 end_event = torch.cuda.Event(enable_timing=True)
 start_event.record()
 for i in range(NUM_ITERS):
-    group_matmul(instructions, A, B, C)
+    group_matmul(A, B, C)
 torch.cuda.synchronize()
 end_event.record()
 torch.cuda.synchronize()

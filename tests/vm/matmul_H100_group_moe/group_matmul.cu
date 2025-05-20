@@ -253,23 +253,73 @@ template<typename config=config> struct GroupMatmulOp {
 PYBIND11_MODULE(group_matmul, m) {
     m.doc() = "group_matmul python module";
     m.def("group_matmul", [](
-        pybind11::object instructions,
         pybind11::object A,
         pybind11::object B,
         pybind11::object C,
         pybind11::kwargs kwargs
     ) {
+        auto py_shape = A.attr("shape").cast<pybind11::tuple>();
+        int num_ep = pybind11::cast<int>(py_shape[0]);
+        int M = pybind11::cast<int>(py_shape[1]);
+        int K = pybind11::cast<int>(py_shape[2]);
+
+        py_shape = B.attr("shape").cast<pybind11::tuple>();
+        int N = pybind11::cast<int>(py_shape[1]);
+        if (pybind11::cast<int>(py_shape[0]) != num_ep) throw std::runtime_error("Expert dimension mismatch on B");
+        if (pybind11::cast<int>(py_shape[2]) != K) throw std::runtime_error("Reduction dimension mismatch on B");
+
+        py_shape = C.attr("shape").cast<pybind11::tuple>();
+        if (pybind11::cast<int>(py_shape[0]) != num_ep) throw std::runtime_error("Expert dimension mismatch on C");
+        if (pybind11::cast<int>(py_shape[1]) != M) throw std::runtime_error("Row dimension mismatch on C");
+        if (pybind11::cast<int>(py_shape[2]) != N) throw std::runtime_error("Column dimension mismatch on C");
+
+        if (M%M_BLOCK != 0) throw std::runtime_error(std::string("M must be divisible by ") + std::to_string(M_BLOCK));
+        if (K%K_BLOCK != 0) throw std::runtime_error(std::string("K must be divisible by ") + std::to_string(K_BLOCK));
+        if (N%N_BLOCK != 0) throw std::runtime_error(std::string("N must be divisible by ") + std::to_string(N_BLOCK));
+
+        int num_row_blocks = M / M_BLOCK;
+        int num_col_blocks = N / N_BLOCK;
+        int num_iters = K / K_BLOCK;
+
+        int num_instructions = num_ep * num_row_blocks * num_col_blocks;
+        int num_instructions_per_sm = (num_instructions + SM_COUNT - 1) / SM_COUNT;
+
+        int instruction_index = 0;
+        int *instructions_host = new int[SM_COUNT * num_instructions_per_sm * config::INSTRUCTION_WIDTH];
+        for (int group_id = 0; group_id < num_ep; group_id++) {
+            for (int row = 0; row < num_row_blocks; row++) {
+                for (int col = 0; col < num_col_blocks; col++) {
+                    int sm = instruction_index % SM_COUNT;
+                    int local_instruction_index = instruction_index / SM_COUNT;
+                    instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 0] = GroupMatmulOp<config>::opcode;
+                    instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 1] = group_id;
+                    instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 2] = row;
+                    instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 3] = col;
+                    instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 4] = 0;
+                    instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 5] = num_iters;
+                    instruction_index++;
+                }
+            }
+        }
+
+        int *instructions_dev;
+        cudaMalloc(&instructions_dev, SM_COUNT * num_instructions_per_sm * config::INSTRUCTION_WIDTH * sizeof(int));
+        cudaMemcpy(instructions_dev, instructions_host, SM_COUNT * num_instructions_per_sm * config::INSTRUCTION_WIDTH * sizeof(int), cudaMemcpyHostToDevice);
+        delete[] instructions_host;
+
         globals __g__{
-            py::from_object<typename globals::instruction_layout>::make(instructions),
+            typename globals::instruction_layout{instructions_dev, nullptr, (unsigned long)SM_COUNT, (unsigned long)num_instructions_per_sm, nullptr},
             py::from_object<typename globals::fp8_matrix>::make(A),
             py::from_object<typename globals::fp8_matrix>::make(B),
             py::from_object<typename globals::fp8_matrix>::make(C)
         };
+
         cudaStream_t raw_stream = nullptr;
         if (kwargs.contains("stream")) {
             uintptr_t stream_ptr = kwargs["stream"].attr("cuda_stream").cast<uintptr_t>();
             raw_stream = reinterpret_cast<cudaStream_t>(stream_ptr);
         }
+
         int __dynamic_shared_memory__ = (int)__g__.dynamic_shared_memory();
         cudaFuncSetAttribute(kvm<config, globals, GroupMatmulOp<config>>, cudaFuncAttributeMaxDynamicSharedMemorySize, __dynamic_shared_memory__);
         kvm<config, globals, GroupMatmulOp<config>><<<__g__.grid(), __g__.block(), __dynamic_shared_memory__, raw_stream>>>(__g__);

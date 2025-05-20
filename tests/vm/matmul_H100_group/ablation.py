@@ -1,3 +1,4 @@
+# Sequential matmuls, instead of group matmuls
 import torch
 from group_matmul import group_matmul
 
@@ -56,8 +57,10 @@ print('B shapes:', [b.shape for b in B])
 print('C shapes:', [c.shape for c in C])
 
 instruction_idx = 0
-instructions = [[] for _ in range(SM_COUNT)]
+all_instructions = []
 for group_id, (M, K, N) in enumerate(GROUP_SHAPES):
+    instructions = [[] for _ in range(SM_COUNT)]
+
     num_iters = K // K_BLOCK
     for row_outer in range((M + SUPER_M - 1) // SUPER_M): # ceil
         for col in range(N // N_BLOCK):
@@ -70,32 +73,37 @@ for group_id, (M, K, N) in enumerate(GROUP_SHAPES):
                 instructions[instruction_idx%SM_COUNT].append([OPCODE, group_id, row, col, num_iters] + [0]*(INSTRUCTION_WIDTH-5))
                 instruction_idx += 1
 
-# Pad instructions
-max_instructions = -1
-for i in range(SM_COUNT):
-    max_instructions = max(max_instructions, len(instructions[i]))
-for i in range(SM_COUNT):
-    while len(instructions[i]) < max_instructions:
-        instructions[i].append([0] * INSTRUCTION_WIDTH)
+    # Pad instructions
+    max_instructions = -1
+    for i in range(SM_COUNT):
+        max_instructions = max(max_instructions, len(instructions[i]))
+    for i in range(SM_COUNT):
+        while len(instructions[i]) < max_instructions:
+            instructions[i].append([0] * INSTRUCTION_WIDTH)
+    
+    instructions = torch.tensor(instructions, dtype=torch.int32, device=0)
+    timings = torch.zeros((SM_COUNT, instructions.shape[1], TIMING_WIDTH), dtype=torch.int32, device=0) # redundant but keep it for now
+    print(f'Instruction and timing tensors created, of shapes {instructions.shape} and {timings.shape}')
 
-instructions = torch.tensor(instructions, dtype=torch.int32, device=0)
-timings = torch.zeros((SM_COUNT, instructions.shape[1], TIMING_WIDTH), dtype=torch.int32, device=0)
-print(f'Instruction and timing tensors created, of shapes {instructions.shape} and {timings.shape}')
+    all_instructions.append(instructions)
 
 # Run the group_matmul kernel
 print('Launching kernel...')
-group_matmul(instructions, timings, A, B, C)
+for instructions in all_instructions:
+    group_matmul(instructions, timings, A, B, C)
 torch.cuda.synchronize()
 
 print('Starting timing loop...')
 for i in range(NUM_WARMUP_ITERS):
-    group_matmul(instructions, timings, A, B, C)
+    for instructions in all_instructions:
+        group_matmul(instructions, timings, A, B, C)
 torch.cuda.synchronize()
 start_event = torch.cuda.Event(enable_timing=True)
 end_event = torch.cuda.Event(enable_timing=True)
 start_event.record()
 for i in range(NUM_ITERS):
-    group_matmul(instructions, timings, A, B, C)
+    for instructions in all_instructions:
+        group_matmul(instructions, timings, A, B, C)
 torch.cuda.synchronize()
 end_event.record()
 torch.cuda.synchronize()

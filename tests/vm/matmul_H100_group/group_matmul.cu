@@ -35,13 +35,55 @@ struct gl_array {
     __host__ __device__ const GL& operator[](size_t i) const { return gls[i]; }
 };
 
-using config = default_config;
+struct config
+{
+    // Instruction pipeline
+    static constexpr int INSTRUCTION_PIPELINE_STAGES = 2;
+
+    // num bits required to represent num pipeline stages
+    static constexpr int INSTRUCTION_PIPELINE_STAGES_BITS = 1;
+
+    static constexpr int INSTRUCTION_WIDTH = 32; // 128 bytes per instruction.
+    using instruction_t = int[INSTRUCTION_WIDTH];
+
+    // Timing info
+    static constexpr int TIMING_WIDTH = 128;
+    using timing_t = int[TIMING_WIDTH];
+
+    // How many semaphores are available for dynamic use?
+    static constexpr int DYNAMIC_SEMAPHORES = 32;
+
+    // One controller warp, one load warp, one store warp, and one mma warp.
+    static constexpr int NUM_CONSUMER_WARPS = 8;
+    static constexpr int NUM_WARPS = 4 + NUM_CONSUMER_WARPS;
+    static constexpr int NUM_THREADS = NUM_WARPS * ::kittens::WARP_THREADS;
+    static constexpr int NUM_BLOCKS = 1;
+    static constexpr int CLUSTER_BLOCKS = 1;
+    static constexpr int MAX_SHARED_MEMORY = kittens::MAX_SHARED_MEMORY;
+
+    // Shared memory declared statically
+    static constexpr int SCRATCH_BYTES = 1024;
+    static constexpr int STATIC_SHARED_MEMORY = 512 + INSTRUCTION_PIPELINE_STAGES * (SCRATCH_BYTES + (INSTRUCTION_WIDTH + TIMING_WIDTH) * 4 + DYNAMIC_SEMAPHORES * 8);
+    static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
+
+    // Shared memory declared dynamically
+    static constexpr int PAGE_SIZE = 16384;
+    static constexpr int NUM_PAGES = DYNAMIC_SHARED_MEMORY / PAGE_SIZE;
+    static_assert(NUM_PAGES == 13, "NUM_PAGES must be 13");
+
+    static constexpr bool TIMING_RECORD_ENABLED = false;
+
+    static constexpr bool GMEM_SPIN_LOOP_SLEEP_NANOS = 20;
+
+    static constexpr int CONSUMER_REGISTERS = 104;
+    static constexpr int NON_CONSUMER_REGISTERS = 64;
+};
+
 struct globals {
     using instruction_layout = ::kittens::prototype::vm::instruction_layout<config>;
     using timing_layout = ::kittens::prototype::vm::timing_layout<config>;
     using fp8_matrix = gl<fp8e4m3, 1, -1, -1, -1, a_tile, b_tile, c_tile>;
     instruction_layout instructions;
-    timing_layout timings;
     gl_array<fp8_matrix, NUM_GROUPS> A, B, C;
     dim3 grid() { return dim3(SM_COUNT); }
     dim3 block() { return dim3(config::NUM_THREADS); }
@@ -211,7 +253,6 @@ PYBIND11_MODULE(group_matmul, m) {
     m.doc() = "group_matmul python module";
     m.def("group_matmul", [](
         pybind11::object instructions,
-        pybind11::object timings,
         pybind11::object A,
         pybind11::object B,
         pybind11::object C,
@@ -219,7 +260,6 @@ PYBIND11_MODULE(group_matmul, m) {
     ) {
         globals __g__{
             py::from_object<typename globals::instruction_layout>::make(instructions),
-            py::from_object<typename globals::timing_layout>::make(timings),
             gl_array<typename globals::fp8_matrix, NUM_GROUPS>(pybind11::cast<pybind11::list>(A)),
             gl_array<typename globals::fp8_matrix, NUM_GROUPS>(pybind11::cast<pybind11::list>(B)),
             gl_array<typename globals::fp8_matrix, NUM_GROUPS>(pybind11::cast<pybind11::list>(C))

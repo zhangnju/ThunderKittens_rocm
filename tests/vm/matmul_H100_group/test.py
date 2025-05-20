@@ -79,23 +79,22 @@ for i in range(SM_COUNT):
         instructions[i].append([0] * INSTRUCTION_WIDTH)
 
 instructions = torch.tensor(instructions, dtype=torch.int32, device=0)
-timings = torch.zeros((SM_COUNT, instructions.shape[1], TIMING_WIDTH), dtype=torch.int32, device=0)
-print(f'Instruction and timing tensors created, of shapes {instructions.shape} and {timings.shape}')
+print(f'Instruction tensor created, of shape {instructions.shape}')
 
 # Run the group_matmul kernel
 print('Launching kernel...')
-group_matmul(instructions, timings, A, B, C)
+group_matmul(instructions, A, B, C)
 torch.cuda.synchronize()
 
 print('Starting timing loop...')
 for i in range(NUM_WARMUP_ITERS):
-    group_matmul(instructions, timings, A, B, C)
+    group_matmul(instructions, A, B, C)
 torch.cuda.synchronize()
 start_event = torch.cuda.Event(enable_timing=True)
 end_event = torch.cuda.Event(enable_timing=True)
 start_event.record()
 for i in range(NUM_ITERS):
-    group_matmul(instructions, timings, A, B, C)
+    group_matmul(instructions, A, B, C)
 torch.cuda.synchronize()
 end_event.record()
 torch.cuda.synchronize()

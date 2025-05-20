@@ -11,8 +11,10 @@ SRC=group_matmul.cu
 # endif
 
 THUNDERKITTENS_ROOT=$(shell pwd)/../../..
+EXTENSION_SUFFIX=.cpython-311-x86_64-linux-gnu.so
+
 NVCCFLAGS=-DNDEBUG -Xcompiler=-fPIE --expt-extended-lambda --expt-relaxed-constexpr -Xcompiler=-Wno-psabi -Xcompiler=-fno-strict-aliasing --use_fast_math -forward-unknown-to-host-compiler -O3 -Xnvlink=--verbose -Xptxas=--verbose -Xptxas=--warn-on-spills -std=c++20 -x cu -lrt -lpthread -ldl -lcuda -lcudadevrt -lcudart_static -lcublas -lineinfo
-NVCCFLAGS+= -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype $(shell python3 -m pybind11 --includes) $(shell python3-config --ldflags) -shared -fPIC # -lpython${PYTHON_VERSION}
+NVCCFLAGS+= -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype $(shell python -m pybind11 --includes) -shared -fPIC
 # NVCCFLAGS+= -g -G
 
 # Conditional setup based on the target GPU
@@ -30,8 +32,8 @@ endif
 all: $(TARGET)
 
 $(TARGET): $(SRC)
-	$(NVCC) $(SRC) $(NVCCFLAGS) -o $(TARGET)$(shell python3-config --extension-suffix)
+	$(NVCC) $(SRC) $(NVCCFLAGS) -o $(TARGET)$(EXTENSION_SUFFIX)
 
 # Clean target
 clean:
-	rm -f $(TARGET)$(shell python3-config --extension-suffix)
+	rm -f $(TARGET)$(EXTENSION_SUFFIX)

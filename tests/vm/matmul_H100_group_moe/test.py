@@ -30,28 +30,39 @@ torch.manual_seed(1)
 A = (torch.randn((NUM_EP, M, K), device=0, dtype=torch.bfloat16) / K**.25).to(torch.float8_e4m3fn)
 B = (torch.randn((NUM_EP, N, K), device=0, dtype=torch.bfloat16) / K**.25).to(torch.float8_e4m3fn)
 C = torch.zeros((NUM_EP, M, N), device=0, dtype=torch.float8_e4m3fn)
+tokens_per_ep = torch.zeros((NUM_EP,), device=0, dtype=torch.int32)
 print('Input tensors created')
-print('A shapes:', A.shape)
-print('B shapes:', B.shape)
-print('C shapes:', C.shape)
+print('A shape:', A.shape)
+print('B shape:', B.shape)
+print('C shape:', C.shape)
+print('tokens_per_ep shape:', tokens_per_ep.shape)
+
+# Set up tokens_per_ep
+tokens_left = K
+for group_id in range(NUM_EP):
+    tokens_per_ep[group_id] = 1024
+    tokens_left -= 1024
+assert(tokens_left == 0)
+print('tokens_per_ep:', tokens_per_ep)
 
 # Run the group_matmul kernel
 print('Launching kernel...')
-group_matmul(A, B, C)
+group_matmul(A, B, C, tokens_per_ep)
 torch.cuda.synchronize()
 
 print('Starting timing loop...')
 for i in range(NUM_WARMUP_ITERS):
-    group_matmul(A, B, C)
-torch.cuda.synchronize()
+    group_matmul(A, B, C, tokens_per_ep)
+    torch.cuda.synchronize()
 start_event = torch.cuda.Event(enable_timing=True)
 end_event = torch.cuda.Event(enable_timing=True)
 start_event.record()
 for i in range(NUM_ITERS):
-    group_matmul(A, B, C)
-torch.cuda.synchronize()
+    group_matmul(A, B, C, tokens_per_ep)
+    torch.cuda.synchronize()
 end_event.record()
 torch.cuda.synchronize()
+print('Elapsed time:', start_event.elapsed_time(end_event))
 elapsed_time = start_event.elapsed_time(end_event)
 sec_per_iter = ((elapsed_time / 1000) / NUM_ITERS)
 tflops = NUM_EP * (2*M*K*N) * 1e-12
@@ -60,9 +71,14 @@ print(f'TFLOP/s: {tflops/(sec_per_iter)}')
 
 print('Test completed successfully!')
 
+token_index = 0
 for group_id in range(NUM_EP):
     C_impl = C[group_id].to(torch.float32).cpu().numpy()
-    C_ref = (A[group_id].to(torch.float16) @ B[group_id].to(torch.float16).T).to(torch.float8_e4m3fn).to(torch.float32).cpu().numpy()
+    C_ref = (
+        A[group_id, :, token_index:token_index+tokens_per_ep[group_id]].to(torch.float16) @ 
+        B[group_id, :, token_index:token_index+tokens_per_ep[group_id]].to(torch.float16).T
+    ).to(torch.float8_e4m3fn).to(torch.float32).cpu().numpy()
+    token_index += tokens_per_ep[group_id]
     assert C_impl.shape == C_ref.shape
     print(f'Group {group_id} abs diff max:', abs(C_impl - C_ref).max())
     print(f'Group {group_id} abs diff mean:', abs(C_impl - C_ref).mean())

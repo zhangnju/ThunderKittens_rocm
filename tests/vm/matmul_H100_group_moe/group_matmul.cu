@@ -256,6 +256,7 @@ PYBIND11_MODULE(group_matmul, m) {
         pybind11::object A,
         pybind11::object B,
         pybind11::object C,
+        pybind11::object tokens_per_ep,
         pybind11::kwargs kwargs
     ) {
         auto py_shape = A.attr("shape").cast<pybind11::tuple>();
@@ -273,20 +274,28 @@ PYBIND11_MODULE(group_matmul, m) {
         if (pybind11::cast<int>(py_shape[1]) != M) throw std::runtime_error("Row dimension mismatch on C");
         if (pybind11::cast<int>(py_shape[2]) != N) throw std::runtime_error("Column dimension mismatch on C");
 
+        py_shape = tokens_per_ep.attr("shape").cast<pybind11::tuple>();
+        if (pybind11::cast<int>(py_shape[0]) != num_ep) throw std::runtime_error("Expert dimension mismatch on tokens_per_ep");
+
         if (M%M_BLOCK != 0) throw std::runtime_error(std::string("M must be divisible by ") + std::to_string(M_BLOCK));
         if (K%K_BLOCK != 0) throw std::runtime_error(std::string("K must be divisible by ") + std::to_string(K_BLOCK));
         if (N%N_BLOCK != 0) throw std::runtime_error(std::string("N must be divisible by ") + std::to_string(N_BLOCK));
 
+        int *tokens_per_ep_host = new int[num_ep];
+        int *tokens_per_ep_dev = reinterpret_cast<int *>(tokens_per_ep.attr("data_ptr")().cast<uint64_t>());
+        cudaMemcpy(tokens_per_ep_host, tokens_per_ep_dev, num_ep * sizeof(int), cudaMemcpyDeviceToHost);    
+
         int num_row_blocks = M / M_BLOCK;
         int num_col_blocks = N / N_BLOCK;
-        int num_iters = K / K_BLOCK;
 
         int num_instructions = num_ep * num_row_blocks * num_col_blocks;
         int num_instructions_per_sm = (num_instructions + SM_COUNT - 1) / SM_COUNT;
 
+        int token_index = 0;
         int instruction_index = 0;
         int *instructions_host = new int[SM_COUNT * num_instructions_per_sm * config::INSTRUCTION_WIDTH];
         for (int group_id = 0; group_id < num_ep; group_id++) {
+            if (token_index >= K) throw std::runtime_error("token_index (" + std::to_string(token_index) + ") >= K (" + std::to_string(K) + ")");
             for (int row = 0; row < num_row_blocks; row++) {
                 for (int col = 0; col < num_col_blocks; col++) {
                     int sm = instruction_index % SM_COUNT;
@@ -295,20 +304,22 @@ PYBIND11_MODULE(group_matmul, m) {
                     instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 1] = group_id;
                     instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 2] = row;
                     instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 3] = col;
-                    instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 4] = 0;
-                    instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 5] = num_iters;
+                    instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 4] = token_index / K_BLOCK;
+                    instructions_host[sm * num_instructions_per_sm * config::INSTRUCTION_WIDTH + local_instruction_index * config::INSTRUCTION_WIDTH + 5] = (token_index + tokens_per_ep_host[group_id]) / K_BLOCK;
                     instruction_index++;
                 }
             }
+            token_index += tokens_per_ep_host[group_id];
         }
 
         int *instructions_dev;
         cudaMalloc(&instructions_dev, SM_COUNT * num_instructions_per_sm * config::INSTRUCTION_WIDTH * sizeof(int));
         cudaMemcpy(instructions_dev, instructions_host, SM_COUNT * num_instructions_per_sm * config::INSTRUCTION_WIDTH * sizeof(int), cudaMemcpyHostToDevice);
         delete[] instructions_host;
+        typename globals::instruction_layout instructions_g{instructions_dev, nullptr, (unsigned long)SM_COUNT, (unsigned long)num_instructions_per_sm, nullptr};
 
         globals __g__{
-            typename globals::instruction_layout{instructions_dev, nullptr, (unsigned long)SM_COUNT, (unsigned long)num_instructions_per_sm, nullptr},
+            instructions_g,
             py::from_object<typename globals::fp8_matrix>::make(A),
             py::from_object<typename globals::fp8_matrix>::make(B),
             py::from_object<typename globals::fp8_matrix>::make(C)

@@ -58,18 +58,20 @@ template<typename config=config> struct GroupMatmulOp {
     static_assert(config::NUM_CONSUMER_WARPS == 8);
     
     struct parsed_instruction {
-        int row, col, num_iters;
+        int group_id, row, col, num_iters;
         __device__ inline parsed_instruction(typename config::instruction_t &instruction) {
             /*
                 Instruction format:
                 [0] = opcode
-                [1] = Row offset of C, in units of M_BLOCK
-                [2] = Col offset of C, in units of N_BLOCK
-                [3] = K reduction dimension, in units of K_BLOCK
+                [1] = Group ID
+                [2] = Row offset of C, in units of M_BLOCK
+                [3] = Col offset of C, in units of N_BLOCK
+                [4] = K reduction dimension, in units of K_BLOCK
             */
-            row = instruction[1];
-            col = instruction[2];
-            num_iters = instruction[3];
+            group_id = instruction[1];
+            row = instruction[2];
+            col = instruction[3];
+            num_iters = instruction[4];
         }
         __device__ inline parsed_instruction(state<config> &s): parsed_instruction(s.instruction()) {}
     };
@@ -119,7 +121,7 @@ template<typename config=config> struct GroupMatmulOp {
                         s.wait_page_ready(a_page);
                     }
                     a_tile &a = *reinterpret_cast<a_tile *>((uint8_t *)s.pages[a_page].data + sizeof(a_tile) * laneid);
-                    tma::load_async(a, g.A[0], {inst.row*2 + laneid, i}, inputs_arrived(s, pipeline_stage));
+                    tma::load_async(a, g.A[inst.group_id], {inst.row*2 + laneid, i}, inputs_arrived(s, pipeline_stage));
                 } else if (laneid == 2) {
                     int b_page = get_b_page(s, pipeline_stage);
                     if (i < PIPELINE_STAGES) {
@@ -127,7 +129,7 @@ template<typename config=config> struct GroupMatmulOp {
                         s.wait_page_ready(b_page + 1); // because b_page is a megapage
                     }
                     b_tile &b = *reinterpret_cast<b_tile *>(s.pages[b_page].data);
-                    tma::load_async(b, g.B[0], {inst.col, i}, inputs_arrived(s, pipeline_stage));
+                    tma::load_async(b, g.B[inst.group_id], {inst.col, i}, inputs_arrived(s, pipeline_stage));
                 }
                 update_phasebit<1>(semaphore_bitfield, pipeline_stage);
             }
@@ -187,7 +189,7 @@ template<typename config=config> struct GroupMatmulOp {
                 wait(outputs_arrived(s, laneid), 0);
                 int store_page = get_store_page(s, laneid);
                 c_tile &store_buffer = *reinterpret_cast<c_tile *>(s.pages[store_page].data);
-                tma::store_async(g.C[0], store_buffer, {inst.row*2 + laneid, inst.col});
+                tma::store_async(g.C[inst.group_id], store_buffer, {inst.row*2 + laneid, inst.col});
                 tma::store_async_read_wait();
                 s.finish_page(store_page, config::NUM_CONSUMER_WARPS);
             }

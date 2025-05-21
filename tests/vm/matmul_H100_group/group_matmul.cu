@@ -76,7 +76,7 @@ struct config
     static constexpr bool GMEM_SPIN_LOOP_SLEEP_NANOS = 20;
 
     static constexpr int CONSUMER_REGISTERS = 104;
-    static constexpr int NON_CONSUMER_REGISTERS = 64;
+    static constexpr int NON_CONSUMER_REGISTERS = 104;
 };
 
 struct globals {

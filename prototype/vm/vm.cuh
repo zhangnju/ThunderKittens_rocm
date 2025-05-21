@@ -118,12 +118,12 @@ __device__ inline void kvm_internal(const globals &g)
 
     if (warpid() < config::NUM_CONSUMER_WARPS)
     {
-        warpgroup::increase_registers<config::CONSUMER_REGISTERS>();
+        warpgroup::decrease_registers<config::CONSUMER_REGISTERS>();
         ::kittens::prototype::vm::consumer::main_loop<config, globals, ops...>(g, kvms);
     }
     else
     {
-        warpgroup::decrease_registers<config::NON_CONSUMER_REGISTERS>();
+        warpgroup::increase_registers<config::NON_CONSUMER_REGISTERS>();
         switch (warpgroup::warpid())
         {
         case 0:

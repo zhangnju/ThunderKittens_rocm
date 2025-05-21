@@ -15,7 +15,7 @@ constexpr int SCALE_BLOCK = 128;
 using a_tile = st_fp8e4m3<M_BLOCK / 2, K_BLOCK>; // 2 consumer warpgroups
 using b_tile = st_fp8e4m3<N_BLOCK, K_BLOCK>;
 using c_tile = st_fl<M_BLOCK / 2, N_BLOCK>;
-using a_scale_vec = col_vec<st_fl<M_BLOCK, K_BLOCK>>;
+using a_scale_vec = col_vec<st_fl<M_BLOCK / 2, K_BLOCK>>;
 using b_scale_vec = row_vec<st_fl<K_BLOCK, N_BLOCK>/* Transposed */>;
 
 static constexpr int SM_COUNT = 132;
@@ -64,7 +64,7 @@ struct config
     static constexpr int MAX_SHARED_MEMORY = kittens::MAX_SHARED_MEMORY;
 
     // Shared memory declared statically
-    static constexpr int SCRATCH_BYTES = 1024;
+    static constexpr int SCRATCH_BYTES = 4096;
     static constexpr int STATIC_SHARED_MEMORY = 512 + INSTRUCTION_PIPELINE_STAGES * (SCRATCH_BYTES + (INSTRUCTION_WIDTH + TIMING_WIDTH) * 4 + DYNAMIC_SEMAPHORES * 8);
     static constexpr int DYNAMIC_SHARED_MEMORY = MAX_SHARED_MEMORY - STATIC_SHARED_MEMORY;
 
@@ -77,8 +77,8 @@ struct config
 
     static constexpr bool GMEM_SPIN_LOOP_SLEEP_NANOS = 20;
 
-    static constexpr int CONSUMER_REGISTERS = 104;
-    static constexpr int NON_CONSUMER_REGISTERS = 96;
+    static constexpr int CONSUMER_REGISTERS = 88;
+    static constexpr int NON_CONSUMER_REGISTERS = 136;
 };
 
 struct globals {
@@ -109,6 +109,7 @@ template<typename config=config> struct GroupMatmulOp {
     static_assert(sizeof(a_tile) == config::PAGE_SIZE / 2);
     static_assert(sizeof(b_tile) == config::PAGE_SIZE);
     static_assert(sizeof(c_tile) == config::PAGE_SIZE * 2);
+    static_assert(PIPELINE_STAGES * (sizeof(a_scale_vec) + sizeof(b_scale_vec)) <= config::SCRATCH_BYTES);
     
     struct parsed_instruction {
         int group_id, row, col, red_start, red_end;
@@ -167,7 +168,7 @@ template<typename config=config> struct GroupMatmulOp {
             uint32_t semaphore_bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
             for (int i = 0; i < inst.red_end - inst.red_start; i++, pipeline_stage=ring_advance<PIPELINE_STAGES>(pipeline_stage)) {
                 wait(inputs_finished(s, pipeline_stage), get_phasebit<1>(semaphore_bitfield, pipeline_stage));
-                warp::tma::expect_bytes(inputs_arrived(s, pipeline_stage), sizeof(a_tile)*2 + sizeof(b_tile));
+                warp::tma::expect_bytes(inputs_arrived(s, pipeline_stage), sizeof(a_tile)*2 + sizeof(b_tile) + sizeof(a_scale_vec)*2 + sizeof(b_scale_vec));
                 __syncwarp(); // none-0 lanes must wait for the tma::expect_bytes to complete
                 if (laneid < 2) {
                     int a_page = get_a_page(s, pipeline_stage);
@@ -176,6 +177,9 @@ template<typename config=config> struct GroupMatmulOp {
                     }
                     a_tile &a = *reinterpret_cast<a_tile *>((uint8_t *)s.pages[a_page].data + sizeof(a_tile) * laneid);
                     tma::load_async(a, g.A, {inst.row*2 + laneid, i + inst.red_start}, inputs_arrived(s, pipeline_stage));
+                    a_scale_vec &a_scale = *reinterpret_cast<a_scale_vec *>(
+                        (char *)s.scratch() + pipeline_stage*(sizeof(a_scale_vec)*2 + sizeof(b_scale_vec)) + laneid*sizeof(a_scale_vec));
+                    tma::load_async(a_scale, g.A_scale, {inst.row*2 + laneid}, inputs_arrived(s, pipeline_stage));
                 } else if (laneid == 2) {
                     int b_page = get_b_page(s, pipeline_stage);
                     if (i < PIPELINE_STAGES) {
@@ -183,6 +187,9 @@ template<typename config=config> struct GroupMatmulOp {
                     }
                     b_tile &b = *reinterpret_cast<b_tile *>(s.pages[b_page].data);
                     tma::load_async(b, g.B, {inst.col, i + inst.red_start}, inputs_arrived(s, pipeline_stage));
+                    b_scale_vec &b_scale = *reinterpret_cast<b_scale_vec *>(
+                        (char *)s.scratch() + pipeline_stage*(sizeof(a_scale_vec)*2 + sizeof(b_scale_vec)) + 2*sizeof(a_scale_vec));
+                    tma::load_async(b_scale, g.B_scale, {inst.col}, inputs_arrived(s, pipeline_stage));
                 }
                 update_phasebit<1>(semaphore_bitfield, pipeline_stage);
             }
@@ -222,10 +229,21 @@ template<typename config=config> struct GroupMatmulOp {
                 int a_page = get_a_page(s, pipeline_stage);
                 int b_page = get_b_page(s, pipeline_stage);
                 a_tile &a = *reinterpret_cast<a_tile *>((uint8_t *)s.pages[a_page].data + sizeof(a_tile) * groupid);
+                a_scale_vec &a_scale = *reinterpret_cast<a_scale_vec *>(
+                    (char *)s.scratch() + pipeline_stage*(sizeof(a_scale_vec)*2 + sizeof(b_scale_vec)) + groupid*sizeof(a_scale_vec));
                 b_tile &b = *reinterpret_cast<b_tile *>(s.pages[b_page].data);
+                b_scale_vec &b_scale = *reinterpret_cast<b_scale_vec *>(
+                    (char *)s.scratch() + pipeline_stage*(sizeof(a_scale_vec)*2 + sizeof(b_scale_vec)) + 2*sizeof(a_scale_vec));
                 warpgroup::mma_ABt(acc_fl, a, b);
+                col_vec<rt_fl<M_BLOCK / 8, K_BLOCK>> a_scale_reg;
+                row_vec<rt_fl<K_BLOCK, N_BLOCK>> b_scale_reg;
+                warpgroup::load(a_scale_reg, a_scale);
+                warp::load(b_scale_reg, b_scale);
                 warpgroup::mma_async_wait();
-                warpgroup::arrive(inputs_finished(s, pipeline_stage));
+                warpgroup::sync(groupid + 3);
+                warpgroup::arrive(inputs_finished(s, pipeline_stage)); // A, A_scale, B, B_scale all done
+                warp::mul_row(acc_fl, acc_fl, a_scale_reg); // dequantize
+                warp::mul_col(acc_fl, acc_fl, b_scale_reg); // dequantize
             }
 
             int store_page = get_store_page(s, groupid);
@@ -274,16 +292,16 @@ PYBIND11_MODULE(group_matmul, m) {
         int K = pybind11::cast<int>(py_shape[1]);
 
         py_shape = A_scale.attr("shape").cast<pybind11::tuple>();
-        if (pybind11::cast<int>(py_shape[0]) != M) throw std::runtime_error("M dimension mismatch on A_scale");
-        if (pybind11::cast<int>(py_shape[1]) != K / SCALE_BLOCK) throw std::runtime_error("Reduction dimension mismatch on A_scale (must be divisible by " + std::to_string(SCALE_BLOCK) + ")");
+        if (pybind11::cast<int>(py_shape[0]) != K / SCALE_BLOCK) throw std::runtime_error("Reduction dimension mismatch on A_scale (must be divisible by " + std::to_string(SCALE_BLOCK) + ")");
+        if (pybind11::cast<int>(py_shape[1]) != M) throw std::runtime_error("M dimension mismatch on A_scale");
 
         py_shape = B.attr("shape").cast<pybind11::tuple>();
         int N = pybind11::cast<int>(py_shape[0]);
         if (pybind11::cast<int>(py_shape[1]) != K) throw std::runtime_error("Reduction dimension mismatch on B");
 
         py_shape = B_scale.attr("shape").cast<pybind11::tuple>();
-        if (pybind11::cast<int>(py_shape[0]) != N) throw std::runtime_error("N dimension mismatch on B_scale");
-        if (pybind11::cast<int>(py_shape[1]) != K / SCALE_BLOCK) throw std::runtime_error("Reduction dimension mismatch on B_scale (must be divisible by " + std::to_string(SCALE_BLOCK) + ")");
+        if (pybind11::cast<int>(py_shape[0]) != K / SCALE_BLOCK) throw std::runtime_error("Reduction dimension mismatch on B_scale (must be divisible by " + std::to_string(SCALE_BLOCK) + ")");
+        if (pybind11::cast<int>(py_shape[1]) != N) throw std::runtime_error("N dimension mismatch on B_scale");
 
         py_shape = C.attr("shape").cast<pybind11::tuple>();
         int num_ep = pybind11::cast<int>(py_shape[0]);

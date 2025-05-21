@@ -32,11 +32,13 @@ A_blocks = A.view(M, K//SCALE_BLOCK, SCALE_BLOCK)
 A_scale = A_blocks.abs().max(dim=2)[0]  # Max absolute value per block
 A_scale = torch.clamp(A_scale, min=1e-8) # Avoid division by zero
 A_fp8 = (A / A_scale.repeat_interleave(SCALE_BLOCK, dim=1)).to(dtype=torch.float8_e4m3fn)
+A_scale = A_scale.t().contiguous()
 B = (torch.randn((N, K), device=0, dtype=torch.float32) / K**.25)
 B_blocks = B.view(N, K//SCALE_BLOCK, SCALE_BLOCK)
 B_scale = B_blocks.abs().max(dim=2)[0]  # Max absolute value per block
 B_scale = torch.clamp(B_scale, min=1e-8) # Avoid division by zero
 B_fp8 = (B / B_scale.repeat_interleave(SCALE_BLOCK, dim=1)).to(dtype=torch.float8_e4m3fn)
+B_scale = B_scale.t().contiguous()
 C = torch.zeros((NUM_EP, M, N), device=0, dtype=torch.float32)
 tokens_per_ep = torch.zeros((NUM_EP,), device=0, dtype=torch.int32)
 print('Input tensors created')
